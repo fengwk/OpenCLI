@@ -11,7 +11,7 @@
 import { WebSocket, type RawData } from 'ws';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
-import type { BrowserCookie, BrowserEvaluateFunction, IPage, ScreenshotOptions } from '../types.js';
+import type { BrowserCookie, BrowserEvaluateFunction, IPage, ScreenshotOptions, WsCaptureFrame } from '../types.js';
 import type { IBrowserFactory } from '../runtime.js';
 import { buildEvaluateExpression } from './utils.js';
 import { generateStealthJs } from './stealth.js';
@@ -46,6 +46,9 @@ const CDP_SEND_TIMEOUT = 30_000;
 // surface `responseBodyFullSize` + `responseBodyTruncated` so downstream layers
 // can tell the agent what happened instead of lying about the payload.
 export const CDP_RESPONSE_BODY_CAPTURE_LIMIT = 8 * 1024 * 1024;
+// Keep in sync with extension/src/cdp.ts WS frame limits.
+const CDP_WS_FRAME_PAYLOAD_LIMIT = 1 * 1024 * 1024;
+const CDP_WS_FRAME_BUFFER_LIMIT = 10_000;
 
 export class CDPBridge implements IBrowserFactory {
   private _ws: WebSocket | null = null;
@@ -199,6 +202,12 @@ class CDPPage extends BasePage {
   }> = [];
   private _pendingRequests = new Map<string, number>(); // requestId → index in _networkEntries
   private _pendingBodyFetches: Set<Promise<void>> = new Set(); // track in-flight getResponseBody calls
+  // WebSocket stream capture (mirrors extension/src/cdp.ts WsCaptureEntry shape)
+  private _wsCapturing = false;
+  private _wsCapturePatterns: string[] = [];
+  private _wsEntries: WsCaptureFrame[] = [];
+  private _wsRequestIdToUrl = new Map<string, string>();
+  private _wsListenersBound = false;
   private _consoleMessages: Array<{ type: string; text: string; timestamp: number }> = [];
   private _consoleCapturing = false;
 
@@ -376,6 +385,85 @@ class CDPPage extends BasePage {
     const entries = [...this._networkEntries];
     this._networkEntries = [];
     return entries;
+  }
+
+  async startWsCapture(pattern: string = ''): Promise<boolean> {
+    this._wsCapturePatterns = String(pattern || '')
+      .split('|')
+      .map((part) => part.trim())
+      .filter(Boolean);
+    this._wsEntries = [];
+    this._wsRequestIdToUrl.clear();
+    // Arm before Network.enable so handshake/created events during enable are kept.
+    this._wsCapturing = true;
+
+    if (!this._wsListenersBound) {
+      this.bridge.on('Network.webSocketCreated', (params: unknown) => {
+        if (!this._wsCapturing) return;
+        const p = params as { requestId?: string; url?: string };
+        const requestId = String(p.requestId || '');
+        const url = String(p.url || '');
+        if (!requestId || !url) return;
+        if (this._wsCapturePatterns.length && !this._wsCapturePatterns.some((pat) => url.includes(pat))) return;
+        this._wsRequestIdToUrl.set(requestId, url);
+      });
+      const onFrame = (direction: 'received' | 'sent') => (params: unknown) => {
+        if (!this._wsCapturing) return;
+        const p = params as {
+          requestId?: string;
+          response?: { opcode?: number; payloadData?: string };
+        };
+        const requestId = String(p.requestId || '');
+        if (!requestId) return;
+        const opcode = Number(p.response?.opcode ?? 1);
+        if (opcode >= 8) return;
+        const url = this._wsRequestIdToUrl.get(requestId) || '';
+        if (!url && this._wsCapturePatterns.length) return;
+        if (url && this._wsCapturePatterns.length && !this._wsCapturePatterns.some((pat) => url.includes(pat))) return;
+        const raw = String(p.response?.payloadData ?? '');
+        const fullSize = raw.length;
+        const truncated = fullSize > CDP_WS_FRAME_PAYLOAD_LIMIT;
+        const stored = truncated ? raw.slice(0, CDP_WS_FRAME_PAYLOAD_LIMIT) : raw;
+        const payload = opcode === 2 ? `base64:${stored}` : stored;
+        this._wsEntries.push({
+          kind: 'ws-frame',
+          url,
+          requestId,
+          timestamp: Date.now(),
+          direction,
+          opcode,
+          payload,
+          payloadFullSize: fullSize,
+          payloadTruncated: truncated,
+        });
+        if (this._wsEntries.length > CDP_WS_FRAME_BUFFER_LIMIT) {
+          this._wsEntries.splice(0, this._wsEntries.length - CDP_WS_FRAME_BUFFER_LIMIT);
+        }
+      };
+      this.bridge.on('Network.webSocketFrameReceived', onFrame('received'));
+      this.bridge.on('Network.webSocketFrameSent', onFrame('sent'));
+      this.bridge.on('Network.webSocketClosed', (params: unknown) => {
+        const p = params as { requestId?: string };
+        const requestId = String(p.requestId || '');
+        if (requestId) this._wsRequestIdToUrl.delete(requestId);
+      });
+      this._wsListenersBound = true;
+    }
+    await this.bridge.send('Network.enable');
+    return true;
+  }
+
+  async readWsCapture(): Promise<WsCaptureFrame[]> {
+    const entries = [...this._wsEntries];
+    this._wsEntries = [];
+    return entries;
+  }
+
+  async stopWsCapture(): Promise<void> {
+    this._wsCapturing = false;
+    this._wsEntries = [];
+    this._wsRequestIdToUrl.clear();
+    this._wsCapturePatterns = [];
   }
 
   async consoleMessages(level: string = 'all'): Promise<Array<{ type: string; text: string; timestamp: number }>> {

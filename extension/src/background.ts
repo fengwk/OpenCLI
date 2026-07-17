@@ -1343,6 +1343,12 @@ async function handleCommand(cmd: Command): Promise<Result> {
         return await handleNetworkCaptureStart(cmd, leaseKey);
       case 'network-capture-read':
         return await handleNetworkCaptureRead(cmd, leaseKey);
+      case 'ws-capture-start':
+        return await handleWsCaptureStart(cmd, leaseKey);
+      case 'ws-capture-read':
+        return await handleWsCaptureRead(cmd, leaseKey);
+      case 'ws-capture-stop':
+        return await handleWsCaptureStop(cmd, leaseKey);
       case 'wait-download':
         return await handleWaitDownload(cmd);
       case 'frames':
@@ -2053,6 +2059,39 @@ async function handleNetworkCaptureRead(cmd: Command, leaseKey: string): Promise
   try {
     const data = await executor.readNetworkCapture(tabId);
     return pageScopedResult(cmd.id, tabId, data);
+  } catch (err) {
+    return errorResult(cmd.id, err);
+  }
+}
+
+async function handleWsCaptureStart(cmd: Command, leaseKey: string): Promise<Result> {
+  const cmdTabId = await resolveCommandTabId(cmd);
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
+  try {
+    await executor.startWsCapture(tabId, cmd.pattern);
+    return pageScopedResult(cmd.id, tabId, { started: true });
+  } catch (err) {
+    return errorResult(cmd.id, err);
+  }
+}
+
+async function handleWsCaptureRead(cmd: Command, leaseKey: string): Promise<Result> {
+  const cmdTabId = await resolveCommandTabId(cmd);
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
+  try {
+    const data = await executor.readWsCapture(tabId);
+    return pageScopedResult(cmd.id, tabId, data);
+  } catch (err) {
+    return errorResult(cmd.id, err);
+  }
+}
+
+async function handleWsCaptureStop(cmd: Command, leaseKey: string): Promise<Result> {
+  const cmdTabId = await resolveCommandTabId(cmd);
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
+  try {
+    executor.stopWsCapture(tabId);
+    return pageScopedResult(cmd.id, tabId, { stopped: true });
   } catch (err) {
     return errorResult(cmd.id, err);
   }

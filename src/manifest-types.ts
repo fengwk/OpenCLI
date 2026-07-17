@@ -23,6 +23,8 @@ export interface ManifestEntry {
     default?: unknown;
     required?: boolean;
     valueRequired?: boolean;
+    /** Collect repeated flags into string[] (e.g. --file a --file b). */
+    repeatable?: boolean;
     positional?: boolean;
     help?: string;
     choices?: string[];

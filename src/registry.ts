@@ -18,6 +18,11 @@ export interface Arg {
   default?: unknown;
   required?: boolean;
   valueRequired?: boolean;
+  /**
+   * Allow repeating the flag: `--file a --file b` collects into a string[].
+   * Values may still include commas; adapters can flatten both styles.
+   */
+  repeatable?: boolean;
   positional?: boolean;
   help?: string;
   choices?: string[];

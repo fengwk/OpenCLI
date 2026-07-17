@@ -18,6 +18,9 @@ export type Action =
   | 'bind'
   | 'network-capture-start'
   | 'network-capture-read'
+  | 'ws-capture-start'
+  | 'ws-capture-read'
+  | 'ws-capture-stop'
   | 'wait-download'
   | 'cdp'
   | 'frames';

@@ -16,6 +16,7 @@ docs/.vitepress/cache
 *.pem
 *.crx
 *.zip
+extension-package/
 .envrc
 .windsurf
 .claude

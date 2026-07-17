@@ -18,6 +18,10 @@ let frameTargetCleanupRegistered = false;
 // on the direct-CDP path. Keep in sync.
 const CDP_RESPONSE_BODY_CAPTURE_LIMIT = 8 * 1024 * 1024;
 const CDP_REQUEST_BODY_CAPTURE_LIMIT = 1 * 1024 * 1024;
+// Stream frames can be frequent; keep per-frame payload bounded and drop oldest
+// frames when the ring is full so a long agent turn cannot OOM the service worker.
+const CDP_WS_FRAME_PAYLOAD_LIMIT = 1 * 1024 * 1024;
+const CDP_WS_FRAME_BUFFER_LIMIT = 10_000;
 
 type NetworkCaptureEntry = {
   kind: 'cdp';
@@ -43,6 +47,29 @@ type NetworkCaptureState = {
   requestToIndex: Map<string, number>;
 };
 
+export type WsCaptureEntry = {
+  kind: 'ws-frame';
+  url: string;
+  requestId: string;
+  timestamp: number;
+  direction: 'received' | 'sent';
+  opcode: number;
+  payload: string;
+  payloadFullSize: number;
+  payloadTruncated: boolean;
+};
+
+type WsCaptureState = {
+  patterns: string[];
+  entries: WsCaptureEntry[];
+  /** requestId → WebSocket URL observed via Network.webSocketCreated */
+  requestIdToUrl: Map<string, string>;
+  /** requestIds whose Created URL failed the filter — never capture their frames */
+  rejectedRequestIds: Set<string>;
+  /** Frames dropped because the ring buffer was full (oldest-evicted count). */
+  dropped: number;
+};
+
 export type DownloadWaitResult = {
   downloaded: boolean;
   id?: number;
@@ -58,6 +85,7 @@ export type DownloadWaitResult = {
 };
 
 const networkCaptures = new Map<number, NetworkCaptureState>();
+const wsCaptures = new Map<number, WsCaptureState>();
 
 /**
  * Default deadline for a single chrome.debugger command. chrome.debugger has
@@ -147,13 +175,14 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
   let lastError = '';
 
   // The forced detach below fires chrome.debugger.onDetach, whose handler wipes
-  // this tab's armed network-capture state; detaching also disables the CDP
+  // this tab's armed network/ws-capture state; detaching also disables the CDP
   // Network domain. Snapshot the capture so we can restore it after a successful
   // re-attach instead of silently dropping in-flight capture — otherwise any
   // non-navigate command that triggers a re-attach (a stale-attach health-check
   // failure during SPA navigation or third-party debugger interference) leaves
-  // network-capture-read returning [] even though requests fired.
+  // network-capture-read / ws-capture-read returning [] even though traffic fired.
   const preservedNetworkCapture = networkCaptures.get(tabId);
+  const preservedWsCapture = wsCaptures.get(tabId);
 
   for (let attempt = 1; attempt <= MAX_ATTACH_RETRIES; attempt++) {
     try {
@@ -208,15 +237,16 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
     // Some pages may not need explicit enable
   }
 
-  // Restore network capture that the re-attach (detach + onDetach) tore down.
+  // Restore network/ws capture that the re-attach (detach + onDetach) tore down.
   // The detach always disables the CDP Network domain, so re-enable it and put
   // the accumulated capture state back unconditionally. Done last (after the
   // awaits above) so it wins over the onDetach handler's delete, which fires
   // while those awaits yield to the event loop.
-  if (preservedNetworkCapture) {
+  if (preservedNetworkCapture || preservedWsCapture) {
     try {
       await sendDebuggerCommand({ tabId }, 'Network.enable');
-      networkCaptures.set(tabId, preservedNetworkCapture);
+      if (preservedNetworkCapture) networkCaptures.set(tabId, preservedNetworkCapture);
+      if (preservedWsCapture) wsCaptures.set(tabId, preservedWsCapture);
     } catch {
       // Leave capture cleared rather than arm a half-attached Network domain;
       // the next start-capture re-arms cleanly.
@@ -364,41 +394,67 @@ export async function setFileInputFiles(
 
   // Chrome rejects DOM.setFileInputFiles with a plain nodeId/backendNodeId when
   // the debugger is attached via chrome.debugger (crbug 928255, "-32000 Not
-  // allowed"). The only accepted path is file-chooser interception: enable it,
-  // programmatically open the chooser, and use the backendNodeId that the
-  // intercepted Page.fileChooserOpened event hands back. See issue #2108.
+  // allowed"). Preferred path: file-chooser interception (Page.fileChooserOpened
+  // backendNodeId). Interception suppresses the native OS file manager.
+  // See issue #2108.
   await sendDebuggerCommand({ tabId }, 'Page.setInterceptFileChooserDialog', { enabled: true });
   try {
-    const backendNodeId = await new Promise<number>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(new Error('Page.fileChooserOpened not received within 5s — the input may not have opened a file chooser'));
-      }, 5000);
-      const listener = (source: chrome.debugger.Debuggee, method: string, params: unknown) => {
-        if (source.tabId !== tabId || method !== 'Page.fileChooserOpened') return;
-        // This is our chooser event — settle now either way, so a malformed
-        // event rejects immediately instead of hanging until the 5s timeout.
-        cleanup();
-        const backend = (params as { backendNodeId?: number })?.backendNodeId;
-        if (typeof backend === 'number') resolve(backend);
-        else reject(new Error('Page.fileChooserOpened carried no backendNodeId'));
-      };
-      const cleanup = () => {
-        clearTimeout(timer);
-        chrome.debugger.onEvent.removeListener(listener);
-      };
-      chrome.debugger.onEvent.addListener(listener);
-      // Open the chooser programmatically — interception suppresses the native
-      // dialog and fires Page.fileChooserOpened instead. Works for hidden inputs.
-      void sendDebuggerCommand({ tabId }, 'Runtime.evaluate', {
-        expression: `document.querySelector(${JSON.stringify(query)}).click()`,
-      }).catch((err) => {
-        cleanup();
-        reject(err instanceof Error ? err : new Error(String(err)));
+    let backendNodeId: number | undefined;
+    try {
+      backendNodeId = await new Promise<number>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          cleanup();
+          reject(new Error('Page.fileChooserOpened not received within 8s — the input may not have opened a file chooser'));
+        }, 8000);
+        const listener = (source: chrome.debugger.Debuggee, method: string, params: unknown) => {
+          if (source.tabId !== tabId || method !== 'Page.fileChooserOpened') return;
+          cleanup();
+          const backend = (params as { backendNodeId?: number })?.backendNodeId;
+          if (typeof backend === 'number') resolve(backend);
+          else reject(new Error('Page.fileChooserOpened carried no backendNodeId'));
+        };
+        const cleanup = () => {
+          clearTimeout(timer);
+          chrome.debugger.onEvent.removeListener(listener);
+        };
+        chrome.debugger.onEvent.addListener(listener);
+        // Open chooser programmatically. Prefer showPicker() (Playwright-like);
+        // fall back to click(). Interception suppresses the native dialog.
+        void sendDebuggerCommand({ tabId }, 'Runtime.evaluate', {
+          expression: `(() => {
+            const el = document.querySelector(${JSON.stringify(query)});
+            if (!el) throw new Error('file input disappeared');
+            if (typeof el.showPicker === 'function') {
+              try { el.showPicker(); return 'showPicker'; } catch (_) {}
+            }
+            el.click();
+            return 'click';
+          })()`,
+        }).catch((err) => {
+          cleanup();
+          reject(err instanceof Error ? err : new Error(String(err)));
+        });
       });
-    });
+    } catch (chooserErr) {
+      // Fallback: resolve backendNodeId via DOM.describeNode (works on some Chrome builds).
+      const doc = await sendDebuggerCommand({ tabId }, 'DOM.getDocument', { depth: 0 }) as {
+        root?: { nodeId?: number };
+      };
+      const rootId = doc?.root?.nodeId;
+      if (typeof rootId !== 'number') throw chooserErr;
+      const q = await sendDebuggerCommand({ tabId }, 'DOM.querySelector', {
+        nodeId: rootId,
+        selector: query,
+      }) as { nodeId?: number };
+      if (typeof q?.nodeId !== 'number' || q.nodeId <= 0) throw chooserErr;
+      const desc = await sendDebuggerCommand({ tabId }, 'DOM.describeNode', {
+        nodeId: q.nodeId,
+      }) as { node?: { backendNodeId?: number } };
+      const backend = desc?.node?.backendNodeId;
+      if (typeof backend !== 'number') throw chooserErr;
+      backendNodeId = backend;
+    }
 
-    // backendNodeId from the intercepted chooser IS accepted by Chrome.
     await sendDebuggerCommand({ tabId }, 'DOM.setFileInputFiles', {
       files,
       backendNodeId,
@@ -770,12 +826,13 @@ export async function startNetworkCapture(
   pattern?: string,
 ): Promise<void> {
   await ensureAttached(tabId);
-  await sendDebuggerCommand({ tabId }, 'Network.enable');
+  // Arm before Network.enable so requestWillBeSent during enable is not dropped.
   networkCaptures.set(tabId, {
     patterns: normalizeCapturePatterns(pattern),
     entries: [],
     requestToIndex: new Map(),
   });
+  await sendDebuggerCommand({ tabId }, 'Network.enable');
 }
 
 export async function readNetworkCapture(tabId: number): Promise<NetworkCaptureEntry[]> {
@@ -787,8 +844,163 @@ export async function readNetworkCapture(tabId: number): Promise<NetworkCaptureE
   return entries;
 }
 
+/**
+ * Arm WebSocket frame capture for a tab.
+ * Only frames observed after this call are buffered — there is no historical replay.
+ * Call before the action that triggers stream traffic (e.g. send prompt).
+ */
+export async function startWsCapture(
+  tabId: number,
+  pattern?: string,
+): Promise<void> {
+  await ensureAttached(tabId);
+  // Arm the buffer BEFORE Network.enable. Chrome may emit webSocketCreated for
+  // already-open sockets (or immediate frames) as soon as the domain is enabled;
+  // setting state after enable races those events and silently drops them.
+  wsCaptures.set(tabId, {
+    patterns: normalizeCapturePatterns(pattern),
+    entries: [],
+    requestIdToUrl: new Map(),
+    rejectedRequestIds: new Set(),
+    dropped: 0,
+  });
+  await sendDebuggerCommand({ tabId }, 'Network.enable');
+}
+
+export async function readWsCapture(tabId: number): Promise<WsCaptureEntry[]> {
+  const state = wsCaptures.get(tabId);
+  if (!state) return [];
+  const entries = state.entries.slice();
+  state.entries = [];
+  // Keep requestIdToUrl so frames that arrive after a drain still resolve URLs.
+  if (state.dropped > 0) {
+    // Adapter should poll more frequently if this appears in extension logs.
+    console.warn(`[opencli] ws-capture dropped ${state.dropped} frame(s) on tab ${tabId} (ring full)`);
+    state.dropped = 0;
+  }
+  return entries;
+}
+
+/**
+ * Disarm WebSocket capture for a tab and free the ring buffer / request maps.
+ * Safe to call when capture was never started. Does not detach the debugger
+ * (HTTP network capture or later commands may still need it).
+ */
+export function stopWsCapture(tabId: number): void {
+  wsCaptures.delete(tabId);
+}
+
+export function hasActiveWsCapture(tabId: number): boolean {
+  return wsCaptures.has(tabId);
+}
+
+/** True when HTTP and/or WebSocket capture is armed (keep debugger attached). */
 export function hasActiveNetworkCapture(tabId: number): boolean {
-  return networkCaptures.has(tabId);
+  return networkCaptures.has(tabId) || wsCaptures.has(tabId);
+}
+
+function pushWsFrame(state: WsCaptureState, entry: WsCaptureEntry): void {
+  if (state.entries.length >= CDP_WS_FRAME_BUFFER_LIMIT) {
+    const overflow = state.entries.length - CDP_WS_FRAME_BUFFER_LIMIT + 1;
+    state.entries.splice(0, overflow);
+    state.dropped += overflow;
+  }
+  state.entries.push(entry);
+}
+
+function encodeWsPayload(payloadData: string | undefined, opcode: number): {
+  payload: string;
+  payloadFullSize: number;
+  payloadTruncated: boolean;
+} {
+  const raw = String(payloadData ?? '');
+  const fullSize = raw.length;
+  // opcode 1 = text, 2 = binary (CDP may still surface binary as a string)
+  const isBinary = opcode === 2;
+  if (isBinary) {
+    // Keep a short base64-ish preview marker; full binary streaming is out of scope.
+    const stored = fullSize > CDP_WS_FRAME_PAYLOAD_LIMIT
+      ? raw.slice(0, CDP_WS_FRAME_PAYLOAD_LIMIT)
+      : raw;
+    return {
+      payload: `base64:${stored}`,
+      payloadFullSize: fullSize,
+      payloadTruncated: fullSize > CDP_WS_FRAME_PAYLOAD_LIMIT,
+    };
+  }
+  const truncated = fullSize > CDP_WS_FRAME_PAYLOAD_LIMIT;
+  return {
+    payload: truncated ? raw.slice(0, CDP_WS_FRAME_PAYLOAD_LIMIT) : raw,
+    payloadFullSize: fullSize,
+    payloadTruncated: truncated,
+  };
+}
+
+function handleWsCaptureEvent(
+  tabId: number,
+  method: string,
+  eventParams: Record<string, any> | undefined,
+): void {
+  const state = wsCaptures.get(tabId);
+  if (!state) return;
+
+  if (method === 'Network.webSocketCreated') {
+    const requestId = String(eventParams?.requestId || '');
+    const url = String(eventParams?.url || '');
+    if (!requestId || !url) return;
+    if (!shouldCaptureUrl(url, state.patterns)) {
+      state.rejectedRequestIds.add(requestId);
+      state.requestIdToUrl.delete(requestId);
+      return;
+    }
+    state.rejectedRequestIds.delete(requestId);
+    state.requestIdToUrl.set(requestId, url);
+    return;
+  }
+
+  if (method === 'Network.webSocketFrameReceived' || method === 'Network.webSocketFrameSent') {
+    const requestId = String(eventParams?.requestId || '');
+    if (!requestId) return;
+    if (state.rejectedRequestIds.has(requestId)) return;
+
+    const response = eventParams?.response as { opcode?: number; payloadData?: string } | undefined;
+    const opcode = Number(response?.opcode ?? 1);
+    // Ignore control frames (close/ping/pong).
+    if (opcode >= 8) return;
+
+    let url = state.requestIdToUrl.has(requestId) ? (state.requestIdToUrl.get(requestId) || '') : undefined;
+    // After Network.enable, frames may arrive for sockets that never re-emit
+    // webSocketCreated. Keep unknown requestIds (empty url) so long-lived
+    // ChatGPT streams are not silently dropped.
+    if (url === undefined) {
+      state.requestIdToUrl.set(requestId, '');
+      url = '';
+    } else if (url && !shouldCaptureUrl(url, state.patterns)) {
+      return;
+    }
+
+    const encoded = encodeWsPayload(response?.payloadData, opcode);
+    pushWsFrame(state, {
+      kind: 'ws-frame',
+      url,
+      requestId,
+      timestamp: Date.now(),
+      direction: method === 'Network.webSocketFrameReceived' ? 'received' : 'sent',
+      opcode,
+      payload: encoded.payload,
+      payloadFullSize: encoded.payloadFullSize,
+      payloadTruncated: encoded.payloadTruncated,
+    });
+    return;
+  }
+
+  if (method === 'Network.webSocketClosed') {
+    const requestId = String(eventParams?.requestId || '');
+    if (requestId) {
+      state.requestIdToUrl.delete(requestId);
+      state.rejectedRequestIds.delete(requestId);
+    }
+  }
 }
 
 function clearFrameTargetsForTab(tabId: number): void {
@@ -805,6 +1017,7 @@ export async function detach(tabId: number): Promise<void> {
   if (!attached.has(tabId)) return;
   attached.delete(tabId);
   networkCaptures.delete(tabId);
+  wsCaptures.delete(tabId);
   tabFrameContexts.delete(tabId);
   try { await chrome.debugger.detach({ tabId }); } catch { /* ignore */ }
 }
@@ -813,6 +1026,7 @@ export function registerListeners(): void {
   chrome.tabs.onRemoved.addListener((tabId) => {
     attached.delete(tabId);
     networkCaptures.delete(tabId);
+    wsCaptures.delete(tabId);
     tabFrameContexts.delete(tabId);
     clearFrameTargetsForTab(tabId);
   });
@@ -820,6 +1034,7 @@ export function registerListeners(): void {
     if (source.tabId) {
       attached.delete(source.tabId);
       networkCaptures.delete(source.tabId);
+      wsCaptures.delete(source.tabId);
       tabFrameContexts.delete(source.tabId);
       clearFrameTargetsForTab(source.tabId);
       return;
@@ -835,9 +1050,16 @@ export function registerListeners(): void {
   chrome.debugger.onEvent.addListener(async (source, method, params) => {
     const tabId = source.tabId;
     if (!tabId) return;
+    const eventParams = params as Record<string, any> | undefined;
+
+    // WebSocket stream capture is independent of HTTP network capture.
+    if (method.startsWith('Network.webSocket')) {
+      handleWsCaptureEvent(tabId, method, eventParams);
+      return;
+    }
+
     const state = networkCaptures.get(tabId);
     if (!state) return;
-    const eventParams = params as Record<string, any> | undefined;
 
     if (method === 'Network.requestWillBeSent') {
       const requestId = String(eventParams?.requestId || '');

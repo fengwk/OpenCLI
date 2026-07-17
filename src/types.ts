@@ -67,6 +67,19 @@ export interface FetchJsonOptions {
   timeoutMs?: number;
 }
 
+/** One drained WebSocket frame from page.startWsCapture / readWsCapture. */
+export interface WsCaptureFrame {
+  kind: 'ws-frame';
+  url: string;
+  requestId: string;
+  timestamp: number;
+  direction: 'received' | 'sent';
+  opcode: number;
+  payload: string;
+  payloadFullSize: number;
+  payloadTruncated: boolean;
+}
+
 export type BrowserEvaluateFunction<Args extends unknown[] = unknown[], Result = unknown> = (...args: Args) => Result | Promise<Result>;
 
 export interface IPage {
@@ -123,6 +136,14 @@ export interface IPage {
   annotatedScreenshot?(options?: ScreenshotOptions): Promise<string>;
   startNetworkCapture?(pattern?: string): Promise<boolean>;
   readNetworkCapture?(): Promise<unknown[]>;
+  /**
+   * Arm CDP WebSocket frame capture for the current page.
+   * Only frames observed after this call are buffered (no historical replay).
+   * @param pattern URL substring filter; empty matches all WebSocket URLs. Use `|` for OR.
+   */
+  startWsCapture?(pattern?: string): Promise<boolean>;
+  /** Drain buffered WebSocket frames since the last read (or start). */
+  readWsCapture?(): Promise<WsCaptureFrame[]>;
   /**
    * Set local file paths on a file input element via CDP DOM.setFileInputFiles.
    * Chrome reads the files directly — no base64 encoding or payload size limits.

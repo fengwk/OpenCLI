@@ -197,6 +197,41 @@ describe('Page network capture compatibility', () => {
   });
 });
 
+describe('Page websocket capture compatibility', () => {
+  beforeEach(() => {
+    sendCommandMock.mockReset();
+    sendCommandFullMock.mockReset();
+    warnMock.mockReset();
+  });
+
+  it('treats unknown ws-capture-start as unsupported and memoizes it', async () => {
+    sendCommandMock.mockRejectedValueOnce(new Error('Unknown action: ws-capture-start'));
+
+    const page = new Page('chatgpt-agent', undefined, undefined, undefined, 'adapter');
+
+    await expect(page.startWsCapture('chatgpt.com')).resolves.toBe(false);
+    await expect(page.startWsCapture('chatgpt.com')).resolves.toBe(false);
+
+    expect(sendCommandMock).toHaveBeenCalledTimes(1);
+    expect(warnMock).toHaveBeenCalledWith(expect.stringContaining('does not support WebSocket capture'));
+    expect(sendCommandMock).toHaveBeenCalledWith('ws-capture-start', expect.objectContaining({
+      session: 'chatgpt-agent',
+      surface: 'adapter',
+      pattern: 'chatgpt.com',
+    }));
+  });
+
+  it('returns empty frames when ws-capture-read is unsupported', async () => {
+    sendCommandMock.mockRejectedValueOnce(new Error('Unknown action: ws-capture-read'));
+
+    const page = new Page('chatgpt-agent', undefined, undefined, undefined, 'adapter');
+
+    await expect(page.readWsCapture()).resolves.toEqual([]);
+    await expect(page.readWsCapture()).resolves.toEqual([]);
+    expect(sendCommandMock).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('Page download waits', () => {
   beforeEach(() => {
     sendCommandMock.mockReset();

@@ -10,7 +10,10 @@ const frameTargetKeys = /* @__PURE__ */ new Map();
 let frameTargetCleanupRegistered = false;
 const CDP_RESPONSE_BODY_CAPTURE_LIMIT = 8 * 1024 * 1024;
 const CDP_REQUEST_BODY_CAPTURE_LIMIT = 1 * 1024 * 1024;
+const CDP_WS_FRAME_PAYLOAD_LIMIT = 1 * 1024 * 1024;
+const CDP_WS_FRAME_BUFFER_LIMIT = 1e4;
 const networkCaptures = /* @__PURE__ */ new Map();
+const wsCaptures = /* @__PURE__ */ new Map();
 const CDP_COMMAND_TIMEOUT_MS = 6e4;
 const CDP_PROBE_TIMEOUT_MS = 2e3;
 async function sendDebuggerCommand(target, method, params, timeoutMs = CDP_COMMAND_TIMEOUT_MS) {
@@ -62,6 +65,7 @@ async function ensureAttached(tabId, aggressiveRetry = false) {
   const RETRY_DELAY_MS = aggressiveRetry ? 1500 : 500;
   let lastError = "";
   const preservedNetworkCapture = networkCaptures.get(tabId);
+  const preservedWsCapture = wsCaptures.get(tabId);
   for (let attempt = 1; attempt <= MAX_ATTACH_RETRIES; attempt++) {
     try {
       try {
@@ -106,10 +110,11 @@ async function ensureAttached(tabId, aggressiveRetry = false) {
     await sendDebuggerCommand({ tabId }, "Runtime.enable");
   } catch {
   }
-  if (preservedNetworkCapture) {
+  if (preservedNetworkCapture || preservedWsCapture) {
     try {
       await sendDebuggerCommand({ tabId }, "Network.enable");
-      networkCaptures.set(tabId, preservedNetworkCapture);
+      if (preservedNetworkCapture) networkCaptures.set(tabId, preservedNetworkCapture);
+      if (preservedWsCapture) wsCaptures.set(tabId, preservedWsCapture);
     } catch {
     }
   }
@@ -197,30 +202,56 @@ async function setFileInputFiles(tabId, files, selector) {
   }
   await sendDebuggerCommand({ tabId }, "Page.setInterceptFileChooserDialog", { enabled: true });
   try {
-    const backendNodeId = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(new Error("Page.fileChooserOpened not received within 5s — the input may not have opened a file chooser"));
-      }, 5e3);
-      const listener = (source, method, params) => {
-        if (source.tabId !== tabId || method !== "Page.fileChooserOpened") return;
-        cleanup();
-        const backend = params?.backendNodeId;
-        if (typeof backend === "number") resolve(backend);
-        else reject(new Error("Page.fileChooserOpened carried no backendNodeId"));
-      };
-      const cleanup = () => {
-        clearTimeout(timer);
-        chrome.debugger.onEvent.removeListener(listener);
-      };
-      chrome.debugger.onEvent.addListener(listener);
-      void sendDebuggerCommand({ tabId }, "Runtime.evaluate", {
-        expression: `document.querySelector(${JSON.stringify(query)}).click()`
-      }).catch((err) => {
-        cleanup();
-        reject(err instanceof Error ? err : new Error(String(err)));
+    let backendNodeId;
+    try {
+      backendNodeId = await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          cleanup();
+          reject(new Error("Page.fileChooserOpened not received within 8s — the input may not have opened a file chooser"));
+        }, 8e3);
+        const listener = (source, method, params) => {
+          if (source.tabId !== tabId || method !== "Page.fileChooserOpened") return;
+          cleanup();
+          const backend = params?.backendNodeId;
+          if (typeof backend === "number") resolve(backend);
+          else reject(new Error("Page.fileChooserOpened carried no backendNodeId"));
+        };
+        const cleanup = () => {
+          clearTimeout(timer);
+          chrome.debugger.onEvent.removeListener(listener);
+        };
+        chrome.debugger.onEvent.addListener(listener);
+        void sendDebuggerCommand({ tabId }, "Runtime.evaluate", {
+          expression: `(() => {
+            const el = document.querySelector(${JSON.stringify(query)});
+            if (!el) throw new Error('file input disappeared');
+            if (typeof el.showPicker === 'function') {
+              try { el.showPicker(); return 'showPicker'; } catch (_) {}
+            }
+            el.click();
+            return 'click';
+          })()`
+        }).catch((err) => {
+          cleanup();
+          reject(err instanceof Error ? err : new Error(String(err)));
+        });
       });
-    });
+    } catch (chooserErr) {
+      const doc = await sendDebuggerCommand({ tabId }, "DOM.getDocument", { depth: 0 });
+      const rootId = doc?.root?.nodeId;
+      if (typeof rootId !== "number") throw chooserErr;
+      const q = await sendDebuggerCommand({ tabId }, "DOM.querySelector", {
+        nodeId: rootId,
+        selector: query
+      });
+      if (typeof q?.nodeId !== "number" || q.nodeId <= 0) throw chooserErr;
+      const desc = await sendDebuggerCommand({ tabId }, "DOM.describeNode", {
+        nodeId: q.nodeId
+      });
+      const backend = desc?.node?.backendNodeId;
+      if (typeof backend !== "number") throw chooserErr;
+      backendNodeId = backend;
+    }
     await sendDebuggerCommand({ tabId }, "DOM.setFileInputFiles", {
       files,
       backendNodeId
@@ -507,12 +538,12 @@ function getOrCreateNetworkCaptureEntry(tabId, requestId, fallback) {
 }
 async function startNetworkCapture(tabId, pattern) {
   await ensureAttached(tabId);
-  await sendDebuggerCommand({ tabId }, "Network.enable");
   networkCaptures.set(tabId, {
     patterns: normalizeCapturePatterns(pattern),
     entries: [],
     requestToIndex: /* @__PURE__ */ new Map()
   });
+  await sendDebuggerCommand({ tabId }, "Network.enable");
 }
 async function readNetworkCapture(tabId) {
   const state = networkCaptures.get(tabId);
@@ -522,8 +553,112 @@ async function readNetworkCapture(tabId) {
   state.requestToIndex.clear();
   return entries;
 }
+async function startWsCapture(tabId, pattern) {
+  await ensureAttached(tabId);
+  wsCaptures.set(tabId, {
+    patterns: normalizeCapturePatterns(pattern),
+    entries: [],
+    requestIdToUrl: /* @__PURE__ */ new Map(),
+    rejectedRequestIds: /* @__PURE__ */ new Set(),
+    dropped: 0
+  });
+  await sendDebuggerCommand({ tabId }, "Network.enable");
+}
+async function readWsCapture(tabId) {
+  const state = wsCaptures.get(tabId);
+  if (!state) return [];
+  const entries = state.entries.slice();
+  state.entries = [];
+  if (state.dropped > 0) {
+    console.warn(`[opencli] ws-capture dropped ${state.dropped} frame(s) on tab ${tabId} (ring full)`);
+    state.dropped = 0;
+  }
+  return entries;
+}
+function stopWsCapture(tabId) {
+  wsCaptures.delete(tabId);
+}
 function hasActiveNetworkCapture(tabId) {
-  return networkCaptures.has(tabId);
+  return networkCaptures.has(tabId) || wsCaptures.has(tabId);
+}
+function pushWsFrame(state, entry) {
+  if (state.entries.length >= CDP_WS_FRAME_BUFFER_LIMIT) {
+    const overflow = state.entries.length - CDP_WS_FRAME_BUFFER_LIMIT + 1;
+    state.entries.splice(0, overflow);
+    state.dropped += overflow;
+  }
+  state.entries.push(entry);
+}
+function encodeWsPayload(payloadData, opcode) {
+  const raw = String(payloadData ?? "");
+  const fullSize = raw.length;
+  const isBinary = opcode === 2;
+  if (isBinary) {
+    const stored = fullSize > CDP_WS_FRAME_PAYLOAD_LIMIT ? raw.slice(0, CDP_WS_FRAME_PAYLOAD_LIMIT) : raw;
+    return {
+      payload: `base64:${stored}`,
+      payloadFullSize: fullSize,
+      payloadTruncated: fullSize > CDP_WS_FRAME_PAYLOAD_LIMIT
+    };
+  }
+  const truncated = fullSize > CDP_WS_FRAME_PAYLOAD_LIMIT;
+  return {
+    payload: truncated ? raw.slice(0, CDP_WS_FRAME_PAYLOAD_LIMIT) : raw,
+    payloadFullSize: fullSize,
+    payloadTruncated: truncated
+  };
+}
+function handleWsCaptureEvent(tabId, method, eventParams) {
+  const state = wsCaptures.get(tabId);
+  if (!state) return;
+  if (method === "Network.webSocketCreated") {
+    const requestId = String(eventParams?.requestId || "");
+    const url = String(eventParams?.url || "");
+    if (!requestId || !url) return;
+    if (!shouldCaptureUrl(url, state.patterns)) {
+      state.rejectedRequestIds.add(requestId);
+      state.requestIdToUrl.delete(requestId);
+      return;
+    }
+    state.rejectedRequestIds.delete(requestId);
+    state.requestIdToUrl.set(requestId, url);
+    return;
+  }
+  if (method === "Network.webSocketFrameReceived" || method === "Network.webSocketFrameSent") {
+    const requestId = String(eventParams?.requestId || "");
+    if (!requestId) return;
+    if (state.rejectedRequestIds.has(requestId)) return;
+    const response = eventParams?.response;
+    const opcode = Number(response?.opcode ?? 1);
+    if (opcode >= 8) return;
+    let url = state.requestIdToUrl.has(requestId) ? state.requestIdToUrl.get(requestId) || "" : void 0;
+    if (url === void 0) {
+      state.requestIdToUrl.set(requestId, "");
+      url = "";
+    } else if (url && !shouldCaptureUrl(url, state.patterns)) {
+      return;
+    }
+    const encoded = encodeWsPayload(response?.payloadData, opcode);
+    pushWsFrame(state, {
+      kind: "ws-frame",
+      url,
+      requestId,
+      timestamp: Date.now(),
+      direction: method === "Network.webSocketFrameReceived" ? "received" : "sent",
+      opcode,
+      payload: encoded.payload,
+      payloadFullSize: encoded.payloadFullSize,
+      payloadTruncated: encoded.payloadTruncated
+    });
+    return;
+  }
+  if (method === "Network.webSocketClosed") {
+    const requestId = String(eventParams?.requestId || "");
+    if (requestId) {
+      state.requestIdToUrl.delete(requestId);
+      state.rejectedRequestIds.delete(requestId);
+    }
+  }
 }
 function clearFrameTargetsForTab(tabId) {
   for (const [key, targetId] of [...frameTargets.entries()]) {
@@ -539,6 +674,7 @@ async function detach(tabId) {
   if (!attached.has(tabId)) return;
   attached.delete(tabId);
   networkCaptures.delete(tabId);
+  wsCaptures.delete(tabId);
   tabFrameContexts.delete(tabId);
   try {
     await chrome.debugger.detach({ tabId });
@@ -549,6 +685,7 @@ function registerListeners() {
   chrome.tabs.onRemoved.addListener((tabId) => {
     attached.delete(tabId);
     networkCaptures.delete(tabId);
+    wsCaptures.delete(tabId);
     tabFrameContexts.delete(tabId);
     clearFrameTargetsForTab(tabId);
   });
@@ -556,6 +693,7 @@ function registerListeners() {
     if (source.tabId) {
       attached.delete(source.tabId);
       networkCaptures.delete(source.tabId);
+      wsCaptures.delete(source.tabId);
       tabFrameContexts.delete(source.tabId);
       clearFrameTargetsForTab(source.tabId);
       return;
@@ -570,9 +708,13 @@ function registerListeners() {
   chrome.debugger.onEvent.addListener(async (source, method, params) => {
     const tabId = source.tabId;
     if (!tabId) return;
+    const eventParams = params;
+    if (method.startsWith("Network.webSocket")) {
+      handleWsCaptureEvent(tabId, method, eventParams);
+      return;
+    }
     const state = networkCaptures.get(tabId);
     if (!state) return;
-    const eventParams = params;
     if (method === "Network.requestWillBeSent") {
       const requestId = String(eventParams?.requestId || "");
       const request = eventParams?.request;
@@ -1711,6 +1853,12 @@ async function handleCommand(cmd) {
         return await handleNetworkCaptureStart(cmd, leaseKey);
       case "network-capture-read":
         return await handleNetworkCaptureRead(cmd, leaseKey);
+      case "ws-capture-start":
+        return await handleWsCaptureStart(cmd, leaseKey);
+      case "ws-capture-read":
+        return await handleWsCaptureRead(cmd, leaseKey);
+      case "ws-capture-stop":
+        return await handleWsCaptureStop(cmd, leaseKey);
       case "wait-download":
         return await handleWaitDownload(cmd);
       case "frames":
@@ -2291,6 +2439,36 @@ async function handleNetworkCaptureRead(cmd, leaseKey) {
   try {
     const data = await readNetworkCapture(tabId);
     return pageScopedResult(cmd.id, tabId, data);
+  } catch (err) {
+    return errorResult(cmd.id, err);
+  }
+}
+async function handleWsCaptureStart(cmd, leaseKey) {
+  const cmdTabId = await resolveCommandTabId(cmd);
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
+  try {
+    await startWsCapture(tabId, cmd.pattern);
+    return pageScopedResult(cmd.id, tabId, { started: true });
+  } catch (err) {
+    return errorResult(cmd.id, err);
+  }
+}
+async function handleWsCaptureRead(cmd, leaseKey) {
+  const cmdTabId = await resolveCommandTabId(cmd);
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
+  try {
+    const data = await readWsCapture(tabId);
+    return pageScopedResult(cmd.id, tabId, data);
+  } catch (err) {
+    return errorResult(cmd.id, err);
+  }
+}
+async function handleWsCaptureStop(cmd, leaseKey) {
+  const cmdTabId = await resolveCommandTabId(cmd);
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
+  try {
+    stopWsCapture(tabId);
+    return pageScopedResult(cmd.id, tabId, { stopped: true });
   } catch (err) {
     return errorResult(cmd.id, err);
   }

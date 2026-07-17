@@ -9,7 +9,7 @@
  * page-scoped operations target the correct page without guessing.
  */
 
-import type { BrowserCookie, BrowserDownloadWaitResult, BrowserEvaluateFunction, ScreenshotOptions } from '../types.js';
+import type { BrowserCookie, BrowserDownloadWaitResult, BrowserEvaluateFunction, ScreenshotOptions, WsCaptureFrame } from '../types.js';
 import { sendCommand, sendCommandFull } from './daemon-client.js';
 import { buildEvaluateExpression } from './utils.js';
 import { saveBase64ToFile } from '../utils.js';
@@ -24,6 +24,14 @@ function isUnsupportedNetworkCaptureError(err: unknown): boolean {
   const normalized = message.toLowerCase();
   return (normalized.includes('unknown action') && normalized.includes('network-capture'))
     || (normalized.includes('network capture') && normalized.includes('not supported'));
+}
+
+function isUnsupportedWsCaptureError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  const normalized = message.toLowerCase();
+  return (normalized.includes('unknown action') && normalized.includes('ws-capture'))
+    || (normalized.includes('ws capture') && normalized.includes('not supported'))
+    || (normalized.includes('websocket capture') && normalized.includes('not supported'));
 }
 
 // The extension throws "Page not found: <id> — stale page identity" when our cached
@@ -60,6 +68,8 @@ export class Page extends BasePage {
   private _page: string | undefined;
   private _networkCaptureUnsupported = false;
   private _networkCaptureWarned = false;
+  private _wsCaptureUnsupported = false;
+  private _wsCaptureWarned = false;
 
   /** Helper: spread session into command params */
   private _sessionOpts(): { session: string; surface: 'browser' | 'adapter'; idleTimeout?: number; contextId?: string; preferredContextId?: string; windowMode?: 'foreground' | 'background'; siteSession?: 'ephemeral' | 'persistent' } {
@@ -170,6 +180,16 @@ export class Page extends BasePage {
     );
   }
 
+  private _markUnsupportedWsCapture(): void {
+    this._wsCaptureUnsupported = true;
+    if (this._wsCaptureWarned) return;
+    this._wsCaptureWarned = true;
+    log.warn(
+      'Browser Bridge extension does not support WebSocket capture; continuing without it. ' +
+      'Stream-protocol adapters need a newer extension (ws-capture-start/read).',
+    );
+  }
+
   async evaluate<T = unknown>(js: string): Promise<T>;
   async evaluate<Args extends unknown[], T>(fn: BrowserEvaluateFunction<Args, T>, ...args: Args): Promise<Awaited<T>>;
   async evaluate(input: string | BrowserEvaluateFunction<unknown[], unknown>, ...args: unknown[]): Promise<unknown> {
@@ -200,6 +220,8 @@ export class Page extends BasePage {
       this._lastUrl = null;
       this._networkCaptureUnsupported = false;
       this._networkCaptureWarned = false;
+      this._wsCaptureUnsupported = false;
+      this._wsCaptureWarned = false;
     }
   }
 
@@ -289,6 +311,48 @@ export class Page extends BasePage {
       if (!isUnsupportedNetworkCaptureError(err)) throw err;
       this._markUnsupportedNetworkCapture();
       return [];
+    }
+  }
+
+  async startWsCapture(pattern: string = ''): Promise<boolean> {
+    if (this._wsCaptureUnsupported) return false;
+    try {
+      await sendCommand('ws-capture-start', {
+        pattern,
+        ...this._cmdOpts(),
+      });
+      return true;
+    } catch (err) {
+      if (!isUnsupportedWsCaptureError(err)) throw err;
+      this._markUnsupportedWsCapture();
+      return false;
+    }
+  }
+
+  async readWsCapture(): Promise<WsCaptureFrame[]> {
+    if (this._wsCaptureUnsupported) return [];
+    try {
+      const result = await sendCommand('ws-capture-read', {
+        ...this._cmdOpts(),
+      });
+      return Array.isArray(result) ? result as WsCaptureFrame[] : [];
+    } catch (err) {
+      if (!isUnsupportedWsCaptureError(err)) throw err;
+      this._markUnsupportedWsCapture();
+      return [];
+    }
+  }
+
+  /** Disarm capture and free the extension-side ring buffer for this tab. */
+  async stopWsCapture(): Promise<void> {
+    if (this._wsCaptureUnsupported) return;
+    try {
+      await sendCommand('ws-capture-stop', {
+        ...this._cmdOpts(),
+      });
+    } catch (err) {
+      if (!isUnsupportedWsCaptureError(err)) throw err;
+      this._markUnsupportedWsCapture();
     }
   }
 

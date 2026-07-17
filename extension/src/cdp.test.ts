@@ -553,6 +553,191 @@ describe('cdp network capture correctness', () => {
   });
 });
 
+describe('cdp websocket stream capture', () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function createWsMock() {
+    const onEventListeners: Array<(source: { tabId?: number }, method: string, params: any) => void | Promise<void>> = [];
+    const debuggerApi = {
+      attach: vi.fn(async () => {}),
+      detach: vi.fn(async () => {}),
+      sendCommand: vi.fn(async (_target: unknown, method: string, params?: any) => {
+        if (method === 'Runtime.evaluate' && params?.expression === '1') return { result: { value: '1' } };
+        return {};
+      }),
+      onDetach: { addListener: vi.fn() },
+      onEvent: { addListener: vi.fn((fn) => { onEventListeners.push(fn); }) },
+    };
+    const tabs = {
+      get: vi.fn(async () => ({ id: 1, windowId: 1, url: 'https://chatgpt.com/' })),
+      onRemoved: { addListener: vi.fn() },
+      onUpdated: { addListener: vi.fn() },
+    };
+    const fire = async (method: string, params: any) => {
+      for (const fn of onEventListeners) await fn({ tabId: 1 }, method, params);
+    };
+    return {
+      chrome: { tabs, debugger: debuggerApi, scripting: {}, runtime: { id: 'opencli-test' } },
+      fire,
+    };
+  }
+
+  // Captures frames after start + URL filter — this is the agent stream runtime contract.
+  it('captures matching websocket frames after start and drains on read', async () => {
+    const mock = createWsMock();
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+    await mod.startWsCapture(1, 'chatgpt.com');
+
+    await mock.fire('Network.webSocketCreated', {
+      requestId: 'ws1',
+      url: 'wss://chatgpt.com/backend-api/conversation',
+    });
+    await mock.fire('Network.webSocketFrameReceived', {
+      requestId: 'ws1',
+      response: { opcode: 1, payloadData: '[{"type":"message"}]' },
+    });
+    // Unrelated host must be ignored when a filter is set.
+    await mock.fire('Network.webSocketCreated', {
+      requestId: 'ws2',
+      url: 'wss://other.example/socket',
+    });
+    await mock.fire('Network.webSocketFrameReceived', {
+      requestId: 'ws2',
+      response: { opcode: 1, payloadData: 'noise' },
+    });
+
+    const frames = await mod.readWsCapture(1);
+    expect(frames).toHaveLength(1);
+    expect(frames[0]).toMatchObject({
+      kind: 'ws-frame',
+      url: 'wss://chatgpt.com/backend-api/conversation',
+      requestId: 'ws1',
+      direction: 'received',
+      opcode: 1,
+      payload: '[{"type":"message"}]',
+    });
+
+    // Second read drains empty until new frames arrive.
+    await expect(mod.readWsCapture(1)).resolves.toEqual([]);
+  });
+
+  // Long-lived sockets may emit frames without webSocketCreated after Network.enable.
+  it('keeps frames with unknown url when a filter is set (do not drop silently)', async () => {
+    const mock = createWsMock();
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+    await mod.startWsCapture(1, 'chatgpt.com');
+
+    await mock.fire('Network.webSocketFrameReceived', {
+      requestId: 'orphan-ws',
+      response: { opcode: 1, payloadData: '[{"type":"message"}]' },
+    });
+
+    const frames = await mod.readWsCapture(1);
+    expect(frames).toHaveLength(1);
+    expect(frames[0].requestId).toBe('orphan-ws');
+    expect(frames[0].payload).toContain('message');
+  });
+
+  it('keeps requestId→url mapping across drain so later frames still resolve', async () => {
+    const mock = createWsMock();
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+    await mod.startWsCapture(1, 'chatgpt.com');
+
+    await mock.fire('Network.webSocketCreated', {
+      requestId: 'ws1',
+      url: 'wss://chatgpt.com/ws',
+    });
+    await mock.fire('Network.webSocketFrameReceived', {
+      requestId: 'ws1',
+      response: { opcode: 1, payloadData: 'a' },
+    });
+    await mod.readWsCapture(1);
+
+    await mock.fire('Network.webSocketFrameReceived', {
+      requestId: 'ws1',
+      response: { opcode: 1, payloadData: 'b' },
+    });
+    const frames = await mod.readWsCapture(1);
+    expect(frames).toHaveLength(1);
+    expect(frames[0].payload).toBe('b');
+    expect(frames[0].url).toBe('wss://chatgpt.com/ws');
+  });
+
+  it('preserves armed ws capture across forced re-attach', async () => {
+    const onDetachListeners: Array<(source: { tabId?: number }) => void> = [];
+    let failNextHealthCheck = false;
+    let networkEnableCount = 0;
+    const onEventListeners: Array<(source: { tabId?: number }, method: string, params: any) => void | Promise<void>> = [];
+    const debuggerApi = {
+      attach: vi.fn(async () => {}),
+      detach: vi.fn(async ({ tabId }: { tabId?: number }) => {
+        for (const fn of onDetachListeners) fn({ tabId });
+      }),
+      sendCommand: vi.fn(async (_target: unknown, method: string, params?: any) => {
+        if (method === 'Runtime.evaluate' && params?.expression === '1') {
+          if (failNextHealthCheck) {
+            failNextHealthCheck = false;
+            throw new Error('Inspected target navigated or closed');
+          }
+          return { result: { value: '1' } };
+        }
+        if (method === 'Network.enable') {
+          networkEnableCount += 1;
+          return {};
+        }
+        return {};
+      }),
+      onDetach: { addListener: vi.fn((fn: (s: { tabId?: number }) => void) => { onDetachListeners.push(fn); }) },
+      onEvent: { addListener: vi.fn((fn) => { onEventListeners.push(fn); }) },
+    };
+    const tabs = {
+      get: vi.fn(async () => ({ id: 1, windowId: 1, url: 'https://chatgpt.com/' })),
+      onRemoved: { addListener: vi.fn() },
+      onUpdated: { addListener: vi.fn() },
+    };
+    vi.stubGlobal('chrome', { tabs, debugger: debuggerApi, scripting: {}, runtime: { id: 'opencli-test' } });
+    const mod = await import('./cdp');
+    mod.registerListeners();
+
+    await mod.startWsCapture(1, 'chatgpt.com');
+    expect(mod.hasActiveWsCapture(1)).toBe(true);
+    expect(mod.hasActiveNetworkCapture(1)).toBe(true);
+    const enablesAfterStart = networkEnableCount;
+
+    // Seed a frame so restoration can be proven via buffered content.
+    for (const fn of onEventListeners) {
+      await fn({ tabId: 1 }, 'Network.webSocketCreated', {
+        requestId: 'ws1',
+        url: 'wss://chatgpt.com/ws',
+      });
+      await fn({ tabId: 1 }, 'Network.webSocketFrameReceived', {
+        requestId: 'ws1',
+        response: { opcode: 1, payloadData: 'keep-me' },
+      });
+    }
+
+    failNextHealthCheck = true;
+    await mod.ensureAttached(1);
+
+    expect(mod.hasActiveWsCapture(1)).toBe(true);
+    expect(networkEnableCount).toBeGreaterThan(enablesAfterStart);
+    const frames = await mod.readWsCapture(1);
+    expect(frames.map((f) => f.payload)).toContain('keep-me');
+  });
+});
+
 describe('cdp evaluateInFrame stale context fallback', () => {
   beforeEach(() => {
     vi.resetModules();
