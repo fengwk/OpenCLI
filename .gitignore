@@ -16,7 +16,10 @@ docs/.vitepress/cache
 *.pem
 *.crx
 *.zip
+*.tgz
 extension-package/
+artifacts/
+npm-shrinkwrap.json
 .envrc
 .windsurf
 .claude

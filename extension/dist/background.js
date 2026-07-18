@@ -1037,7 +1037,7 @@ async function connectAttempt() {
       type: "hello",
       contextId: currentContextId,
       version: chrome.runtime.getManifest().version,
-      compatRange: ">=1.7.0"
+      compatRange: ">=1.8.7"
     });
     startWsKeepalive(thisWs);
   };

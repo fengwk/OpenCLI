@@ -5,7 +5,7 @@ Use it when merging back to mainline or rebasing onto upstream.
 
 **Plugin adapters** (e.g. `chatgpt-agent`) live in a separate plugin repo:
 
-- `~/proj/my-opencli` — install with `opencli plugin install ~/proj/my-opencli`
+- `~/proj/my-opencli/packages/chatgpt-agent` — install with `opencli plugin install ~/proj/my-opencli/packages/chatgpt-agent`
 
 ---
 
@@ -37,11 +37,28 @@ Use it when merging back to mainline or rebasing onto upstream.
 |------|--------|----------|
 | chatgpt-agent | Protocol stream ask, sequential upload, file chip download, image export | `~/proj/my-opencli/packages/chatgpt-agent` via official `opencli plugin install` |
 
-#### Packaging
+#### Packaging / release
 
-| Script | Purpose |
-|--------|---------|
-| `scripts/package-fork.sh` | Build CLI + extension, emit dated extension zip to repo root and `~/Downloads` |
+| Item | Purpose |
+|------|---------|
+| `scripts/package-fork.sh` | Build CLI + extension; emit versioned npm `.tgz`, extension zip, `SHA256SUMS`, `build-info.json` under `artifacts/` (or `--output-dir`) |
+| `.github/workflows/fork-release.yml` | Tag `fork-v*` / manual dispatch packaging; Actions artifact upload; GitHub Release attach for tags only (no npm publish) |
+
+**Current versions**
+
+| Component | Version |
+|-----------|---------|
+| CLI (`@jackwener/opencli`) | `1.8.7-fengwk.1` |
+| Extension | `1.0.23` (`compatRange`: `>=1.8.7`) |
+
+### Auto-update policy (fork)
+
+Fork builds (`*-fengwk.*` versions) are **not** published to upstream npm and must **not** use upstream auto-update discovery:
+
+- CLI background update check (npm registry `@jackwener/opencli`) is disabled.
+- Exit-time update notices and doctor “latest extension” cache reads from upstream GitHub Releases are disabled.
+- Upgrade by installing the fork Release artifacts (`.tgz` / extension zip) from `fengwk/OpenCLI` tags `fork-v*`, not via `npm install -g @jackwener/opencli`.
+- Optional override for any build: set `OPENCLI_DISABLE_UPDATE_CHECK=1|true|yes`.
 
 ---
 
@@ -52,6 +69,7 @@ Use it when merging back to mainline or rebasing onto upstream.
 3. **`Arg.repeatable`** — low risk; useful beyond this fork.
 4. **chatgpt-agent** — prefer shipping as **plugin**, not core `clis/`, unless upstream wants a first-party agent adapter.
 5. Drop fork-only docs (`FORK.md`) or fold into upstream CHANGELOG when landing.
+6. Do **not** land fork release workflow / version branding as-is without renaming.
 
 ---
 
@@ -70,15 +88,39 @@ Use it when merging back to mainline or rebasing onto upstream.
 
 ```bash
 cd ~/proj/OpenCLI
+npm ci
+(cd extension && npm ci)
+
+# Default output: ./artifacts/
 ./scripts/package-fork.sh
-# → opencli-extension-*-YYYYMMDD-HHMM.zip
-# → also copied to C:\Users\…\Downloads when /mnt/c is present
+
+# Explicit output directory (CI / temp validation)
+./scripts/package-fork.sh --output-dir /tmp/opencli-artifacts
+
+# Optional Windows Downloads copy (never used by CI)
+./scripts/package-fork.sh --copy-to-windows-downloads
 ```
 
-Install / reload extension from the zip or `extension-package/`.
+Artifacts (version-based names, no timestamps):
+
+- `jackwener-opencli-1.8.7-fengwk.1.tgz`
+- `opencli-extension-v1.0.23.zip`
+- `SHA256SUMS`
+- `build-info.json`
 
 ```bash
+# install CLI from the tarball (not npm publish)
+npm install -g ./artifacts/jackwener-opencli-1.8.7-fengwk.1.tgz
+opencli --version   # → 1.8.7-fengwk.1
+
 # plugin
-opencli plugin install ~/proj/my-opencli
+opencli plugin install ~/proj/my-opencli/packages/chatgpt-agent
 opencli chatgpt-agent ask --help
 ```
+
+### GitHub fork release
+
+1. Ensure `package.json` version is `X` and commit any regenerated `cli-manifest.json` / `extension/dist`.
+2. Tag exactly `fork-vX` (example: `fork-v1.8.7-fengwk.1`) and push the tag.
+3. Workflow `Fork Release` packages, uploads the Actions artifact bundle, and attaches tgz/zip/SHA256SUMS/build-info.json to the GitHub Release.
+4. Never runs `npm publish` or upstream website dispatch jobs.

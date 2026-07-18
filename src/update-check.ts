@@ -85,6 +85,38 @@ function isCI(): boolean {
   return !!(process.env.CI || process.env.CONTINUOUS_INTEGRATION);
 }
 
+/**
+ * Pure policy: whether update checks/notices should run for this distribution.
+ *
+ * Disabled for:
+ * - fengwk fork prerelease train (`-fengwk.` in the version, e.g. `1.8.7-fengwk.1`)
+ * - `OPENCLI_DISABLE_UPDATE_CHECK` set to an accepted truthy value (`1` / `true` / `yes`, case-insensitive)
+ *
+ * CI skip is handled separately by callers via `isCI()` so stock CI behavior stays intact.
+ */
+function isUpdateCheckEnabled(options: {
+  packageVersion: string;
+  env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
+}): boolean {
+  const env = options.env ?? process.env;
+  const raw = env.OPENCLI_DISABLE_UPDATE_CHECK;
+  if (typeof raw === 'string') {
+    const normalized = raw.trim().toLowerCase();
+    if (normalized === '1' || normalized === 'true' || normalized === 'yes') {
+      return false;
+    }
+  }
+  // Fork tarball train is not published to upstream npm; never recommend upstream installs.
+  if (/-fengwk\./i.test(options.packageVersion)) {
+    return false;
+  }
+  return true;
+}
+
+function isUpdateCheckEnabledForRuntime(): boolean {
+  return isUpdateCheckEnabled({ packageVersion: PKG_VERSION });
+}
+
 interface NoticeInputs {
   cliVersion: string;
   cache: UpdateCache | null;
@@ -128,6 +160,7 @@ function buildUpdateNotices({ cliVersion, cache, now }: NoticeInputs): NoticeLin
  */
 export function registerUpdateNoticeOnExit(): void {
   if (isCI()) return;
+  if (!isUpdateCheckEnabledForRuntime()) return;
   if (process.argv.includes('--get-completions')) return;
 
   process.on('exit', (code) => {
@@ -183,6 +216,7 @@ async function fetchLatestExtensionVersion(): Promise<string | undefined> {
  */
 export function checkForUpdateBackground(): void {
   if (isCI()) return;
+  if (!isUpdateCheckEnabledForRuntime()) return;
   if (_cache?.lastCheck && Date.now() - _cache.lastCheck < CHECK_INTERVAL_MS) return;
 
   void (async () => {
@@ -224,13 +258,17 @@ export function recordExtensionVersion(version: string): void {
 /**
  * Get the cached latest extension version (if available).
  * Used by `opencli doctor` to report extension updates.
+ * Returns undefined when update discovery is disabled for this distribution so
+ * stale upstream cache is never surfaced on fengwk fork builds.
  */
 export function getCachedLatestExtensionVersion(): string | undefined {
+  if (!isUpdateCheckEnabledForRuntime()) return undefined;
   return _cache?.latestExtensionVersion;
 }
 
 export {
   extractLatestExtensionVersionFromReleases as _extractLatestExtensionVersionFromReleases,
   buildUpdateNotices as _buildUpdateNotices,
+  isUpdateCheckEnabled as _isUpdateCheckEnabled,
   EXTENSION_STALE_MS as _EXTENSION_STALE_MS,
 };

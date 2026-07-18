@@ -2,8 +2,46 @@ import { describe, expect, it } from 'vitest';
 import {
   _extractLatestExtensionVersionFromReleases as extractLatestExtensionVersionFromReleases,
   _buildUpdateNotices as buildUpdateNotices,
+  _isUpdateCheckEnabled as isUpdateCheckEnabled,
   _EXTENSION_STALE_MS as EXTENSION_STALE_MS,
 } from './update-check.js';
+
+describe('isUpdateCheckEnabled', () => {
+  // Pure policy helper: decides whether this distribution may discover/surface
+  // upstream npm/GitHub update artifacts.
+
+  it('enables checks for stock semver releases', () => {
+    expect(isUpdateCheckEnabled({ packageVersion: '1.8.6', env: {} })).toBe(true);
+    expect(isUpdateCheckEnabled({ packageVersion: '1.8.7', env: {} })).toBe(true);
+  });
+
+  it('disables checks for fengwk fork prerelease train (-fengwk.)', () => {
+    expect(isUpdateCheckEnabled({ packageVersion: '1.8.7-fengwk.1', env: {} })).toBe(false);
+    expect(isUpdateCheckEnabled({ packageVersion: '2.0.0-fengwk.12', env: {} })).toBe(false);
+  });
+
+  it('disables checks when OPENCLI_DISABLE_UPDATE_CHECK is an accepted truthy value', () => {
+    for (const value of ['1', 'true', 'TRUE', 'yes', 'Yes', ' YES ']) {
+      expect(
+        isUpdateCheckEnabled({
+          packageVersion: '1.8.6',
+          env: { OPENCLI_DISABLE_UPDATE_CHECK: value },
+        }),
+      ).toBe(false);
+    }
+  });
+
+  it('does not disable for unrelated OPENCLI_DISABLE_UPDATE_CHECK values', () => {
+    for (const value of ['0', 'false', 'no', 'maybe', '']) {
+      expect(
+        isUpdateCheckEnabled({
+          packageVersion: '1.8.6',
+          env: { OPENCLI_DISABLE_UPDATE_CHECK: value },
+        }),
+      ).toBe(true);
+    }
+  });
+});
 
 describe('extractLatestExtensionVersionFromReleases', () => {
   it('reads the extension version from a versioned asset on a normal CLI release', () => {
