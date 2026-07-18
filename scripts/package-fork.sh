@@ -104,8 +104,10 @@ echo "==> [3/6] Pack installable CLI tarball (${CLI_TGZ_NAME})"
 # Track creation so cleanup never deletes a pre-existing file.
 cp package-lock.json "${SHRINKWRAP_PATH}"
 CREATED_SHRINKWRAP=1
-# Build already completed above; do not re-run prepare/lifecycle scripts during pack.
-npm pack --ignore-scripts --pack-destination "${OUTPUT_DIR}"
+# npm 10 may still invoke `prepare` for `npm pack --ignore-scripts`, while npm 11
+# skips it. Fence the repository prepare hook explicitly so neither behavior can
+# delete the already verified dist/ tree during packing.
+OPENCLI_SKIP_PREPARE_BUILD=1 npm pack --ignore-scripts --pack-destination "${OUTPUT_DIR}"
 if [[ ! -f "${CLI_TGZ_PATH}" ]]; then
   echo "ERROR: expected npm pack output missing: ${CLI_TGZ_PATH}" >&2
   ls -la "${OUTPUT_DIR}" >&2 || true
@@ -188,7 +190,7 @@ echo "==> [6/6] Write SHA256SUMS + build-info.json"
 
 SOURCE_COMMIT="$(git -C "${ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
 
-# Prefer useful refs for detached tag CI (e.g. fork-v1.8.7-fengwk.1), not bare HEAD.
+# Prefer useful refs for detached tag CI (e.g. fork-v1.8.7-fengwk.2), not bare HEAD.
 resolve_source_ref() {
   local ref=""
 
