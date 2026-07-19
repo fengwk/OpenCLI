@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -11,6 +11,12 @@ import * as runtime from './runtime.js';
 import * as capRouting from './capabilityRouting.js';
 import * as daemonClient from './browser/daemon-client.js';
 import { BrowserCommandError } from './browser/daemon-client.js';
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+  daemonClient.setDaemonRunContext(null);
+});
 
 describe('executeCommand — non-browser timeout', () => {
   it('applies the user --timeout arg as the ceiling for non-browser commands', async () => {
@@ -758,12 +764,12 @@ describe('executeCommand — persistent write lease release', () => {
     vi.spyOn(runtime, 'browserSession').mockImplementation(async (_Factory, fn) => fn({} as any));
     const releaseSpy = vi.spyOn(daemonClient, 'releaseSiteSessionLease').mockResolvedValue(undefined);
     const runCtxSpy = vi.spyOn(daemonClient, 'setDaemonRunContext');
+    const clearCtxSpy = vi.spyOn(daemonClient, 'clearDaemonRunContext');
 
     await executeCommand(persistentWriteCmd(async () => [{ ok: true }]), {});
 
     expect(releaseSpy).toHaveBeenCalledTimes(1);
-    expect(runCtxSpy).toHaveBeenLastCalledWith(null);
-    vi.restoreAllMocks();
+    expect(clearCtxSpy).toHaveBeenCalledWith(runCtxSpy.mock.calls[0][0]?.runId);
   });
 
   it('releases the lease after an ordinary persistent write failure', async () => {
@@ -771,39 +777,47 @@ describe('executeCommand — persistent write lease release', () => {
     vi.spyOn(runtime, 'browserSession').mockImplementation(async (_Factory, fn) => fn({} as any));
     const releaseSpy = vi.spyOn(daemonClient, 'releaseSiteSessionLease').mockResolvedValue(undefined);
     const runCtxSpy = vi.spyOn(daemonClient, 'setDaemonRunContext');
+    const clearCtxSpy = vi.spyOn(daemonClient, 'clearDaemonRunContext');
 
     const cmd = persistentWriteCmd(async () => { throw new BrowserCommandError('boom', 'attach_failed'); });
     await expect(executeCommand(cmd, {})).rejects.toThrow('boom');
 
     expect(releaseSpy).toHaveBeenCalledTimes(1);
-    expect(runCtxSpy).toHaveBeenLastCalledWith(null);
-    vi.restoreAllMocks();
+    expect(clearCtxSpy).toHaveBeenCalledWith(runCtxSpy.mock.calls[0][0]?.runId);
   });
 
-  it('does NOT release the lease after an unknown-outcome failure but still clears the run context', async () => {
+  it('resets rather than releases the lease after an unknown-outcome failure', async () => {
     vi.spyOn(capRouting, 'shouldUseBrowserSession').mockReturnValue(true);
     vi.spyOn(runtime, 'browserSession').mockImplementation(async (_Factory, fn) => fn({} as any));
     const releaseSpy = vi.spyOn(daemonClient, 'releaseSiteSessionLease').mockResolvedValue(undefined);
     const runCtxSpy = vi.spyOn(daemonClient, 'setDaemonRunContext');
+    const clearCtxSpy = vi.spyOn(daemonClient, 'clearDaemonRunContext');
+    const recoverySpy = vi.spyOn(daemonClient, 'recoverSiteSessionLease').mockResolvedValue({
+      ok: true, result: 'RECOVERED', tabReset: true, cancelledPending: 1,
+    });
 
-    // The browser-side command may still be running against the persistent tab,
-    // so releasing now would let a manual rerun collide with it — the TTL must
-    // reclaim the lease instead.
     const cmd = persistentWriteCmd(async () => { throw new BrowserCommandError('result unknown', 'command_result_unknown'); });
     await expect(executeCommand(cmd, {})).rejects.toThrow('result unknown');
 
     expect(releaseSpy).not.toHaveBeenCalled();
-    expect(runCtxSpy).toHaveBeenLastCalledWith(null);
-    vi.restoreAllMocks();
+    expect(recoverySpy).toHaveBeenCalledWith(expect.objectContaining({
+      runId: runCtxSpy.mock.calls[0][0]?.runId,
+      mode: 'CANCEL_AND_RESET',
+      reason: 'command_outcome_unknown',
+    }));
+    expect(clearCtxSpy).toHaveBeenCalledWith(runCtxSpy.mock.calls[0][0]?.runId);
   });
 
-  it('keeps the run identity bound through a CLI-layer timeout and cleans up when the adapter settles', async () => {
+  it('fences/resets a timed-out adapter and keeps its revoked run identity until it settles', async () => {
     vi.useFakeTimers();
     vi.spyOn(capRouting, 'shouldUseBrowserSession').mockReturnValue(true);
     vi.spyOn(runtime, 'browserSession').mockImplementation(async (_Factory, fn) => fn({} as any));
     const releaseSpy = vi.spyOn(daemonClient, 'releaseSiteSessionLease').mockResolvedValue(undefined);
     const runCtxSpy = vi.spyOn(daemonClient, 'setDaemonRunContext');
     const clearCtxSpy = vi.spyOn(daemonClient, 'clearDaemonRunContext');
+    const recoverySpy = vi.spyOn(daemonClient, 'recoverSiteSessionLease').mockResolvedValue({
+      ok: true, result: 'RECOVERED', tabReset: true, cancelledPending: 1,
+    });
 
     try {
       // runWithTimeout does not cancel the adapter promise, and the process
@@ -821,19 +835,52 @@ describe('executeCommand — persistent write lease release', () => {
       expect(releaseSpy).not.toHaveBeenCalled();
       expect(runCtxSpy).not.toHaveBeenCalledWith(null);
       expect(clearCtxSpy).not.toHaveBeenCalled();
+      expect(recoverySpy).toHaveBeenCalledWith(expect.objectContaining({
+        mode: 'CANCEL_AND_RESET',
+        reason: 'execution_timeout',
+      }));
 
       finishAdapter();
       await vi.advanceTimersByTimeAsync(0);
 
       const runId = runCtxSpy.mock.calls[0][0]?.runId;
       expect(clearCtxSpy).toHaveBeenCalledWith(runId);
-      expect(releaseSpy).toHaveBeenCalledTimes(1);
-      expect(releaseSpy).toHaveBeenCalledWith(expect.objectContaining({ runId }));
+      expect(releaseSpy).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
       vi.restoreAllMocks();
       daemonClient.setDaemonRunContext(null);
     }
+  });
+
+  it('preserves the TIMEOUT outcome and adds a recovery-failed hint without releasing the lease', async () => {
+    vi.useFakeTimers();
+    const closeWindow = vi.fn().mockResolvedValue(undefined);
+    vi.spyOn(capRouting, 'shouldUseBrowserSession').mockReturnValue(true);
+    vi.spyOn(runtime, 'browserSession').mockImplementation(async (_Factory, fn) => fn({ closeWindow } as any));
+    const releaseSpy = vi.spyOn(daemonClient, 'releaseSiteSessionLease').mockResolvedValue(undefined);
+    vi.spyOn(daemonClient, 'recoverSiteSessionLease').mockResolvedValue({
+      ok: false,
+      result: 'RESET_FAILED',
+      tabReset: false,
+      cancelledPending: 0,
+      errorCode: 'session_recovery_failed',
+      error: 'Bridge reset did not acknowledge',
+    });
+    let finishAdapter!: () => void;
+    const adapterGate = new Promise<void>((resolve) => { finishAdapter = resolve; });
+    const command = persistentWriteCmd(async () => { await adapterGate; return [{ ok: true }]; });
+
+    const outcome = executeCommand(command, {}).catch((err) => err);
+    await vi.advanceTimersByTimeAsync(30 * 60 * 1000);
+    const error = await outcome;
+    expect(error).toBeInstanceOf(TimeoutError);
+    expect((error as TimeoutError).hint).toContain('Session recovery failed: Bridge reset did not acknowledge');
+    expect(closeWindow).not.toHaveBeenCalled();
+    expect(releaseSpy).not.toHaveBeenCalled();
+
+    finishAdapter();
+    await vi.advanceTimersByTimeAsync(0);
   });
 
   it('skips the deferred release when a timed-out adapter ends with an unknown outcome', async () => {
@@ -843,6 +890,9 @@ describe('executeCommand — persistent write lease release', () => {
     const releaseSpy = vi.spyOn(daemonClient, 'releaseSiteSessionLease').mockResolvedValue(undefined);
     const runCtxSpy = vi.spyOn(daemonClient, 'setDaemonRunContext');
     const clearCtxSpy = vi.spyOn(daemonClient, 'clearDaemonRunContext');
+    const recoverySpy = vi.spyOn(daemonClient, 'recoverSiteSessionLease').mockResolvedValue({
+      ok: true, result: 'RECOVERED', tabReset: true, cancelledPending: 1,
+    });
 
     try {
       // Same rule as the immediate path: if the zombie's last browser command
@@ -854,6 +904,8 @@ describe('executeCommand — persistent write lease release', () => {
       const rejection = expect(executeCommand(cmd, {})).rejects.toThrow('timed out');
       await vi.advanceTimersByTimeAsync(30 * 60 * 1000);
       await rejection;
+
+      expect(recoverySpy).toHaveBeenCalledWith(expect.objectContaining({ reason: 'execution_timeout' }));
 
       failAdapter(new BrowserCommandError('late result unknown', 'command_result_unknown'));
       await vi.advanceTimersByTimeAsync(0);
@@ -876,6 +928,10 @@ describe('executeCommand — persistent write lease release', () => {
     vi.spyOn(runtime, 'browserSession').mockImplementation(async (_Factory, fn) => fn(mockPage));
     const releaseSpy = vi.spyOn(daemonClient, 'releaseSiteSessionLease').mockResolvedValue(undefined);
     const runCtxSpy = vi.spyOn(daemonClient, 'setDaemonRunContext');
+    const clearCtxSpy = vi.spyOn(daemonClient, 'clearDaemonRunContext');
+    const recoverySpy = vi.spyOn(daemonClient, 'recoverSiteSessionLease').mockResolvedValue({
+      ok: true, result: 'RECOVERED', tabReset: true, cancelledPending: 1,
+    });
 
     // The pre-nav wrapper must keep the original error on the cause chain so
     // the release decision still sees the unknown outcome.
@@ -893,7 +949,7 @@ describe('executeCommand — persistent write lease release', () => {
 
     expect(mockPage.goto).toHaveBeenCalledWith('https://example.com/inbox');
     expect(releaseSpy).not.toHaveBeenCalled();
-    expect(runCtxSpy).toHaveBeenLastCalledWith(null);
-    vi.restoreAllMocks();
+    expect(recoverySpy).toHaveBeenCalledWith(expect.objectContaining({ reason: 'command_outcome_unknown' }));
+    expect(clearCtxSpy).toHaveBeenCalledWith(runCtxSpy.mock.calls[0][0]?.runId);
   });
 });

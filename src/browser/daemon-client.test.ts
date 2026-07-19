@@ -6,6 +6,8 @@ import {
   fetchDaemonStatus,
   getDaemonHealth,
   isUnknownOutcomeError,
+  recoverSiteSessionLease,
+  resolveDaemonRunOwner,
   requestDaemonShutdown,
   sendCommand,
   setDaemonCommandTimeoutSeconds,
@@ -69,6 +71,86 @@ describe('daemon-client', () => {
         headers: expect.objectContaining({ 'X-OpenCLI': '1' }),
       }),
     );
+  });
+
+  it('discovers the exact lease context then submits a CAS recovery request', async () => {
+    const status = {
+      ok: true,
+      pid: 123,
+      uptime: 10,
+      extensionConnected: true,
+      capabilities: ['session-lease-v1', 'session-recover-v1'],
+      sessionLeases: [{
+        contextId: 'resolved-profile',
+        surface: 'adapter',
+        session: 'site:chatgpt-agent',
+        runId: 'run_111_1_a',
+        command: 'chatgpt-agent ask',
+        pid: 111,
+        owner: 'opencli-hub:instance:execution',
+        startedAt: 1,
+        lastSeenAt: 2,
+        pendingCount: 1,
+        state: 'ACTIVE' as const,
+      }],
+      pending: 1,
+      memoryMB: 32,
+      port: 19825,
+    };
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve(status) } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({
+          ok: true,
+          result: 'RECOVERED',
+          runId: 'run_111_1_a',
+          tabReset: true,
+          cancelledPending: 1,
+        }),
+      } as Response);
+
+    await expect(recoverSiteSessionLease({
+      runId: 'run_111_1_a',
+      session: 'site:chatgpt-agent',
+      surface: 'adapter',
+      mode: 'CANCEL_AND_RESET',
+      reason: 'execution_timeout',
+    })).resolves.toMatchObject({ result: 'RECOVERED', tabReset: true });
+
+    const [, recoveryInit] = vi.mocked(fetch).mock.calls[1];
+    expect(vi.mocked(fetch).mock.calls[1][0]).toMatch(/\/session-leases\/recover$/);
+    expect(JSON.parse(String(recoveryInit?.body))).toEqual(expect.objectContaining({
+      contextId: 'resolved-profile',
+      expectedRunId: 'run_111_1_a',
+      mode: 'CANCEL_AND_RESET',
+    }));
+  });
+
+  it('fails closed instead of calling recovery on a daemon without the capability', async () => {
+    vi.mocked(fetch).mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({
+        ok: true,
+        pid: 123,
+        uptime: 10,
+        extensionConnected: true,
+        capabilities: ['session-lease-v1'],
+        pending: 0,
+        memoryMB: 32,
+        port: 19825,
+      }),
+    } as Response);
+
+    const result = await recoverSiteSessionLease({
+      runId: 'run_111_1_a',
+      session: 'site:chatgpt-agent',
+      surface: 'adapter',
+      mode: 'CANCEL_AND_RESET',
+      reason: 'execution_timeout',
+    });
+    expect(result).toMatchObject({ ok: false, result: 'RESET_FAILED', errorCode: 'session_recovery_failed' });
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
   });
 
   it('getDaemonHealth returns stopped when daemon is not reachable', async () => {
@@ -231,11 +313,17 @@ describe('daemon-client', () => {
     await sendCommand('exec', { code: '2 + 2', surface: 'adapter', session: 'site:chatgpt', siteSession: 'persistent' });
 
     for (const call of vi.mocked(fetch).mock.calls) {
-      const body = JSON.parse(String(call[1]?.body)) as { runId?: string; command?: string; access?: string };
+      const body = JSON.parse(String(call[1]?.body)) as { runId?: string; command?: string; access?: string; owner?: string };
       expect(body.runId).toBe('run_4242_1_a');
       expect(body.command).toBe('chatgpt ask');
       expect(body.access).toBe('write');
+      expect(body.owner).toBe('cli');
     }
+  });
+
+  it('uses OPENCLI_RUN_OWNER when the caller provides orchestration ownership', () => {
+    vi.stubEnv('OPENCLI_RUN_OWNER', 'opencli-hub:instance-1:execution-2');
+    expect(resolveDaemonRunOwner()).toBe('opencli-hub:instance-1:execution-2');
   });
 
   it('clearDaemonRunContext only clears the context that still belongs to the runId', async () => {

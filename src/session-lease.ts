@@ -10,12 +10,10 @@
  *
  * This registry grants ONE logical write lease per (contextId, surface,
  * session) that spans the whole CLI command run. A second concurrent write
- * fails fast, and a lease whose holder died (kill -9, crash) self-expires
- * after TTL of inactivity so a retry succeeds within a bounded time. Each exec
- * that flows through refreshes the lease, and a holder whose single exec
- * outlives the TTL (e.g. a slow navigate) is still protected while that exec
- * is in flight (see `hasPendingWork`), so a live long-running holder keeps the
- * lease indefinitely.
+ * fails fast. A dead holder (kill -9, crash) becomes reclaimable after its
+ * TTL/pending state is checked, while a process that can still be confirmed
+ * alive remains observable so recovery can fence it instead of losing track of
+ * an adapter between browser commands.
  *
  * The daemon is the arbiter because it is the single local process that sees
  * every CLI client; keeping the logic here (pure, no I/O) makes it testable
@@ -27,18 +25,32 @@ export const SESSION_LEASE_TTL_MS = 45_000;
 
 /** Machine-readable error code for the fast-fail busy response. */
 export const SESSION_BUSY_CODE = 'session_busy';
+/** A recovery owns the lease while the old browser session is being reset. */
+export const SESSION_RECOVERING_CODE = 'session_recovering';
+/** A fenced run tried to issue another command after recovery started. */
+export const SESSION_LEASE_REVOKED_CODE = 'session_lease_revoked';
+/** The browser session reset could not be confirmed. */
+export const SESSION_RECOVERY_FAILED_CODE = 'session_recovery_failed';
+
+export type SessionLeaseState = 'ACTIVE' | 'RECOVERING';
+export type SessionLeaseRecoveryMode = 'RECLAIM_IF_IDLE' | 'CANCEL_AND_RESET';
+export type SessionLeaseRecoveryResult = 'RECOVERED' | 'ALREADY_FREE' | 'STILL_ACTIVE' | 'OWNER_CHANGED';
 
 export interface SessionLeaseHolder {
   /** Stable per logical CLI command run (NOT the per-exec command id). */
   runId: string;
   /** Human command name, e.g. `chatgpt ask`. */
   command: string;
-  /** CLI process pid recovered from the runId, for the "kill it" hint. */
+  /** CLI process pid recovered from the runId, for conservative orphan detection. */
   pid: number | null;
   /** When the current holder first acquired the lease. */
   startedAt: number;
   /** Last time an exec from the holder refreshed the lease (heartbeat). */
   lastSeenAt: number;
+  /** Caller-supplied ownership label for observability and recovery routing. */
+  owner: string;
+  /** ACTIVE normally; RECOVERING fences the old run until reset is confirmed. */
+  state: SessionLeaseState;
 }
 
 /**
@@ -52,6 +64,17 @@ export interface SessionLeaseHolder {
  */
 export function getSessionLeaseKey(contextId: string, surface: string, session: string): string {
   return `${contextId}␟${surface}␟${encodeURIComponent(session)}`;
+}
+
+/** Decode the daemon-internal key for status output; malformed keys stay hidden. */
+export function parseSessionLeaseKey(key: string): { contextId: string; surface: string; session: string } | null {
+  const [contextId, surface, encodedSession, ...extra] = key.split('␟');
+  if (!contextId || !surface || !encodedSession || extra.length > 0) return null;
+  try {
+    return { contextId, surface, session: decodeURIComponent(encodedSession) };
+  } catch {
+    return null;
+  }
 }
 
 /** CLI runIds are `run_<pid>_<ts>_<rand>`; recover the pid for the busy hint. */
@@ -88,13 +111,15 @@ export function isSessionLeaseCommand<T extends SessionLeaseCommand>(
   );
 }
 
-export interface LeaseTouchResult {
-  granted: boolean;
-  holder: SessionLeaseHolder;
-}
+export type LeaseTouchResult =
+  | { granted: true; holder: SessionLeaseHolder }
+  | { granted: false; reason: 'busy' | 'recovering'; holder: SessionLeaseHolder }
+  | { granted: false; reason: 'revoked' };
 
 export class SessionLeaseRegistry {
   private readonly leases = new Map<string, SessionLeaseHolder>();
+  /** Keep forced-recovery fences for the daemon lifetime. */
+  private readonly revokedRunIds = new Set<string>();
 
   constructor(private readonly ttlMs: number = SESSION_LEASE_TTL_MS) {}
 
@@ -114,23 +139,39 @@ export class SessionLeaseRegistry {
    */
   touch(
     key: string,
-    input: { runId: string; command: string; now: number; hasPendingWork?: (runId: string) => boolean },
+    input: {
+      runId: string;
+      command: string;
+      owner?: string;
+      now: number;
+      hasPendingWork?: (runId: string) => boolean;
+      isRunAlive?: (runId: string) => boolean;
+    },
   ): LeaseTouchResult {
+    if (this.revokedRunIds.has(input.runId)) return { granted: false, reason: 'revoked' };
+
     const current = this.leases.get(key);
+    if (current?.state === 'RECOVERING') {
+      return { granted: false, reason: 'recovering', holder: current };
+    }
     const alive = current !== undefined && (
-      input.now - current.lastSeenAt <= this.ttlMs || input.hasPendingWork?.(current.runId) === true
+      input.now - current.lastSeenAt <= this.ttlMs ||
+      input.hasPendingWork?.(current.runId) === true ||
+      input.isRunAlive?.(current.runId) === true
     );
     if (current !== undefined && alive && current.runId !== input.runId) {
-      return { granted: false, holder: current };
+      return { granted: false, reason: 'busy', holder: current };
     }
     const holder: SessionLeaseHolder = current !== undefined && current.runId === input.runId
-      ? { ...current, command: input.command, lastSeenAt: input.now }
+      ? { ...current, command: input.command, owner: input.owner?.trim() || current.owner, lastSeenAt: input.now }
       : {
         runId: input.runId,
         command: input.command,
         pid: parsePidFromRunId(input.runId),
         startedAt: input.now,
         lastSeenAt: input.now,
+        owner: input.owner?.trim() || 'cli',
+        state: 'ACTIVE',
       };
     this.leases.set(key, holder);
     return { granted: true, holder };
@@ -144,7 +185,14 @@ export class SessionLeaseRegistry {
    */
   heartbeat(key: string, runId: string, now: number): void {
     const current = this.leases.get(key);
-    if (current !== undefined && current.runId === runId) current.lastSeenAt = now;
+    if (
+      current !== undefined &&
+      current.runId === runId &&
+      current.state === 'ACTIVE' &&
+      !this.revokedRunIds.has(runId)
+    ) {
+      current.lastSeenAt = now;
+    }
   }
 
   /**
@@ -155,15 +203,70 @@ export class SessionLeaseRegistry {
    */
   releaseByRunId(runId: string): void {
     for (const [key, holder] of this.leases) {
-      if (holder.runId === runId) this.leases.delete(key);
+      // A late release from a fenced CLI must not bypass an unconfirmed reset.
+      if (holder.runId === runId && holder.state === 'ACTIVE') this.leases.delete(key);
     }
   }
 
-  /** Active (non-expired) holder for `key`, lazily evicting a stale one. */
-  get(key: string, now: number): SessionLeaseHolder | undefined {
+  /** Return a holder without TTL eviction; daemon recovery performs its own liveness check. */
+  peek(key: string): SessionLeaseHolder | undefined {
+    return this.leases.get(key);
+  }
+
+  isRevoked(runId: string): boolean {
+    return this.revokedRunIds.has(runId);
+  }
+
+  /**
+   * Compare-and-set recovery transition. It fences first, then either releases
+   * an idle holder or leaves a RECOVERING holder for async reset completion.
+   */
+  beginRecovery(input: {
+    key: string;
+    expectedRunId: string;
+    mode: SessionLeaseRecoveryMode;
+    pendingCount: number;
+    now: number;
+  }): { result: SessionLeaseRecoveryResult; holder?: SessionLeaseHolder; retryReset?: boolean } {
+    const current = this.leases.get(input.key);
+    if (!current) return { result: 'ALREADY_FREE' };
+    if (current.runId !== input.expectedRunId) return { result: 'OWNER_CHANGED', holder: current };
+    // A previous reset may have timed out after fencing the run. Retrying the
+    // reset is safe, but reclaiming it without a confirmed reset is not.
+    if (current.state === 'RECOVERING') {
+      return input.mode === 'CANCEL_AND_RESET'
+        ? { result: 'STILL_ACTIVE', holder: current, retryReset: true }
+        : { result: 'STILL_ACTIVE', holder: current };
+    }
+    if (input.mode === 'RECLAIM_IF_IDLE' && input.pendingCount > 0) {
+      return { result: 'STILL_ACTIVE', holder: current };
+    }
+
+    this.revokedRunIds.add(input.expectedRunId);
+    if (input.mode === 'RECLAIM_IF_IDLE') {
+      this.leases.delete(input.key);
+      return { result: 'RECOVERED', holder: current };
+    }
+
+    current.state = 'RECOVERING';
+    current.lastSeenAt = input.now;
+    return { result: 'RECOVERED', holder: current };
+  }
+
+  /** Delete only the exact holder that was fenced and successfully reset. */
+  completeRecovery(key: string, expectedRunId: string): boolean {
+    const current = this.leases.get(key);
+    if (!current || current.runId !== expectedRunId || current.state !== 'RECOVERING') return false;
+    this.leases.delete(key);
+    return true;
+  }
+
+  /** Active holder for `key`, lazily evicting only a stale, non-live one. */
+  get(key: string, now: number, isRunAlive?: (runId: string) => boolean): SessionLeaseHolder | undefined {
     const current = this.leases.get(key);
     if (current === undefined) return undefined;
-    if (now - current.lastSeenAt > this.ttlMs) {
+    if (current.state === 'RECOVERING') return current;
+    if (now - current.lastSeenAt > this.ttlMs && isRunAlive?.(current.runId) !== true) {
       this.leases.delete(key);
       return undefined;
     }
@@ -178,10 +281,17 @@ export class SessionLeaseRegistry {
    * still being rejected — misleading during a single long exec. Read-only:
    * never lazily evicts.
    */
-  list(now: number, hasPendingWork?: (runId: string) => boolean): Array<{ key: string } & SessionLeaseHolder> {
+  list(
+    now: number,
+    hasPendingWork?: (runId: string) => boolean,
+    isRunAlive?: (runId: string) => boolean,
+  ): Array<{ key: string } & SessionLeaseHolder> {
     const out: Array<{ key: string } & SessionLeaseHolder> = [];
     for (const [key, holder] of this.leases) {
-      const alive = now - holder.lastSeenAt <= this.ttlMs || hasPendingWork?.(holder.runId) === true;
+      const alive = holder.state === 'RECOVERING'
+        || now - holder.lastSeenAt <= this.ttlMs
+        || hasPendingWork?.(holder.runId) === true
+        || isRunAlive?.(holder.runId) === true;
       if (alive) out.push({ key, ...holder });
     }
     return out;
@@ -195,6 +305,24 @@ export interface SessionBusyFailure {
   status: number;
 }
 
+export function buildSessionRecoveringFailure(session: string, holder: SessionLeaseHolder): SessionBusyFailure {
+  return {
+    message: `Session "${session}" is recovering from ${holder.command}; wait for the reset to complete.`,
+    errorCode: SESSION_RECOVERING_CODE,
+    errorHint: 'Do not retry the original write command until session recovery finishes. Read-only commands are not blocked.',
+    status: 409,
+  };
+}
+
+export function buildSessionLeaseRevokedFailure(session: string): SessionBusyFailure {
+  return {
+    message: `Session "${session}" rejected a command from a run cancelled during session recovery.`,
+    errorCode: SESSION_LEASE_REVOKED_CODE,
+    errorHint: 'The write outcome may be unknown. Inspect the browser/session state; do not replay the command automatically.',
+    status: 409,
+  };
+}
+
 /** Build the fast-fail response naming the holder, its pid, and hold time. */
 export function buildSessionBusyFailure(
   session: string,
@@ -203,9 +331,7 @@ export function buildSessionBusyFailure(
 ): SessionBusyFailure {
   const heldSeconds = Math.max(0, Math.round((now - holder.startedAt) / 1000));
   const who = holder.pid != null ? `${holder.command} (pid ${holder.pid})` : holder.command;
-  const stop = holder.pid != null
-    ? `Wait for it to finish, or stop it with \`kill ${holder.pid}\` if it is stuck.`
-    : 'Wait for it to finish, or stop that process if it is stuck.';
+  const stop = 'Wait for it to finish, or have its owner request a fenced session recovery.';
   return {
     message: `Session "${session}" is busy: ${who} has been driving it for ${heldSeconds}s.`,
     errorCode: SESSION_BUSY_CODE,

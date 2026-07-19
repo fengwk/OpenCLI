@@ -28,10 +28,27 @@ export interface DaemonStatus {
   profileRequired?: boolean;
   profileDisconnected?: boolean;
   profiles?: BrowserProfileStatus[];
+  /** Feature discovery; callers must not infer recovery support from version. */
+  capabilities?: string[];
+  sessionLeases?: DaemonSessionLeaseStatus[];
   pending: number;
   commandResultUnknown?: number;
   memoryMB: number;
   port: number;
+}
+
+export interface DaemonSessionLeaseStatus {
+  contextId: string;
+  surface: string;
+  session: string;
+  runId: string;
+  command: string;
+  pid: number | null;
+  owner: string;
+  startedAt: number;
+  lastSeenAt: number;
+  pendingCount: number;
+  state: 'ACTIVE' | 'RECOVERING';
 }
 
 export interface BrowserProfileStatus {

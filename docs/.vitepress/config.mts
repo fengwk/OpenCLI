@@ -206,6 +206,7 @@ export default defineConfig({
                 { text: 'Electron Apps', link: '/advanced/electron' },
                 { text: 'Remote Chrome', link: '/advanced/remote-chrome' },
                 { text: 'Download Support', link: '/advanced/download' },
+                { text: 'Persistent Session Recovery', link: '/advanced/session-lease-recovery' },
               ],
             },
           ],

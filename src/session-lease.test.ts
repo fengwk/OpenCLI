@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   SESSION_LEASE_TTL_MS,
+  type LeaseTouchResult,
   SessionLeaseRegistry,
   buildSessionBusyFailure,
   getSessionLeaseKey,
@@ -10,6 +11,11 @@ import {
 } from './session-lease.js';
 
 const T0 = 1_000_000;
+
+function holder(result: LeaseTouchResult) {
+  if (!('holder' in result)) throw new Error('expected a lease holder');
+  return result.holder;
+}
 
 function writeCommand(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -71,8 +77,8 @@ describe('SessionLeaseRegistry', () => {
 
     const second = reg.touch(KEY, { runId: 'run_222_2_b', command: 'chatgpt ask', now: T0 + 1000 });
     expect(second.granted).toBe(false);
-    expect(second.holder.runId).toBe('run_111_1_a');
-    expect(second.holder.pid).toBe(111);
+    expect(holder(second).runId).toBe('run_111_1_a');
+    expect(holder(second).pid).toBe(111);
   });
 
   it('does not block a write on a different session key', () => {
@@ -101,7 +107,7 @@ describe('SessionLeaseRegistry', () => {
       runId: 'run_333_3_c', command: 'chatgpt ask', now: T0 + 1,
     });
     expect(rival.granted).toBe(false);
-    expect(rival.holder.runId).toBe('run_111_1_a');
+    expect(holder(rival).runId).toBe('run_111_1_a');
   });
 
   it('treats same-runId execs as heartbeats that keep the holder alive past the TTL', () => {
@@ -112,13 +118,13 @@ describe('SessionLeaseRegistry', () => {
     // Heartbeat just before expiry keeps startedAt but advances lastSeenAt.
     const beat = reg.touch(KEY, { runId: 'run_111_1_a', command: 'chatgpt ask', now: T0 + SESSION_LEASE_TTL_MS });
     expect(beat.granted).toBe(true);
-    expect(beat.holder.startedAt).toBe(T0);
+    expect(holder(beat).startedAt).toBe(T0);
 
     // A rival long after the original acquire is still blocked because the
     // holder kept refreshing.
     const rival = reg.touch(KEY, { runId: 'run_222_2_b', command: 'chatgpt ask', now: T0 + SESSION_LEASE_TTL_MS + 1 });
     expect(rival.granted).toBe(false);
-    expect(rival.holder.runId).toBe('run_111_1_a');
+    expect(holder(rival).runId).toBe('run_111_1_a');
   });
 
   it('lets a retry re-acquire after the holder dies and the TTL lapses', () => {
@@ -128,7 +134,7 @@ describe('SessionLeaseRegistry', () => {
     // No heartbeats — the holder was killed. Past the TTL the lease is stale.
     const retry = reg.touch(KEY, { runId: 'run_222_2_b', command: 'chatgpt ask', now: T0 + SESSION_LEASE_TTL_MS + 1 });
     expect(retry.granted).toBe(true);
-    expect(retry.holder.runId).toBe('run_222_2_b');
+    expect(holder(retry).runId).toBe('run_222_2_b');
   });
 
   it('releases by runId alone so a retry succeeds immediately on normal completion', () => {
@@ -164,7 +170,7 @@ describe('SessionLeaseRegistry', () => {
       hasPendingWork: (runId) => runId === 'run_111_1_a',
     });
     expect(rival.granted).toBe(false);
-    expect(rival.holder.runId).toBe('run_111_1_a');
+    expect(holder(rival).runId).toBe('run_111_1_a');
   });
 
   it('lets a challenger acquire once the pending command settled and the TTL truly lapsed', () => {
@@ -186,7 +192,7 @@ describe('SessionLeaseRegistry', () => {
       runId: 'run_222_2_b', command: 'chatgpt ask', now: settledAt + SESSION_LEASE_TTL_MS + 1, hasPendingWork: () => false,
     });
     expect(late.granted).toBe(true);
-    expect(late.holder.runId).toBe('run_222_2_b');
+    expect(holder(late).runId).toBe('run_222_2_b');
   });
 
   it('heartbeat never lets a non-owner resurrect or steal the lease', () => {
@@ -227,13 +233,98 @@ describe('SessionLeaseRegistry', () => {
     // A predicate that reports no pending work drops the stale holder again.
     expect(reg.list(staleNow, () => false)).toEqual([]);
   });
+
+  it('keeps a TTL-stale but still-live run observable and unavailable for recovery fencing', () => {
+    const reg = new SessionLeaseRegistry();
+    reg.touch(KEY, { runId: 'run_111_1_a', command: 'chatgpt ask', now: T0 });
+    const staleNow = T0 + SESSION_LEASE_TTL_MS + 10_000;
+
+    const challenger = reg.touch(KEY, {
+      runId: 'run_222_2_b',
+      command: 'chatgpt ask',
+      now: staleNow,
+      hasPendingWork: () => false,
+      isRunAlive: (runId) => runId === 'run_111_1_a',
+    });
+    expect(challenger).toMatchObject({ granted: false, reason: 'busy' });
+    expect(reg.list(staleNow, () => false, (runId) => runId === 'run_111_1_a')).toEqual([
+      expect.objectContaining({ key: KEY, runId: 'run_111_1_a' }),
+    ]);
+  });
+
+  it('uses expectedRunId CAS and refuses to reclaim a holder that has pending work', () => {
+    const reg = new SessionLeaseRegistry();
+    reg.touch(KEY, { runId: 'run_111_1_a', command: 'chatgpt ask', owner: 'hub:one', now: T0 });
+
+    expect(reg.beginRecovery({
+      key: KEY,
+      expectedRunId: 'run_222_2_b',
+      mode: 'RECLAIM_IF_IDLE',
+      pendingCount: 0,
+      now: T0 + 1,
+    }).result).toBe('OWNER_CHANGED');
+    expect(reg.peek(KEY)?.runId).toBe('run_111_1_a');
+
+    expect(reg.beginRecovery({
+      key: KEY,
+      expectedRunId: 'run_111_1_a',
+      mode: 'RECLAIM_IF_IDLE',
+      pendingCount: 1,
+      now: T0 + 1,
+    }).result).toBe('STILL_ACTIVE');
+    expect(reg.peek(KEY)?.state).toBe('ACTIVE');
+  });
+
+  it('fences the old run until reset completion, then admits only a new writer', () => {
+    const reg = new SessionLeaseRegistry();
+    reg.touch(KEY, { runId: 'run_111_1_a', command: 'chatgpt ask', owner: 'hub:one', now: T0 });
+
+    const transition = reg.beginRecovery({
+      key: KEY,
+      expectedRunId: 'run_111_1_a',
+      mode: 'CANCEL_AND_RESET',
+      pendingCount: 1,
+      now: T0 + 1,
+    });
+    expect(transition.result).toBe('RECOVERED');
+    expect(reg.peek(KEY)?.state).toBe('RECOVERING');
+    expect(reg.isRevoked('run_111_1_a')).toBe(true);
+
+    const oldRun = reg.touch(KEY, { runId: 'run_111_1_a', command: 'chatgpt ask', now: T0 + 2 });
+    expect(oldRun).toMatchObject({ granted: false, reason: 'revoked' });
+    const challenger = reg.touch(KEY, { runId: 'run_222_2_b', command: 'chatgpt ask', now: T0 + 2 });
+    expect(challenger).toMatchObject({ granted: false, reason: 'recovering' });
+
+    reg.heartbeat(KEY, 'run_111_1_a', T0 + 3);
+    expect(reg.peek(KEY)?.lastSeenAt).toBe(T0 + 1);
+    expect(reg.completeRecovery(KEY, 'run_111_1_a')).toBe(true);
+    expect(reg.touch(KEY, { runId: 'run_222_2_b', command: 'chatgpt ask', now: T0 + 4 }).granted).toBe(true);
+  });
+
+  it('fences an idle reclaimed run so it cannot reacquire after release', () => {
+    const reg = new SessionLeaseRegistry();
+    reg.touch(KEY, { runId: 'run_111_1_a', command: 'chatgpt ask', now: T0 });
+    expect(reg.beginRecovery({
+      key: KEY,
+      expectedRunId: 'run_111_1_a',
+      mode: 'RECLAIM_IF_IDLE',
+      pendingCount: 0,
+      now: T0 + 1,
+    }).result).toBe('RECOVERED');
+    expect(reg.touch(KEY, { runId: 'run_111_1_a', command: 'chatgpt ask', now: T0 + 2 }))
+      .toMatchObject({ granted: false, reason: 'revoked' });
+    expect(reg.touch(KEY, { runId: 'run_222_2_b', command: 'chatgpt ask', now: T0 + 2 }).granted).toBe(true);
+  });
 });
 
 describe('buildSessionBusyFailure', () => {
   it('names the holder, its pid, and how long it has held the lease', () => {
     const failure = buildSessionBusyFailure(
       'site:chatgpt',
-      { runId: 'run_111_1_a', command: 'chatgpt ask', pid: 111, startedAt: T0, lastSeenAt: T0 + 40_000 },
+      {
+        runId: 'run_111_1_a', command: 'chatgpt ask', pid: 111,
+        startedAt: T0, lastSeenAt: T0 + 40_000, owner: 'cli', state: 'ACTIVE',
+      },
       T0 + 42_000,
     );
     expect(failure.status).toBe(409);
@@ -241,14 +332,14 @@ describe('buildSessionBusyFailure', () => {
     expect(failure.message).toContain('chatgpt ask');
     expect(failure.message).toContain('pid 111');
     expect(failure.message).toContain('42s');
-    expect(failure.errorHint).toContain('kill 111');
+    expect(failure.errorHint).toContain('fenced session recovery');
     expect(failure.errorHint).toContain('Read-only commands are not blocked');
   });
 
   it('degrades gracefully when the pid is unknown', () => {
     const failure = buildSessionBusyFailure(
       'site:chatgpt',
-      { runId: 'x', command: 'chatgpt ask', pid: null, startedAt: T0, lastSeenAt: T0 },
+      { runId: 'x', command: 'chatgpt ask', pid: null, startedAt: T0, lastSeenAt: T0, owner: 'cli', state: 'ACTIVE' },
       T0 + 5_000,
     );
     expect(failure.message).not.toContain('pid');

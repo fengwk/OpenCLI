@@ -29,6 +29,8 @@ import { PKG_VERSION } from './version.js';
 import { DEFAULT_CONTEXT_ID } from './browser/profile.js';
 import { recordExtensionVersion } from './update-check.js';
 import {
+  COMMAND_RESULT_UNKNOWN_CODE,
+  COMMAND_RESULT_UNKNOWN_HINT,
   PROFILE_DISCONNECTED_HINT,
   buildCommandDispatchFailure,
   buildCommandTimeoutFailure,
@@ -39,8 +41,14 @@ import {
 import {
   SessionLeaseRegistry,
   buildSessionBusyFailure,
+  buildSessionLeaseRevokedFailure,
+  buildSessionRecoveringFailure,
   getSessionLeaseKey,
   isSessionLeaseCommand,
+  parseSessionLeaseKey,
+  parsePidFromRunId,
+  SESSION_RECOVERY_FAILED_CODE,
+  type SessionLeaseRecoveryMode,
 } from './session-lease.js';
 
 const PORT = DEFAULT_DAEMON_PORT;
@@ -83,8 +91,13 @@ type PendingEntry = {
    */
   leaseKey?: string;
   runId?: string;
+  /** Recovery fenced this run; late extension results must never revive it. */
+  recoveryRevoked?: boolean;
 };
 const pending = new Map<string, PendingEntry>();
+
+const SESSION_RECOVERY_RESET_TIMEOUT_MS = 5_000;
+const DAEMON_CAPABILITIES = ['session-lease-v1', 'session-recover-v1'] as const;
 
 // One logical write lease per (contextId, surface, persistent site session).
 // Serializes concurrent adapter write commands so a retry can't drive the same
@@ -100,12 +113,93 @@ function runHasPendingWork(runId: string): boolean {
   return false;
 }
 
+function pendingCountForRun(runId: string): number {
+  let count = 0;
+  for (const entry of pending.values()) {
+    if (entry.runId === runId) count++;
+  }
+  return count;
+}
+
+/** Conservative owner liveness: only ESRCH proves a CLI run is gone. */
+function isRunOwnerProcessAlive(runId: string): boolean {
+  const pid = parsePidFromRunId(runId);
+  return pid !== null && pid !== process.pid && !isOwnerProcessConfirmedDead(pid);
+}
+
+function sessionLeaseStatus(): Array<{
+  contextId: string;
+  surface: string;
+  session: string;
+  runId: string;
+  command: string;
+  pid: number | null;
+  owner: string;
+  startedAt: number;
+  lastSeenAt: number;
+  pendingCount: number;
+  state: 'ACTIVE' | 'RECOVERING';
+}> {
+  return sessionLeases.list(Date.now(), runHasPendingWork, isRunOwnerProcessAlive).flatMap(({ key, ...holder }) => {
+    const identity = parseSessionLeaseKey(key);
+    if (!identity) return [];
+    return [{
+      ...identity,
+      ...holder,
+      pendingCount: pendingCountForRun(holder.runId),
+    }];
+  });
+}
+
+function recoveredPendingFailure(action: string): DaemonCommandFailure {
+  return new DaemonCommandFailure(
+    `Browser ${action} command was cancelled during session recovery; it may have completed before the reset.`,
+    COMMAND_RESULT_UNKNOWN_CODE,
+    COMMAND_RESULT_UNKNOWN_HINT,
+    503,
+  );
+}
+
+/** Fence pending work before reset so a late extension result is ignored. */
+function markRunPendingForRecovery(runId: string): void {
+  for (const entry of pending.values()) {
+    if (entry.runId !== runId) continue;
+    entry.recoveryRevoked = true;
+    clearTimeout(entry.timer);
+  }
+}
+
+/** Settle every old HTTP waiter as unknown after a reset attempt. */
+function settleRunPendingAsUnknown(runId: string): number {
+  let settled = 0;
+  for (const [id, entry] of [...pending.entries()]) {
+    if (entry.runId !== runId) continue;
+    if (entry.dispatched) commandResultUnknownCount++;
+    settlePending(id, entry, { error: recoveredPendingFailure(entry.action) });
+    settled++;
+  }
+  return settled;
+}
+
+/** `ESRCH` proves the client process is gone; all other results are conservative. */
+function isOwnerProcessConfirmedDead(pid: number | null): boolean {
+  if (pid === null || pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'ESRCH';
+  }
+}
+
 function settlePending(id: string, entry: PendingEntry, outcome: { data?: unknown; error?: Error }): void {
   clearTimeout(entry.timer);
   pending.delete(id);
   // A settling command is proof of holder liveness — restart the TTL clock so
   // an exec that outlived the TTL hands over to normal heartbeats seamlessly.
-  if (entry.leaseKey && entry.runId) sessionLeases.heartbeat(entry.leaseKey, entry.runId, Date.now());
+  if (entry.leaseKey && entry.runId && !entry.recoveryRevoked) {
+    sessionLeases.heartbeat(entry.leaseKey, entry.runId, Date.now());
+  }
   for (const settler of entry.settlers) {
     if (outcome.error) settler.reject(outcome.error);
     else settler.resolve(outcome.data);
@@ -169,6 +263,205 @@ function resolveExtensionConnection(contextId?: string, preferredContextId?: str
     errorCode: 'profile_disconnected',
     error: `Browser profile "${route.contextId}" is not connected.`,
     errorHint: PROFILE_DISCONNECTED_HINT,
+  };
+}
+
+let recoveryCommandSequence = 0;
+
+async function resetExtensionSession(input: {
+  connection: ExtensionProfileConnection;
+  contextId: string;
+  surface: string;
+  session: string;
+}): Promise<boolean> {
+  const id = `session-recover-${process.pid}-${Date.now()}-${++recoveryCommandSequence}`;
+  const result = await new Promise<unknown>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const entry = pending.get(id);
+      if (!entry) return;
+      settlePending(id, entry, {
+        error: new DaemonCommandFailure(
+          `Timed out waiting for the Browser Bridge to reset session "${input.session}".`,
+          SESSION_RECOVERY_FAILED_CODE,
+          'Keep the session fenced and retry recovery after the Browser Bridge reconnects.',
+          503,
+        ),
+      });
+    }, SESSION_RECOVERY_RESET_TIMEOUT_MS);
+    const entry: PendingEntry = {
+      contextId: input.contextId,
+      action: 'close-window',
+      dispatched: false,
+      settlers: [{ resolve, reject }],
+      timer,
+    };
+    pending.set(id, entry);
+    const failBeforeDispatch = (err: unknown) => {
+      if (pending.get(id) !== entry) return;
+      settlePending(id, entry, {
+        error: new DaemonCommandFailure(
+          `Failed to dispatch Browser Bridge session reset: ${err instanceof Error ? err.message : String(err)}`,
+          SESSION_RECOVERY_FAILED_CODE,
+          'Keep the session fenced and retry recovery after the Browser Bridge reconnects.',
+          503,
+        ),
+      });
+    };
+    try {
+      input.connection.ws.send(JSON.stringify({
+        id,
+        action: 'close-window',
+        contextId: input.contextId,
+        surface: input.surface,
+        session: input.session,
+        siteSession: 'persistent',
+      }), (err?: Error) => {
+        if (err && !entry.dispatched) failBeforeDispatch(err);
+      });
+      entry.dispatched = true;
+    } catch (err) {
+      failBeforeDispatch(err);
+    }
+  });
+  return typeof result === 'object' && result !== null && (result as { ok?: unknown }).ok === true;
+}
+
+type SessionRecoveryResponse = {
+  ok: boolean;
+  result: 'RECOVERED' | 'ALREADY_FREE' | 'STILL_ACTIVE' | 'OWNER_CHANGED' | 'RESET_FAILED';
+  runId?: string;
+  tabReset: boolean;
+  cancelledPending: number;
+  errorCode?: string;
+  error?: string;
+  errorHint?: string;
+};
+
+type SessionRecoveryInput = {
+  contextId: string;
+  surface: string;
+  session: string;
+  expectedRunId: string;
+  mode: SessionLeaseRecoveryMode;
+  reason?: string;
+};
+
+const recoveryInFlight = new Map<string, Promise<SessionRecoveryResponse>>();
+
+function recoverSessionLease(input: SessionRecoveryInput): Promise<SessionRecoveryResponse> {
+  const inFlightKey = `${getSessionLeaseKey(input.contextId, input.surface, input.session)}␟${input.expectedRunId}`;
+  const existing = recoveryInFlight.get(inFlightKey);
+  if (existing) return existing;
+
+  const recovery = performSessionLeaseRecovery(input);
+  recoveryInFlight.set(inFlightKey, recovery);
+  void recovery.then(
+    () => { if (recoveryInFlight.get(inFlightKey) === recovery) recoveryInFlight.delete(inFlightKey); },
+    () => { if (recoveryInFlight.get(inFlightKey) === recovery) recoveryInFlight.delete(inFlightKey); },
+  );
+  return recovery;
+}
+
+async function performSessionLeaseRecovery(input: SessionRecoveryInput): Promise<SessionRecoveryResponse> {
+  const key = getSessionLeaseKey(input.contextId, input.surface, input.session);
+  const transition = sessionLeases.beginRecovery({
+    key,
+    expectedRunId: input.expectedRunId,
+    mode: input.mode,
+    pendingCount: pendingCountForRun(input.expectedRunId),
+    now: Date.now(),
+  });
+
+  if (transition.result === 'ALREADY_FREE' || transition.result === 'OWNER_CHANGED') {
+    return {
+      ok: true,
+      result: transition.result,
+      ...(transition.holder ? { runId: transition.holder.runId } : {}),
+      tabReset: false,
+      cancelledPending: 0,
+    };
+  }
+  if (transition.result === 'STILL_ACTIVE' && !transition.retryReset) {
+    return {
+      ok: true,
+      result: 'STILL_ACTIVE',
+      runId: input.expectedRunId,
+      tabReset: false,
+      cancelledPending: 0,
+    };
+  }
+  if (input.mode === 'RECLAIM_IF_IDLE') {
+    return {
+      ok: true,
+      result: 'RECOVERED',
+      runId: input.expectedRunId,
+      tabReset: false,
+      cancelledPending: 0,
+    };
+  }
+
+  // From here the exact run is fenced and the lease is RECOVERING. Preserve
+  // pending entries until the reset attempt finishes so late results cannot
+  // heartbeat or be mistaken for safe completion.
+  markRunPendingForRecovery(input.expectedRunId);
+  const connection = extensionProfiles.get(input.contextId);
+  let tabReset = false;
+  let resetError: unknown;
+  if (connection?.ws.readyState === WebSocket.OPEN) {
+    try {
+      tabReset = await resetExtensionSession({
+        connection,
+        contextId: input.contextId,
+        surface: input.surface,
+        session: input.session,
+      });
+    } catch (err) {
+      resetError = err;
+    }
+  } else {
+    resetError = new Error(`Browser profile "${input.contextId}" is not connected.`);
+  }
+
+  const cancelledPending = settleRunPendingAsUnknown(input.expectedRunId);
+  if (!tabReset) {
+    const detail = resetError instanceof Error ? resetError.message : 'Browser Bridge did not confirm the session reset.';
+    log.warn(
+      `[daemon] Session recovery reset failed (context=${input.contextId}, session=${input.session}, ` +
+      `runId=${input.expectedRunId}, reason=${input.reason ?? 'unspecified'}): ${detail}`,
+    );
+    return {
+      ok: false,
+      result: 'RESET_FAILED',
+      runId: input.expectedRunId,
+      tabReset: false,
+      cancelledPending,
+      errorCode: SESSION_RECOVERY_FAILED_CODE,
+      error: detail,
+      errorHint: 'The old run remains fenced and the lease remains RECOVERING. Retry recovery or restart only this Chrome profile.',
+    };
+  }
+  if (!sessionLeases.completeRecovery(key, input.expectedRunId)) {
+    return {
+      ok: false,
+      result: 'RESET_FAILED',
+      runId: input.expectedRunId,
+      tabReset: true,
+      cancelledPending,
+      errorCode: SESSION_RECOVERY_FAILED_CODE,
+      error: 'Session lease ownership changed while completing recovery.',
+      errorHint: 'Inspect daemon status before retrying; do not replay the original write command.',
+    };
+  }
+  log.info(
+    `[daemon] Recovered session (context=${input.contextId}, session=${input.session}, ` +
+    `runId=${input.expectedRunId}, cancelledPending=${cancelledPending}, reason=${input.reason ?? 'unspecified'})`,
+  );
+  return {
+    ok: true,
+    result: 'RECOVERED',
+    runId: input.expectedRunId,
+    tabReset: true,
+    cancelledPending,
   };
 }
 
@@ -316,7 +609,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       profileDisconnected: route.errorCode === 'profile_disconnected',
       profiles,
       pending: pending.size,
-      sessionLeases: sessionLeases.list(Date.now(), runHasPendingWork),
+      capabilities: DAEMON_CAPABILITIES,
+      sessionLeases: sessionLeaseStatus(),
       commandResultUnknown: commandResultUnknownCount,
       memoryMB: Math.round(mem.rss / 1024 / 1024 * 10) / 10,
       port: PORT,
@@ -343,6 +637,45 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   if (req.method === 'POST' && pathname === '/shutdown') {
     jsonResponse(res, 200, { ok: true, message: 'Shutting down' });
     setTimeout(() => shutdown(), 100);
+    return;
+  }
+
+  if (req.method === 'POST' && pathname === '/session-leases/recover') {
+    try {
+      const body = JSON.parse(await readBody(req)) as Record<string, unknown>;
+      const contextId = typeof body.contextId === 'string' ? body.contextId.trim() : '';
+      const surface = typeof body.surface === 'string' ? body.surface.trim() : '';
+      const session = typeof body.session === 'string' ? body.session.trim() : '';
+      const expectedRunId = typeof body.expectedRunId === 'string' ? body.expectedRunId.trim() : '';
+      const mode = body.mode;
+      if (!contextId || surface !== 'adapter' || !session || !expectedRunId || (
+        mode !== 'RECLAIM_IF_IDLE' && mode !== 'CANCEL_AND_RESET'
+      )) {
+        jsonResponse(res, 400, {
+          ok: false,
+          errorCode: 'invalid_session_recovery_request',
+          error: 'contextId, surface=adapter, session, expectedRunId, and a valid recovery mode are required.',
+        });
+        return;
+      }
+      const result = await recoverSessionLease({
+        contextId,
+        surface,
+        session,
+        expectedRunId,
+        mode,
+        ...(typeof body.reason === 'string' && body.reason.trim()
+          ? { reason: body.reason.trim().replace(/[\r\n]+/g, ' ').slice(0, 200) }
+          : {}),
+      });
+      jsonResponse(res, result.ok ? 200 : 503, result);
+    } catch (err) {
+      jsonResponse(res, 400, {
+        ok: false,
+        errorCode: 'invalid_session_recovery_request',
+        error: err instanceof Error ? err.message : 'Invalid session recovery request',
+      });
+    }
     return;
   }
 
@@ -391,20 +724,72 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       if (isSessionLeaseCommand(body)) {
         const now = Date.now();
         const key = getSessionLeaseKey(route.connection.contextId, body.surface, body.session);
+        const current = sessionLeases.peek(key);
+        // SIGKILL cannot run CLI cleanup. A challenger may prove the holder's
+        // PID no longer exists, then safely reclaim an idle lease or start a
+        // fenced reset for pending browser work. EPERM/unknown stay busy.
+        if (
+          current &&
+          current.runId !== body.runId &&
+          current.state === 'ACTIVE' &&
+          isOwnerProcessConfirmedDead(current.pid)
+        ) {
+          const pendingCount = pendingCountForRun(current.runId);
+          if (pendingCount === 0) {
+            sessionLeases.beginRecovery({
+              key,
+              expectedRunId: current.runId,
+              mode: 'RECLAIM_IF_IDLE',
+              pendingCount,
+              now,
+            });
+          } else {
+            // recoverSessionLease fences synchronously before its first await.
+            void recoverSessionLease({
+              contextId: route.connection.contextId,
+              surface: body.surface,
+              session: body.session,
+              expectedRunId: current.runId,
+              mode: 'CANCEL_AND_RESET',
+              reason: 'owner_process_dead',
+            }).catch((err) => {
+              log.error(`[daemon] Orphan session recovery failed: ${err instanceof Error ? err.message : String(err)}`);
+            });
+            const recovering = sessionLeases.peek(key) ?? current;
+            const failure = buildSessionRecoveringFailure(body.session, recovering);
+            jsonResponse(res, failure.status, {
+              id: body.id,
+              ok: false,
+              errorCode: failure.errorCode,
+              error: failure.message,
+              errorHint: failure.errorHint,
+            });
+            return;
+          }
+        }
         const outcome = sessionLeases.touch(key, {
           runId: body.runId,
           command: typeof body.command === 'string' && body.command ? body.command : body.action,
+          owner: typeof body.owner === 'string' ? body.owner : undefined,
           now,
           // A holder past the TTL whose exec is still in flight is alive — a
-          // single slow command produces no heartbeat until it settles.
+          // single slow command produces no heartbeat until it settles. A live
+          // CLI between commands is also retained so recovery can fence it.
           hasPendingWork: runHasPendingWork,
+          isRunAlive: isRunOwnerProcessAlive,
         });
         if (!outcome.granted) {
-          const failure = buildSessionBusyFailure(body.session, outcome.holder, now);
-          log.warn(
-            `[daemon] Session ${key} busy — rejected ${body.command ?? body.action} ` +
-            `(runId=${body.runId}); held by ${outcome.holder.command} (runId=${outcome.holder.runId})`,
-          );
+          const failure = outcome.reason === 'revoked'
+            ? buildSessionLeaseRevokedFailure(body.session)
+            : outcome.reason === 'recovering'
+              ? buildSessionRecoveringFailure(body.session, outcome.holder)
+              : buildSessionBusyFailure(body.session, outcome.holder, now);
+          if (outcome.reason !== 'revoked') {
+            log.warn(
+              `[daemon] Session ${key} ${outcome.reason} — rejected ${body.command ?? body.action} ` +
+              `(runId=${body.runId}); held by ${outcome.holder.command} (runId=${outcome.holder.runId})`,
+            );
+          }
           jsonResponse(res, failure.status, {
             id: body.id,
             ok: false,
@@ -561,6 +946,10 @@ wss.on('connection', (ws: WebSocket) => {
       // Handle command results
       const p = pending.get(msg.id);
       if (p) {
+        if (p.recoveryRevoked) {
+          log.warn(`[daemon] Ignoring late result from fenced run (id=${msg.id}, action=${p.action}, runId=${p.runId})`);
+          return;
+        }
         settlePending(msg.id, p, { data: msg });
       }
     } catch (err) {

@@ -5,8 +5,13 @@
  */
 
 import { sleep } from '../utils.js';
-import { BrowserConnectError, SessionBusyError } from '../errors.js';
+import { BrowserConnectError, SessionBusyError, SessionLeaseRevokedError, SessionRecoveringError } from '../errors.js';
 import { COMMAND_RESULT_UNKNOWN_CODE, COMMAND_RESULT_UNKNOWN_HINT } from '../daemon-utils.js';
+import {
+  SESSION_LEASE_REVOKED_CODE,
+  SESSION_RECOVERING_CODE,
+  SESSION_RECOVERY_FAILED_CODE,
+} from '../session-lease.js';
 import { classifyBrowserError } from './errors.js';
 import { profileRouteParams, resolveProfileSelection } from './profile.js';
 import { DEFAULT_BROWSER_CONNECT_TIMEOUT } from './config.js';
@@ -18,6 +23,7 @@ import {
   requestDaemon,
   requestDaemonShutdown,
   type BrowserProfileStatus,
+  type DaemonSessionLeaseStatus,
   type DaemonHealth,
   type DaemonStatus,
 } from './daemon-transport.js';
@@ -46,6 +52,7 @@ export interface DaemonRunContext {
   runId: string;
   command: string;
   access: 'read' | 'write';
+  owner?: string;
 }
 
 let _runContext: DaemonRunContext | null = null;
@@ -62,6 +69,102 @@ export function setDaemonRunContext(ctx: DaemonRunContext | null): void {
  */
 export function clearDaemonRunContext(runId: string): void {
   if (_runContext?.runId === runId) _runContext = null;
+}
+
+export function resolveDaemonRunOwner(): string {
+  return process.env.OPENCLI_RUN_OWNER?.trim() || 'cli';
+}
+
+export type SessionLeaseRecoveryMode = 'RECLAIM_IF_IDLE' | 'CANCEL_AND_RESET';
+export type SessionLeaseRecoveryResult = 'RECOVERED' | 'ALREADY_FREE' | 'STILL_ACTIVE' | 'OWNER_CHANGED' | 'RESET_FAILED';
+
+export type SessionLeaseRecoveryResponse = {
+  ok: boolean;
+  result: SessionLeaseRecoveryResult;
+  runId?: string;
+  tabReset: boolean;
+  cancelledPending: number;
+  errorCode?: string;
+  error?: string;
+  errorHint?: string;
+};
+
+const SESSION_LEASE_RECOVERY_RESULTS = new Set<SessionLeaseRecoveryResult>([
+  'RECOVERED',
+  'ALREADY_FREE',
+  'STILL_ACTIVE',
+  'OWNER_CHANGED',
+  'RESET_FAILED',
+]);
+
+function recoveryFailure(message: string): SessionLeaseRecoveryResponse {
+  return {
+    ok: false,
+    result: 'RESET_FAILED',
+    tabReset: false,
+    cancelledPending: 0,
+    errorCode: SESSION_RECOVERY_FAILED_CODE,
+    error: message,
+  };
+}
+
+/**
+ * Discover the daemon-resolved context before issuing the strict CAS request.
+ * This is needed when the CLI used a preferred profile and the daemon selected
+ * the only currently connected profile.
+ */
+export async function recoverSiteSessionLease(params: {
+  runId: string;
+  session: string;
+  surface: 'adapter';
+  mode: SessionLeaseRecoveryMode;
+  reason: string;
+}): Promise<SessionLeaseRecoveryResponse> {
+  const status = await fetchDaemonStatus();
+  if (!status) return recoveryFailure('OpenCLI daemon is unavailable for session recovery.');
+  if (!status.capabilities?.includes('session-recover-v1')) {
+    return recoveryFailure('The running OpenCLI daemon does not support session-recover-v1.');
+  }
+  const lease = status.sessionLeases?.find((entry: DaemonSessionLeaseStatus) =>
+    entry.runId === params.runId && entry.session === params.session && entry.surface === params.surface,
+  );
+  if (!lease) {
+    return {
+      ok: true,
+      result: 'ALREADY_FREE',
+      runId: params.runId,
+      tabReset: false,
+      cancelledPending: 0,
+    };
+  }
+  try {
+    const res = await requestDaemon('/session-leases/recover', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contextId: lease.contextId,
+        surface: params.surface,
+        session: params.session,
+        expectedRunId: params.runId,
+        mode: params.mode,
+        reason: params.reason,
+      }),
+      timeout: 7_000,
+    });
+    const result = await res.json() as Partial<SessionLeaseRecoveryResponse>;
+    if (
+      typeof result.ok !== 'boolean' ||
+      typeof result.result !== 'string' ||
+      !SESSION_LEASE_RECOVERY_RESULTS.has(result.result as SessionLeaseRecoveryResult) ||
+      typeof result.tabReset !== 'boolean' ||
+      typeof result.cancelledPending !== 'number'
+    ) {
+      return recoveryFailure('OpenCLI daemon returned an invalid session recovery response.');
+    }
+    return result as SessionLeaseRecoveryResponse;
+  } catch (err) {
+    return recoveryFailure(`Session recovery request failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 /**
@@ -271,6 +374,8 @@ export interface DaemonCommand {
   command?: string;
   /** Command access level; only 'write' commands take/hold a session lease. */
   access?: 'read' | 'write';
+  /** Optional caller ownership label, e.g. an OpenCLI Hub execution identity. */
+  owner?: string;
 }
 
 export interface DaemonResult {
@@ -386,6 +491,7 @@ async function sendCommandRaw(
         runId: _runContext.runId,
         command: _runContext.command,
         access: _runContext.access,
+        owner: _runContext.owner ?? 'cli',
       }),
     };
     try {
@@ -405,6 +511,14 @@ async function sendCommandRaw(
       // retried, and surfaced as a CliError so the busy message is the output.
       if (result.errorCode === 'session_busy') {
         throw new SessionBusyError(result.error ?? 'The site session is busy.', result.errorHint);
+      }
+
+      if (result.errorCode === SESSION_RECOVERING_CODE) {
+        throw new SessionRecoveringError(result.error ?? 'The site session is recovering.', result.errorHint);
+      }
+
+      if (result.errorCode === SESSION_LEASE_REVOKED_CODE) {
+        throw new SessionLeaseRevokedError(result.error ?? 'This command run was cancelled during session recovery.', result.errorHint);
       }
 
       if (result.errorCode && UNKNOWN_OUTCOME_CODES.has(result.errorCode)) {
@@ -442,7 +556,15 @@ async function sendCommandRaw(
 
       throw new BrowserCommandError(result.error ?? 'Daemon command failed', result.errorCode, result.errorHint);
     } catch (err) {
-      if (err instanceof BrowserCommandError || err instanceof BrowserConnectError || err instanceof SessionBusyError) throw err;
+      if (
+        err instanceof BrowserCommandError ||
+        err instanceof BrowserConnectError ||
+        err instanceof SessionBusyError ||
+        err instanceof SessionRecoveringError ||
+        err instanceof SessionLeaseRevokedError
+      ) {
+        throw err;
+      }
 
       if (err instanceof Error && err.name === 'AbortError') {
         throw new BrowserCommandError(

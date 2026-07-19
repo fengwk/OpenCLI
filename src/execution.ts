@@ -26,11 +26,22 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import { executePipeline } from './pipeline/index.js';
-import { adapterLoadError, ArgumentError, CommandExecutionError, SessionBusyError, attachTraceReceipt, getErrorMessage } from './errors.js';
+import { adapterLoadError, ArgumentError, CommandExecutionError, SessionBusyError, TimeoutError, attachTraceReceipt, getErrorMessage } from './errors.js';
 import { shouldUseBrowserSession } from './capabilityRouting.js';
 import { getBrowserFactory, browserSession, runWithTimeout, DEFAULT_BROWSER_COMMAND_TIMEOUT, type BrowserWindowMode } from './runtime.js';
 import { profileRouteParams, resolveProfileSelection } from './browser/profile.js';
-import { clearDaemonRunContext, generateRunId, isUnknownOutcomeError, releaseSiteSessionLease, setDaemonCommandTimeoutSeconds, setDaemonRunContext } from './browser/daemon-client.js';
+import {
+  clearDaemonRunContext,
+  generateRunId,
+  isUnknownOutcomeError,
+  recoverSiteSessionLease,
+  releaseSiteSessionLease,
+  resolveDaemonRunOwner,
+  setDaemonCommandTimeoutSeconds,
+  setDaemonRunContext,
+  type SessionLeaseRecoveryResponse,
+} from './browser/daemon-client.js';
+import { installBoundedSignalRecovery } from './browser/session-recovery.js';
 import { emitHook, type HookContext } from './hooks.js';
 import { log } from './logger.js';
 import { isElectronApp } from './electron-apps.js';
@@ -273,8 +284,53 @@ export async function executeCommand(
       const leaseRun = siteSession === 'persistent' && cmd.access === 'write'
         ? { runId: generateRunId(), session }
         : null;
-      if (leaseRun) setDaemonRunContext({ runId: leaseRun.runId, command: fullName(cmd), access: 'write' });
+      if (leaseRun) {
+        setDaemonRunContext({
+          runId: leaseRun.runId,
+          command: fullName(cmd),
+          access: 'write',
+          owner: resolveDaemonRunOwner(),
+        });
+      }
       let browserRunError: unknown;
+      let recoveryPromise: Promise<SessionLeaseRecoveryResponse> | null = null;
+      const requestSessionRecovery = (reason: string): Promise<SessionLeaseRecoveryResponse> => {
+        if (!leaseRun) {
+          return Promise.resolve({ ok: true, result: 'ALREADY_FREE', tabReset: false, cancelledPending: 0 });
+        }
+        if (!recoveryPromise) {
+          recoveryPromise = recoverSiteSessionLease({
+            runId: leaseRun.runId,
+            session: leaseRun.session,
+            surface: 'adapter',
+            mode: 'CANCEL_AND_RESET',
+            reason,
+          }).then((response) => {
+            if (!response.ok) {
+              log.warn(`Session recovery failed for ${fullName(cmd)}: ${response.error ?? response.result}`);
+            }
+            return response;
+          }).catch((err) => {
+            const response: SessionLeaseRecoveryResponse = {
+              ok: false,
+              result: 'RESET_FAILED',
+              tabReset: false,
+              cancelledPending: 0,
+              errorCode: 'session_recovery_failed',
+              error: err instanceof Error ? err.message : String(err),
+            };
+            log.warn(`Session recovery failed for ${fullName(cmd)}: ${response.error}`);
+            return response;
+          });
+        }
+        return recoveryPromise;
+      };
+      const removeSignalRecovery = leaseRun
+        ? installBoundedSignalRecovery({
+          recover: () => requestSessionRecovery('cli_signal'),
+          terminate: (signal) => process.kill(process.pid, signal),
+        })
+        : null;
       // `as` casts defeat literal narrowing: both are assigned only inside the
       // browserSession callback, which TS's flow analysis does not see from the
       // finally block below.
@@ -342,6 +398,8 @@ export async function executeCommand(
             // the cause chain, and a pre-nav navigate/exec can itself end with an
             // unknown outcome while still running against the persistent tab.
             wrapped.cause = err;
+            const needsRecovery = leaseRun !== null && isUnknownOutcomeError(wrapped);
+            if (needsRecovery) await requestSessionRecovery('command_outcome_unknown');
             if (observation && (traceMode === 'on' || traceMode === 'retain-on-failure')) {
               observation.record({
                 stream: 'error',
@@ -350,7 +408,7 @@ export async function executeCommand(
                 code: wrapped.code,
                 hint: wrapped.hint,
               });
-              await collectObservationEvidence(observation, page).catch(() => {});
+              if (!needsRecovery) await collectObservationEvidence(observation, page).catch(() => {});
               exportTraceArtifact(observation, 'failure', wrapped, opts.onTraceExport);
             }
             throw wrapped;
@@ -388,69 +446,77 @@ export async function executeCommand(
           return result;
         } catch (err) {
           if (!commandSettled) adapterStillRunning = true;
+          const needsRecovery = leaseRun !== null && (
+            !commandSettled || isUnknownOutcomeError(err)
+          );
+          let surfacedError = err;
+          if (needsRecovery) {
+            const recovery = await requestSessionRecovery(
+              err instanceof TimeoutError ? 'execution_timeout' : 'command_outcome_unknown',
+            );
+            if (err instanceof TimeoutError && !recovery.ok) {
+              surfacedError = new TimeoutError(
+                fullName(cmd),
+                browserTimeout,
+                `${err.hint ?? 'The command timed out.'} Session recovery failed: ${recovery.error ?? recovery.result}.`,
+              );
+            }
+          }
           if (observation) {
             observation.record({
               stream: 'action',
               name: 'command',
               phase: 'error',
-              data: { error: err instanceof Error ? err.message : String(err) },
+              data: { error: surfacedError instanceof Error ? surfacedError.message : String(surfacedError) },
             });
             observation.record({
               stream: 'error',
-              message: err instanceof Error ? err.message : String(err),
-              stack: err instanceof Error ? err.stack : undefined,
+              message: surfacedError instanceof Error ? surfacedError.message : String(surfacedError),
+              stack: surfacedError instanceof Error ? surfacedError.stack : undefined,
             });
             if (traceMode === 'on' || traceMode === 'retain-on-failure') {
-              await collectObservationEvidence(observation, page).catch(() => {});
-              exportTraceArtifact(observation, 'failure', err, opts.onTraceExport);
+              // A trace capture sends further browser commands. Once a write is
+              // timed out/unknown, fence/reset it first and never add work to
+              // the session we are recovering.
+              if (!needsRecovery) await collectObservationEvidence(observation, page).catch(() => {});
+              exportTraceArtifact(observation, 'failure', surfacedError, opts.onTraceExport);
             }
           }
           // Release the tab lease on failure too — without this, the lease lingers
           // until the extension's idle timer fires (unreliable on Windows where
           // MV3 service workers may be suspended before setTimeout triggers).
-          if (!keepTab) await page.closeWindow?.().catch(() => {});
-          throw err;
+          if (!keepTab && !needsRecovery) await page.closeWindow?.().catch(() => {});
+          throw surfacedError;
         }
       }, { session, cdpEndpoint, ...profileRouting, windowMode, surface: 'adapter', siteSession });
       } catch (err) {
         browserRunError = err;
         throw err;
       } finally {
-        // Clear the run identity whether the command succeeded or failed, then
-        // release the lease so a retry succeeds immediately. Best-effort: TTL
-        // reclaims it if the release is lost.
-        //
-        // Exceptions — cases where the session may still be driven, so an
-        // immediate explicit release would hand the lease to a challenger that
-        // then collides with the stale work (the very collision this lease
-        // prevents):
-        // - A CLI-layer timeout does not cancel the adapter promise, and the
-        //   process only exits when the event loop drains, so the adapter may
-        //   keep driving the tab for minutes. Keep the run identity bound: its
-        //   follow-up commands heartbeat the lease (challengers stay blocked
-        //   past the TTL), and cleanup runs when the adapter finally settles.
-        //   If the process dies first, the daemon TTL reclaims the lease.
-        // - An unknown-outcome failure (result-unknown / command-lost /
-        //   result-evicted, anywhere in the cause chain) means the browser-side
-        //   command may STILL be running against the persistent tab; there is
-        //   nothing to await client-side, so the TTL is the quiet period.
+        removeSignalRecovery?.();
         if (leaseRun) {
+          // Pre-navigation can surface an unknown outcome outside the adapter
+          // timeout catch. It still needs the same fence -> reset path.
+          if (!recoveryPromise && isUnknownOutcomeError(browserRunError)) {
+            await requestSessionRecovery('command_outcome_unknown');
+          }
+          const runWasFenced = recoveryPromise !== null;
           if (adapterStillRunning && adapterRun) {
             const runId = leaseRun.runId;
             const session = leaseRun.session;
             const settle = (err?: unknown) => {
               clearDaemonRunContext(runId);
-              // Same rule as the immediate path below: an unknown-outcome
-              // ending means the browser side may still be busy — skip the
-              // explicit release and leave the lease to TTL reclamation.
-              if (!isUnknownOutcomeError(err)) {
+              // Keep the old context attached until its promise settles: after
+              // recovery its next browser command carries the revoked runId
+              // and is rejected by the daemon instead of bypassing arbitration.
+              if (!runWasFenced && !isUnknownOutcomeError(err)) {
                 void releaseSiteSessionLease({ runId, session, surface: 'adapter' });
               }
             };
             adapterRun.then(() => settle(), (err) => settle(err));
           } else {
-            setDaemonRunContext(null);
-            if (!isUnknownOutcomeError(browserRunError)) {
+            clearDaemonRunContext(leaseRun.runId);
+            if (!runWasFenced && !isUnknownOutcomeError(browserRunError)) {
               await releaseSiteSessionLease({ runId: leaseRun.runId, session: leaseRun.session, surface: 'adapter' });
             }
           }

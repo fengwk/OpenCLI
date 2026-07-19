@@ -142,6 +142,20 @@ export class SessionBusyError extends CliError {
   }
 }
 
+/** A recovery is fencing and resetting the persistent write session. */
+export class SessionRecoveringError extends CliError {
+  constructor(message: string, hint?: string) {
+    super('SESSION_RECOVERING', message, hint, EXIT_CODES.TEMPFAIL);
+  }
+}
+
+/** A stale adapter run attempted browser work after it was fenced. */
+export class SessionLeaseRevokedError extends CliError {
+  constructor(message: string, hint?: string) {
+    super('SESSION_LEASE_REVOKED', message, hint, EXIT_CODES.TEMPFAIL);
+  }
+}
+
 export class EmptyResultError extends CliError {
   constructor(command: string, hint?: string) {
     super(

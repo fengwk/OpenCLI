@@ -22,7 +22,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createConnection } from 'node:net';
 import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import WebSocket from 'ws';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -114,6 +114,31 @@ async function postCommand(body: Record<string, unknown>, timeoutMs = 15_000): P
     signal: AbortSignal.timeout(timeoutMs),
   });
   return { status: res.status, result: (await res.json()) as WireResult };
+}
+
+async function postRecovery(body: Record<string, unknown>, timeoutMs = 15_000): Promise<{ status: number; result: WireResult }> {
+  const res = await fetch(`${BASE}/session-leases/recover`, {
+    method: 'POST',
+    headers: HEADERS,
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  return { status: res.status, result: (await res.json()) as WireResult };
+}
+
+function persistentWrite(input: { id: string; runId: string; session?: string; owner?: string }): Record<string, unknown> {
+  return {
+    id: input.id,
+    action: 'exec',
+    code: 'window.__write = true',
+    session: input.session ?? 'site:chatgpt-agent',
+    surface: 'adapter',
+    siteSession: 'persistent',
+    access: 'write',
+    runId: input.runId,
+    command: 'chatgpt-agent ask',
+    owner: input.owner ?? 'e2e-owner',
+  };
 }
 
 async function waitFor(check: () => Promise<boolean> | boolean, timeoutMs: number, message: string): Promise<void> {
@@ -291,6 +316,242 @@ describe('daemon transport contracts (real daemon)', () => {
       expect(required.result.errorCode).toBe('profile_disconnected');
     } finally {
       ext.close();
+    }
+  });
+
+  it('fences a pending writer, resets its session, and admits a new writer only after reset confirmation', async () => {
+    if (guard()) return;
+    const ext = new FakeExtension();
+    const oldId = cmdId();
+    let resetId: string | null = null;
+    ext.onCommand = (cmd) => {
+      if (cmd.action === 'close-window') {
+        resetId = String(cmd.id);
+        return null; // Hold reset open so the challenger observes RECOVERING.
+      }
+      if (cmd.id === oldId) return null; // Simulate an in-flight browser write.
+      return { id: String(cmd.id), ok: true, data: { echo: cmd.action } };
+    };
+    await ext.connect('ctx-recover');
+    try {
+      const old = postCommand(persistentWrite({
+        id: oldId,
+        runId: 'run_111_1_old',
+        owner: 'opencli-hub:instance:execution-old',
+      }));
+      await waitFor(() => ext.dispatchCountFor(oldId) === 1, 5_000, 'old writer was not dispatched');
+
+      const before = await getStatus();
+      expect(before?.capabilities).toContain('session-lease-v1');
+      expect(before?.capabilities).toContain('session-recover-v1');
+      expect(before?.sessionLeases).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          contextId: 'ctx-recover',
+          session: 'site:chatgpt-agent',
+          runId: 'run_111_1_old',
+          owner: 'opencli-hub:instance:execution-old',
+          pendingCount: 1,
+          state: 'ACTIVE',
+        }),
+      ]));
+
+      const recovery = postRecovery({
+        contextId: 'ctx-recover',
+        surface: 'adapter',
+        session: 'site:chatgpt-agent',
+        expectedRunId: 'run_111_1_old',
+        mode: 'CANCEL_AND_RESET',
+        reason: 'execution_timeout',
+      });
+      await waitFor(() => resetId !== null, 5_000, 'session reset was not dispatched');
+      const followerRecovery = postRecovery({
+        contextId: 'ctx-recover',
+        surface: 'adapter',
+        session: 'site:chatgpt-agent',
+        expectedRunId: 'run_111_1_old',
+        mode: 'CANCEL_AND_RESET',
+        reason: 'duplicate_recovery_request',
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(ext.received.filter((cmd) => cmd.action === 'close-window')).toHaveLength(1);
+
+      const blockedId = cmdId();
+      const blocked = await postCommand(persistentWrite({ id: blockedId, runId: 'run_222_2_new' }));
+      expect(blocked.status).toBe(409);
+      expect(blocked.result.errorCode).toBe('session_recovering');
+      expect(ext.dispatchCountFor(blockedId)).toBe(0);
+
+      ext.send({ id: resetId!, ok: true, data: { closed: true } });
+      const recovered = await recovery;
+      expect(recovered.status).toBe(200);
+      expect(recovered.result).toMatchObject({
+        ok: true,
+        result: 'RECOVERED',
+        tabReset: true,
+        cancelledPending: 1,
+      });
+      expect((await followerRecovery).result).toMatchObject({ ok: true, result: 'RECOVERED' });
+
+      const oldResult = await old;
+      expect(oldResult.status).toBe(503);
+      expect(oldResult.result.errorCode).toBe('command_result_unknown');
+
+      // It is too late for the old command to affect daemon state.
+      ext.send({ id: oldId, ok: true, data: 'late old result' });
+      const newId = cmdId();
+      const next = await postCommand(persistentWrite({ id: newId, runId: 'run_222_2_new' }));
+      expect(next.status).toBe(200);
+      expect(next.result.ok).toBe(true);
+      expect(ext.dispatchCountFor(newId)).toBe(1);
+    } finally {
+      ext.close();
+    }
+  });
+
+  it('CAS-reclaims an idle lease without resetting the tab and permanently fences its old runId', async () => {
+    if (guard()) return;
+    const ext = new FakeExtension();
+    await ext.connect('ctx-reclaim');
+    try {
+      const oldId = cmdId();
+      const oldRunId = 'run_666_6_old';
+      expect((await postCommand(persistentWrite({ id: oldId, runId: oldRunId }))).result.ok).toBe(true);
+
+      const wrongOwner = await postRecovery({
+        contextId: 'ctx-reclaim',
+        surface: 'adapter',
+        session: 'site:chatgpt-agent',
+        expectedRunId: 'run_999_9_wrong',
+        mode: 'RECLAIM_IF_IDLE',
+        reason: 'owner_dead_no_pending',
+      });
+      expect(wrongOwner.result).toMatchObject({ ok: true, result: 'OWNER_CHANGED', tabReset: false });
+
+      const reclaimed = await postRecovery({
+        contextId: 'ctx-reclaim',
+        surface: 'adapter',
+        session: 'site:chatgpt-agent',
+        expectedRunId: oldRunId,
+        mode: 'RECLAIM_IF_IDLE',
+        reason: 'owner_dead_no_pending',
+      });
+      expect(reclaimed.result).toMatchObject({ ok: true, result: 'RECOVERED', tabReset: false, cancelledPending: 0 });
+      expect(ext.received.filter((cmd) => cmd.action === 'close-window')).toHaveLength(0);
+
+      const oldRetry = await postCommand(persistentWrite({ id: cmdId(), runId: oldRunId }));
+      expect(oldRetry.result.errorCode).toBe('session_lease_revoked');
+      expect((await postCommand(persistentWrite({ id: cmdId(), runId: 'run_777_7_new' }))).result.ok).toBe(true);
+    } finally {
+      ext.close();
+    }
+  });
+
+  it('keeps a fenced lease RECOVERING when the Browser Bridge cannot confirm reset', async () => {
+    if (guard()) return;
+    const ext = new FakeExtension();
+    const oldId = cmdId();
+    ext.onCommand = (cmd) => {
+      if (cmd.action === 'close-window') return { id: String(cmd.id), ok: false, error: 'reset rejected' };
+      if (cmd.id === oldId) return null;
+      return { id: String(cmd.id), ok: true, data: 'unexpected' };
+    };
+    await ext.connect('ctx-reset-failure');
+    try {
+      const old = postCommand(persistentWrite({ id: oldId, runId: 'run_333_3_old' }));
+      await waitFor(() => ext.dispatchCountFor(oldId) === 1, 5_000, 'old writer was not dispatched');
+
+      const recovery = await postRecovery({
+        contextId: 'ctx-reset-failure',
+        surface: 'adapter',
+        session: 'site:chatgpt-agent',
+        expectedRunId: 'run_333_3_old',
+        mode: 'CANCEL_AND_RESET',
+        reason: 'execution_timeout',
+      });
+      expect(recovery.status).toBe(503);
+      expect(recovery.result).toMatchObject({ ok: false, result: 'RESET_FAILED', errorCode: 'session_recovery_failed' });
+      expect((await old).result.errorCode).toBe('command_result_unknown');
+
+      const status = await getStatus();
+      expect(status?.sessionLeases).toEqual(expect.arrayContaining([
+        expect.objectContaining({ runId: 'run_333_3_old', state: 'RECOVERING', pendingCount: 0 }),
+      ]));
+      const challenger = await postCommand(persistentWrite({ id: cmdId(), runId: 'run_444_4_new' }));
+      expect(challenger.result.errorCode).toBe('session_recovering');
+    } finally {
+      ext.close();
+    }
+  });
+
+  it('starts fenced orphan recovery after the holder process is SIGKILLed', async () => {
+    if (guard()) return;
+    const ext = new FakeExtension();
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    const oldId = cmdId();
+    let resetId: string | null = null;
+    ext.onCommand = (cmd) => {
+      if (cmd.action === 'close-window') {
+        resetId = String(cmd.id);
+        return null;
+      }
+      if (cmd.id === oldId) return null;
+      return { id: String(cmd.id), ok: true, data: 'ok' };
+    };
+    await ext.connect('ctx-orphan');
+    try {
+      const old = postCommand(persistentWrite({ id: oldId, runId: `run_${child.pid}_old` }));
+      await waitFor(() => ext.dispatchCountFor(oldId) === 1, 5_000, 'old writer was not dispatched');
+      child.kill('SIGKILL');
+      await new Promise<void>((resolve) => child.once('exit', () => resolve()));
+
+      const challenger = await postCommand(persistentWrite({ id: cmdId(), runId: 'run_555_5_new' }));
+      expect(challenger.result.errorCode).toBe('session_recovering');
+      await waitFor(() => resetId !== null, 5_000, 'orphan recovery did not dispatch reset');
+      ext.send({ id: resetId!, ok: true, data: { closed: true } });
+      expect((await old).result.errorCode).toBe('command_result_unknown');
+
+      const retry = await postCommand(persistentWrite({ id: cmdId(), runId: 'run_555_5_new' }));
+      expect(retry.result.ok).toBe(true);
+    } finally {
+      if (child.exitCode === null) child.kill('SIGKILL');
+      ext.close();
+    }
+  });
+
+  it('performs bounded SIGTERM recovery before restoring normal signal termination', async () => {
+    if (guard()) return;
+    const helperUrl = pathToFileURL(path.join(ROOT, 'dist', 'src', 'browser', 'session-recovery.js')).href;
+    const script = `
+      import { installBoundedSignalRecovery } from ${JSON.stringify(helperUrl)};
+      let finish;
+      const gate = new Promise((resolve) => { finish = resolve; });
+      process.on('message', (message) => { if (message?.type === 'complete') finish(); });
+      installBoundedSignalRecovery({
+        recover: async () => { process.send?.({ type: 'recover' }); await gate; },
+        terminate: (signal) => process.kill(process.pid, signal),
+        graceMs: 2_500,
+      });
+      process.send?.({ type: 'ready' });
+      setInterval(() => {}, 1_000);
+    `;
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    });
+    const messages: Array<{ type?: string }> = [];
+    child.on('message', (message) => { messages.push(message as { type?: string }); });
+    try {
+      await waitFor(() => messages.some((message) => message.type === 'ready'), 5_000, 'signal child did not start');
+      child.kill('SIGTERM');
+      await waitFor(() => messages.some((message) => message.type === 'recover'), 5_000, 'SIGTERM did not start recovery');
+      const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+        child.once('exit', (code, signal) => resolve({ code, signal }));
+      });
+      child.send?.({ type: 'complete' });
+      const exited = await exitPromise;
+      expect(exited.code).toBeNull();
+      expect(exited.signal).toBe('SIGTERM');
+    } finally {
+      if (child.exitCode === null) child.kill('SIGKILL');
     }
   });
 
