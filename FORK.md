@@ -26,6 +26,7 @@ Use it when merging back to mainline or rebasing onto upstream.
 
 || Area | Change | Paths |
 ||------|--------|--------|
+|| setFileInput nodeId | Replace `Page.setInterceptFileChooserDialog` / `el.showPicker()` / `el.click()` fallback with a pure-CDP `DOM.getDocument` → `DOM.querySelector({nodeId, selector})` → `DOM.setFileInputFiles({ files, nodeId })` path (the shape Windows Chrome accepts from direct CDP attachments when objectId+backendNodeId is rejected with `-32000 Not allowed`). Raw `{code,message}` CDP rejections are normalized to Error via `normalizeCdpError` so the predicate no longer silently breaks on `[object Object]`. DOM.describeNode protocol rejections route to the same fallback. Direct transport/lifecycle failures still surface the original error. `Runtime.releaseObject` released best-effort. `Page.setInterceptFileChooserDialog`, `Page.fileChooserOpened`, and `Page.enable` are gone — no chooser interception, no in-page picker driving, no DataTransfer fallback. Strict HTMLInputElement[type=file] validation + legacy "No element found matching selector: <query>" prefix preserved across both direct and fallback paths. | `extension/src/cdp.ts`, `extension/src/cdp.test.ts` |
 || setFileInput | Direct CDP path: `Runtime.evaluate` → `objectId` + `DOM.describeNode({objectId})` → `DOM.setFileInputFiles({ files, objectId, backendNodeId })`. Chooser interception only as fallback for protocol-resolution rejections (`-32000 Not allowed` / `Invalid parameters` / object-not-resolved); never waited on for transport / lifecycle errors. `Runtime.releaseObject` released best-effort. Strict HTMLInputElement[type=file] validation with precise not-file-input error; legacy "No element found matching selector: <query>" message preserved for plugin selector fallback. | `extension/src/cdp.ts`, `extension/src/cdp.test.ts` |
 || daemon body cap | 1 MiB cap preserved; over-limit requests now drain + respond with structured HTTP 413 (`errorCode: request_body_too_large`, `error`, `errorHint`, `receivedBytes`, `limit`). No `req.destroy()` / socket reset. Extracted reader to `src/daemon-body.ts` for unit-testing. | `src/daemon.ts`, `src/daemon-body.ts`, `src/daemon-body.test.ts`, `src/daemon-utils.ts`, `src/daemon.test.ts` |
 || daemon-client 413 | 413 response is surfaced as a typed `BrowserCommandError(code='request_body_too_large')` and never auto-retried (1 fetch attempt, no `ensureBrowserBridgeReady`, no `daemon_shutting_down` retry). Daemon's own `error`/`errorHint` preserved verbatim. | `src/browser/daemon-client.ts`, `src/browser/daemon-client.test.ts` |
@@ -59,8 +60,8 @@ Use it when merging back to mainline or rebasing onto upstream.
 
 | Component | Version |
 |-----------|---------|
-| CLI (`@jackwener/opencli`) | `1.8.7-fengwk.5` |
-| Extension | `1.0.26` (`compatRange`: `>=1.8.7`) |
+| CLI (`@jackwener/opencli`) | `1.8.7-fengwk.6` |
+| Extension | `1.0.27` (`compatRange`: `>=1.8.7`) |
 
 ### Auto-update policy (fork)
 
@@ -114,15 +115,15 @@ npm ci
 
 Artifacts (version-based names, no timestamps):
 
-- `jackwener-opencli-1.8.7-fengwk.5.tgz`
-- `opencli-extension-v1.0.26.zip`
+- `jackwener-opencli-1.8.7-fengwk.6.tgz`
+- `opencli-extension-v1.0.27.zip`
 - `SHA256SUMS`
 - `build-info.json`
 
 ```bash
 # install CLI from the tarball (not npm publish)
-npm install -g ./artifacts/jackwener-opencli-1.8.7-fengwk.5.tgz
-opencli --version   # → 1.8.7-fengwk.5
+npm install -g ./artifacts/jackwener-opencli-1.8.7-fengwk.6.tgz
+opencli --version   # → 1.8.7-fengwk.6
 
 # plugin
 opencli plugin install ~/proj/my-opencli/packages/chatgpt-agent
@@ -132,6 +133,6 @@ opencli chatgpt-agent ask --help
 ### GitHub fork release
 
 1. Ensure `package.json` version is `X` and commit any regenerated `cli-manifest.json` / `extension/dist`.
-2. Tag exactly `fork-vX` (example: `fork-v1.8.7-fengwk.5`) and push the tag.
+2. Tag exactly `fork-vX` (example: `fork-v1.8.7-fengwk.6`) and push the tag.
 3. Workflow `Fork Release` packages, uploads the Actions artifact bundle, and attaches tgz/zip/SHA256SUMS/build-info.json to the GitHub Release.
 4. Never runs `npm publish` or upstream website dispatch jobs.

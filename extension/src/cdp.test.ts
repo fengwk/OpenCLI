@@ -889,6 +889,134 @@ describe('cdp isFileInputFallbackEligible', () => {
     expect(mod.isFileInputFallbackEligible('plain string')).toBe(false);
     expect(mod.isFileInputFallbackEligible(null)).toBe(false);
   });
+
+  // The big regression: chrome.debugger surfaces protocol rejections as raw
+  // `{ code, message }` objects. Passing those through `String(err)` yields
+  // `'[object Object]'`, so a message-only predicate silently breaks and
+  // the fallback never runs. The new code path must key off `.code` directly.
+  it('accepts raw CDP {code, message} object form (the chatgpt-agent regression)', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./cdp');
+    expect(mod.isFileInputFallbackEligible({ code: -32000, message: 'Not allowed' })).toBe(true);
+    expect(mod.isFileInputFallbackEligible({ code: -32000, message: 'Invalid parameters' })).toBe(true);
+    expect(mod.isFileInputFallbackEligible({ code: -32000, message: 'Object reference could not be resolved' })).toBe(true);
+  });
+
+  it('accepts raw CDP object with code only (no message) — robust to Chrome omitting strings', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./cdp');
+    expect(mod.isFileInputFallbackEligible({ code: -32000 })).toBe(true);
+    expect(mod.isFileInputFallbackEligible({ code: -32000, message: '' })).toBe(true);
+  });
+
+  it('rejects raw CDP objects with unrelated error codes', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./cdp');
+    expect(mod.isFileInputFallbackEligible({ code: -32601, message: 'Method not found' })).toBe(false);
+    expect(mod.isFileInputFallbackEligible({ code: -32001, message: 'No such file' })).toBe(false);
+  });
+
+  it('rejects Error that carries code -32000 with unrelated message (no resolution keyword)', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./cdp');
+    // normalizeCdpError stamps .code on the wrapped Error; the code-only
+    // short-circuit must still fire even when the message lacks the
+    // resolution keyword.
+    const err = new Error('No such file');
+    (err as Error & { code?: unknown }).code = -32000;
+    expect(mod.isFileInputFallbackEligible(err)).toBe(true);
+  });
+});
+
+describe('cdp normalizeCdpError', () => {
+  beforeEach(() => { vi.resetModules(); });
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it('preserves an Error instance unchanged (preserves stack trace)', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./cdp');
+    const err = new Error('boom');
+    expect(mod.normalizeCdpError(err)).toBe(err);
+  });
+
+  it('keeps an Error that already carries a .code field', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./cdp');
+    const err = new Error('boom');
+    (err as Error & { code?: unknown }).code = -32000;
+    const out = mod.normalizeCdpError(err);
+    expect(out).toBe(err);
+    expect((out as Error & { code?: unknown }).code).toBe(-32000);
+  });
+
+  it('turns a raw {code, message} object into an Error with both fields in the message', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./cdp');
+    const out = mod.normalizeCdpError({ code: -32000, message: 'Not allowed' });
+    expect(out).toBeInstanceOf(Error);
+    expect(out.message).toBe('-32000 Not allowed');
+    expect((out as Error & { code?: unknown }).code).toBe(-32000);
+  });
+
+  it('handles a raw object with only code (no message)', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./cdp');
+    const out = mod.normalizeCdpError({ code: -32000 });
+    expect(out).toBeInstanceOf(Error);
+    expect(out.message).toBe('-32000');
+    expect((out as Error & { code?: unknown }).code).toBe(-32000);
+  });
+
+  it('handles a raw object with only message (no code)', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./cdp');
+    const out = mod.normalizeCdpError({ message: 'Not allowed' });
+    expect(out).toBeInstanceOf(Error);
+    expect(out.message).toBe('Not allowed');
+    expect((out as Error & { code?: unknown }).code).toBeUndefined();
+  });
+
+  it('serializes data when neither code nor message are present', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./cdp');
+    const out = mod.normalizeCdpError({ data: { reason: 'no-input' } });
+    expect(out).toBeInstanceOf(Error);
+    expect(out.message).toBe('{"reason":"no-input"}');
+  });
+
+  it('falls back to a JSON dump for objects without any of code/message/data', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./cdp');
+    const out = mod.normalizeCdpError({ weird: true });
+    expect(out).toBeInstanceOf(Error);
+    expect(out.message).toBe('{"weird":true}');
+  });
+
+  it('handles string primitives', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./cdp');
+    expect(mod.normalizeCdpError('just a string').message).toBe('just a string');
+  });
+
+  it('handles null / undefined', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./cdp');
+    expect(mod.normalizeCdpError(null)).toBeInstanceOf(Error);
+    expect(mod.normalizeCdpError(undefined)).toBeInstanceOf(Error);
+  });
 });
 
 describe('cdp setFileInputFiles', () => {
@@ -897,22 +1025,41 @@ describe('cdp setFileInputFiles', () => {
 
   /**
    * Build a chrome.debugger mock that returns scripted CDP responses per
-   * method. `fileInputState` controls what `document.querySelector(...)` in
-   * the page returns: 'file' = real file input, 'missing' = no element,
-   * 'button' = a non-file element. `directEligible` controls whether the
-   * first DOM.setFileInputFiles call succeeds. `chooserBackendNodeId` (when
-   * defined) makes the chooser fallback arm Page.fileChooserOpened with the
-   * given id.
+   * method.
+   *
+   * `fileInputState` controls what `document.querySelector(...)` in the
+   * page returns: 'file' = real file input, 'missing' = no element,
+   * 'button' = a non-file element.
+   *
+   * `directResult` controls what the first DOM.setFileInputFiles call
+   * returns/throws:
+   *   - undefined           → success (default)
+   *   - { throw: new Error('-32000 Not allowed') }
+   *   - { throw: { code: -32000, message: 'Not allowed' } }  (raw CDP object)
+   *   - { throw: new Error('File not found') } (transport / lifecycle)
+   *
+   * `nodeId` controls what DOM.querySelector returns (default 12345).
+   * `nodeIdSetFileResult` is the throwable for the second DOM.setFileInputFiles
+   * call (the nodeId fallback), defaulting to success.
+   *
+   * `describeNodeResult` is the throwable for DOM.describeNode; default null
+   * (success, returns backendNodeId 4242).
    */
   function createFileInputMock(opts: {
     fileInputState?: 'file' | 'missing' | 'button';
-    directEligible?: boolean;
-    chooserBackendNodeId?: number;
+    directResult?: { throw?: unknown } | null;
+    nodeId?: number | null;
+    nodeIdMissing?: boolean;
+    nodeIdSetFileResult?: { throw?: unknown } | null;
+    describeNodeResult?: { throw?: unknown } | null;
   } = {}) {
     const state = {
       fileInputState: opts.fileInputState ?? 'file',
-      directEligible: opts.directEligible ?? true,
-      chooserBackendNodeId: opts.chooserBackendNodeId,
+      directResult: opts.directResult === undefined ? null : opts.directResult,
+      nodeId: opts.nodeId ?? 12345,
+      nodeIdMissing: opts.nodeIdMissing ?? false,
+      nodeIdSetFileResult: opts.nodeIdSetFileResult === undefined ? null : opts.nodeIdSetFileResult,
+      describeNodeResult: opts.describeNodeResult ?? null,
     };
     const onEventListeners: Array<(source: { tabId?: number }, method: string, params: any) => void> = [];
     const calls: Array<{ method: string; params?: unknown }> = [];
@@ -923,14 +1070,13 @@ describe('cdp setFileInputFiles', () => {
         if (idx >= 0) onEventListeners.splice(idx, 1);
       }),
     };
+    const setFileCalls = { count: 0 };
     const debuggerApi = {
       attach: vi.fn(async () => {}),
       detach: vi.fn(async () => {}),
       sendCommand: vi.fn(async (_target: unknown, method: string, params?: any) => {
         calls.push({ method, params });
         if (method === 'Runtime.evaluate') {
-          // Two call shapes: validation (returnByValue:true) and resolve (no returnByValue).
-          const expr = String((params as { expression?: string }).expression ?? '');
           if (state.fileInputState === 'missing') {
             if (params?.returnByValue) return { result: { value: { ok: false, reason: 'not-found' } } };
             return { result: { type: 'null' } };
@@ -939,22 +1085,31 @@ describe('cdp setFileInputFiles', () => {
             if (params?.returnByValue) return { result: { value: { ok: false, reason: 'not-file-input', tag: 'BUTTON', type: 'submit' } } };
             return { result: { type: 'object', subtype: 'node', objectId: 'fake-object-id', className: 'HTMLButtonElement' } };
           }
-          // 'file'
           if (params?.returnByValue) return { result: { value: { ok: true } } };
           return { result: { type: 'object', subtype: 'node', objectId: 'fake-object-id', className: 'HTMLInputElement' } };
         }
         if (method === 'DOM.describeNode') {
+          if (state.describeNodeResult) {
+            throw state.describeNodeResult.throw;
+          }
           return { node: { backendNodeId: 4242 } };
         }
-        if (method === 'DOM.setFileInputFiles') {
-          // The first invocation is the direct path; if not eligible, throw.
-          const directCalls = calls.filter((c) => c.method === 'DOM.setFileInputFiles');
-          if (directCalls.length === 1 && !state.directEligible) {
-            throw new Error('-32000 Not allowed');
-          }
-          return {};
+        if (method === 'DOM.getDocument') {
+          return { root: { nodeId: 1 } };
         }
-        if (method === 'Page.setInterceptFileChooserDialog') {
+        if (method === 'DOM.querySelector') {
+          if (state.nodeIdMissing) return { nodeId: 0 };
+          return { nodeId: state.nodeId };
+        }
+        if (method === 'DOM.setFileInputFiles') {
+          setFileCalls.count += 1;
+          if (setFileCalls.count === 1) {
+            // First call: direct path (with objectId+backendNodeId).
+            if (state.directResult) throw state.directResult.throw;
+            return {};
+          }
+          // Second call: nodeId fallback.
+          if (state.nodeIdSetFileResult) throw state.nodeIdSetFileResult.throw;
           return {};
         }
         if (method === 'Runtime.releaseObject') {
@@ -970,12 +1125,16 @@ describe('cdp setFileInputFiles', () => {
       onRemoved: { addListener: vi.fn() },
       onUpdated: { addListener: vi.fn() },
     };
-    // Used by tests that need to drive the chooser event themselves (when
-    // the chooser branch is reached and is waiting on Page.fileChooserOpened).
     const fireEvent = (method: string, params: any) => {
       for (const fn of onEventListeners) fn({ tabId: 1 }, method, params);
     };
-    return { chrome: { tabs, debugger: debuggerApi, scripting: {}, runtime: { id: 'opencli-test' } }, calls, fireEvent, state };
+    return {
+      chrome: { tabs, debugger: debuggerApi, scripting: {}, runtime: { id: 'opencli-test' } },
+      calls,
+      fireEvent,
+      state,
+      setFileCalls,
+    };
   }
 
   it('uses the direct CDP path with objectId + backendNodeId on the happy path', async () => {
@@ -991,8 +1150,13 @@ describe('cdp setFileInputFiles', () => {
       objectId: 'fake-object-id',
       backendNodeId: 4242,
     });
-    // No interception was armed on the happy path.
-    expect(mock.calls.some((c) => c.method === 'Page.setInterceptFileChooserDialog' && (c.params as { enabled?: boolean })?.enabled === true)).toBe(false);
+    // No Page-domain chooser was armed on the happy path — the entire
+    // Page.setInterceptFileChooserDialog surface is gone.
+    expect(mock.calls.some((c) => c.method === 'Page.setInterceptFileChooserDialog')).toBe(false);
+    expect(mock.calls.some((c) => c.method === 'Page.fileChooserOpened')).toBe(false);
+    // nodeId fallback must not have been reached.
+    expect(mock.calls.some((c) => c.method === 'DOM.getDocument')).toBe(false);
+    expect(mock.calls.some((c) => c.method === 'DOM.querySelector')).toBe(false);
     // objectId is released best-effort.
     const release = mock.calls.filter((c) => c.method === 'Runtime.releaseObject');
     expect(release.length).toBeGreaterThanOrEqual(1);
@@ -1015,102 +1179,198 @@ describe('cdp setFileInputFiles', () => {
     const mod = await import('./cdp');
     await expect(mod.setFileInputFiles(1, ['/tmp/upload.bin'], 'button.submit'))
       .rejects.toThrow(/selector "button\.submit" matched <BUTTON type="submit">, expected HTMLInputElement\[type=file\]/);
-    // The chooser fallback must not be armed for a validation failure.
-    expect(mock.calls.some((c) => c.method === 'Page.setInterceptFileChooserDialog' && (c.params as { enabled?: boolean })?.enabled === true)).toBe(false);
+    // The nodeId fallback must not be armed for a validation failure.
+    expect(mock.calls.some((c) => c.method === 'DOM.getDocument')).toBe(false);
+    expect(mock.calls.some((c) => c.method === 'DOM.querySelector')).toBe(false);
   });
 
-  it('falls back to chooser interception when the direct path is rejected for a protocol-resolution reason', async () => {
+  it('falls back to nodeId when the direct path rejects as Error(-32000 Not allowed)', async () => {
     const mock = createFileInputMock({
-      directEligible: false,
-      chooserBackendNodeId: 9999,
+      directResult: { throw: new Error('-32000 Not allowed') },
+      nodeId: 9876,
     });
     vi.stubGlobal('chrome', mock.chrome);
 
     const mod = await import('./cdp');
-    const promise = mod.setFileInputFiles(1, ['/tmp/upload.bin']);
+    await mod.setFileInputFiles(1, ['/tmp/upload.bin']);
 
-    // Drive the chooser event after the Runtime.evaluate that opens the
-    // picker — order does not matter for the resolve, the listener
-    // is installed before the Runtime.evaluate that triggers showPicker().
-    setTimeout(() => mock.fireEvent('Page.fileChooserOpened', { backendNodeId: 9999 }), 0);
-
-    await promise;
-
-    const interceptOn = mock.calls.find((c) => c.method === 'Page.setInterceptFileChooserDialog' && (c.params as { enabled?: boolean })?.enabled === true);
-    const interceptOff = [...mock.calls].reverse().find((c) => c.method === 'Page.setInterceptFileChooserDialog' && (c.params as { enabled?: boolean })?.enabled === false);
-    expect(interceptOn).toBeDefined();
-    expect(interceptOff).toBeDefined();
     const setFileCalls = mock.calls.filter((c) => c.method === 'DOM.setFileInputFiles');
     expect(setFileCalls).toHaveLength(2);
-    // Direct call carried objectId+backendNodeId.
-    expect(setFileCalls[0].params).toMatchObject({ objectId: 'fake-object-id', backendNodeId: 4242 });
-    // Fallback call carried only backendNodeId from the chooser event.
-    expect(setFileCalls[1].params).toMatchObject({ files: ['/tmp/upload.bin'], backendNodeId: 9999 });
+    // Direct call carried objectId + backendNodeId.
+    expect(setFileCalls[0].params).toMatchObject({
+      objectId: 'fake-object-id',
+      backendNodeId: 4242,
+      files: ['/tmp/upload.bin'],
+    });
+    // Fallback call carried a bare nodeId, no objectId / backendNodeId.
+    expect(setFileCalls[1].params).toEqual({
+      files: ['/tmp/upload.bin'],
+      nodeId: 9876,
+    });
     expect((setFileCalls[1].params as Record<string, unknown>).objectId).toBeUndefined();
+    expect((setFileCalls[1].params as Record<string, unknown>).backendNodeId).toBeUndefined();
+
+    // DOM.getDocument + DOM.querySelector were used for the fallback, no
+    // Page.setInterceptFileChooserDialog was ever armed.
+    expect(mock.calls.some((c) => c.method === 'DOM.getDocument')).toBe(true);
+    expect(mock.calls.some((c) => c.method === 'DOM.querySelector')).toBe(true);
+    expect(mock.calls.some((c) => c.method === 'Page.setInterceptFileChooserDialog')).toBe(false);
+    expect(mock.calls.some((c) => c.method === 'Page.fileChooserOpened')).toBe(false);
   });
 
-  it('does NOT wait for chooser when the direct path rejects for transport / lifecycle reasons', async () => {
-    const mock = createFileInputMock({ directEligible: false });
+  // The headline regression: chrome.debugger surfaces protocol rejections as
+  // raw `{ code, message }` objects, NOT Error instances. String() of those
+  // yields `'[object Object]'`, which previously caused the predicate to
+  // reject and the fallback to silently never run. This test must pass with
+  // the new normalization-based predicate.
+  it('falls back to nodeId when the direct path rejects as RAW CDP {code:-32000, message:"Not allowed"} object', async () => {
+    const mock = createFileInputMock({
+      directResult: { throw: { code: -32000, message: 'Not allowed' } },
+      nodeId: 7777,
+    });
     vi.stubGlobal('chrome', mock.chrome);
 
-    // Override the first DOM.setFileInputFiles to reject with a transport
-    // error (file not found / permission / detach / timeout) rather than
-    // the protocol-resolution error the predicate accepts.
-    let directCalls = 0;
-    mock.chrome.debugger.sendCommand = vi.fn(async (target: unknown, method: string, params?: any) => {
-      mock.calls.push({ method, params });
-      if (method === 'Runtime.evaluate') {
-        const expr = String((params as { expression?: string }).expression ?? '');
-        if (params?.returnByValue) return { result: { value: { ok: true } } };
-        return { result: { type: 'object', subtype: 'node', objectId: 'fake-object-id', className: 'HTMLInputElement' } };
-      }
-      if (method === 'DOM.describeNode') return { node: { backendNodeId: 4242 } };
-      if (method === 'DOM.setFileInputFiles') {
-        directCalls += 1;
-        if (directCalls === 1) throw new Error('File not found');
-        return {};
-      }
-      if (method === 'Runtime.releaseObject') return {};
-      return {};
+    const mod = await import('./cdp');
+    await mod.setFileInputFiles(1, ['/tmp/upload.bin']);
+
+    const setFileCalls = mock.calls.filter((c) => c.method === 'DOM.setFileInputFiles');
+    expect(setFileCalls).toHaveLength(2);
+    expect(setFileCalls[1].params).toEqual({
+      files: ['/tmp/upload.bin'],
+      nodeId: 7777,
     });
+  });
+
+  it('falls back to nodeId when DOM.describeNode rejects with a protocol-resolution error', async () => {
+    const mock = createFileInputMock({
+      describeNodeResult: { throw: { code: -32000, message: 'Object reference could not be resolved' } },
+      nodeId: 5555,
+    });
+    vi.stubGlobal('chrome', mock.chrome);
+
+    const mod = await import('./cdp');
+    await mod.setFileInputFiles(1, ['/tmp/upload.bin']);
+
+    const setFileCalls = mock.calls.filter((c) => c.method === 'DOM.setFileInputFiles');
+    expect(setFileCalls).toHaveLength(1); // direct never reached; fallback only
+    expect(setFileCalls[0].params).toEqual({ files: ['/tmp/upload.bin'], nodeId: 5555 });
+  });
+
+  it('still surfaces the original transport error when the direct path fails for non-eligible reasons', async () => {
+    const mock = createFileInputMock({
+      directResult: { throw: new Error('File not found') },
+    });
+    vi.stubGlobal('chrome', mock.chrome);
 
     const mod = await import('./cdp');
     await expect(mod.setFileInputFiles(1, ['/tmp/missing.bin']))
       .rejects.toThrow('File not found');
 
-    // The chooser fallback must NEVER be armed for a transport failure.
-    expect(mock.calls.some((c) => c.method === 'Page.setInterceptFileChooserDialog')).toBe(false);
+    // The nodeId fallback must NEVER run for a transport / lifecycle failure.
+    expect(mock.calls.some((c) => c.method === 'DOM.getDocument')).toBe(false);
+    expect(mock.calls.some((c) => c.method === 'DOM.querySelector')).toBe(false);
     expect(mock.calls.filter((c) => c.method === 'DOM.setFileInputFiles')).toHaveLength(1);
+    // No chooser / page interaction ever.
+    expect(mock.calls.some((c) => c.method === 'Page.setInterceptFileChooserDialog')).toBe(false);
   });
 
-  it('reports BOTH direct and chooser failures when both paths reject', async () => {
-    const mock = createFileInputMock({ directEligible: false });
+  it('surfaces the original transport error when DOM.describeNode fails for non-eligible reasons', async () => {
+    const mock = createFileInputMock({
+      describeNodeResult: { throw: new Error('Debugger is not attached to the tab') },
+    });
     vi.stubGlobal('chrome', mock.chrome);
 
-    // Make every DOM.setFileInputFiles call reject.
-    mock.chrome.debugger.sendCommand = vi.fn(async (target: unknown, method: string, params?: any) => {
-      mock.calls.push({ method, params });
-      if (method === 'Runtime.evaluate') {
-        if (params?.returnByValue) return { result: { value: { ok: true } } };
-        return { result: { type: 'object', subtype: 'node', objectId: 'fake-object-id', className: 'HTMLInputElement' } };
-      }
-      if (method === 'DOM.describeNode') return { node: { backendNodeId: 4242 } };
-      if (method === 'DOM.setFileInputFiles') throw new Error('-32000 Not allowed');
-      if (method === 'Page.setInterceptFileChooserDialog') return {};
-      if (method === 'Runtime.releaseObject') return {};
-      return {};
+    const mod = await import('./cdp');
+    await expect(mod.setFileInputFiles(1, ['/tmp/upload.bin']))
+      .rejects.toThrow('Debugger is not attached');
+
+    expect(mock.calls.some((c) => c.method === 'DOM.getDocument')).toBe(false);
+    expect(mock.calls.some((c) => c.method === 'Page.setInterceptFileChooserDialog')).toBe(false);
+  });
+
+  it('reports BOTH direct and nodeId failures when both paths reject', async () => {
+    const mock = createFileInputMock({
+      directResult: { throw: new Error('-32000 Not allowed') },
+      nodeIdSetFileResult: { throw: new Error('-32000 Object reference could not be resolved') },
     });
+    vi.stubGlobal('chrome', mock.chrome);
 
     const mod = await import('./cdp');
-    const promise = mod.setFileInputFiles(1, ['/tmp/upload.bin']);
-    setTimeout(() => mock.fireEvent('Page.fileChooserOpened', { backendNodeId: 7777 }), 0);
+    await expect(mod.setFileInputFiles(1, ['/tmp/upload.bin']))
+      .rejects.toThrow(/direct CDP path failed.*nodeId fallback.*also failed/);
 
-    await expect(promise).rejects.toThrow(/direct CDP path failed.*chooser fallback.*also failed/);
+    // No chooser surface in any failure branch.
+    expect(mock.calls.some((c) => c.method === 'Page.setInterceptFileChooserDialog')).toBe(false);
+    expect(mock.calls.some((c) => c.method === 'Page.fileChooserOpened')).toBe(false);
+  });
 
-    // Interception was armed AND disabled — finally cleanup still ran.
-    const interceptOn = mock.calls.find((c) => c.method === 'Page.setInterceptFileChooserDialog' && (c.params as { enabled?: boolean })?.enabled === true);
-    const interceptOff = [...mock.calls].reverse().find((c) => c.method === 'Page.setInterceptFileChooserDialog' && (c.params as { enabled?: boolean })?.enabled === false);
-    expect(interceptOn).toBeDefined();
-    expect(interceptOff).toBeDefined();
+  it('preserves the selector-miss contract on the fallback path (Instagram post.js grep)', async () => {
+    const mock = createFileInputMock({
+      directResult: { throw: new Error('-32000 Not allowed') },
+      nodeIdMissing: true,
+    });
+    vi.stubGlobal('chrome', mock.chrome);
+
+    const mod = await import('./cdp');
+    await expect(mod.setFileInputFiles(1, ['/tmp/upload.bin'], '#opencli-upload'))
+      .rejects.toThrow('No element found matching selector: #opencli-upload');
+  });
+
+  it('releases the direct-path objectId before falling back (no leaked Runtime remote)', async () => {
+    const mock = createFileInputMock({
+      directResult: { throw: new Error('-32000 Not allowed') },
+      nodeId: 8888,
+    });
+    vi.stubGlobal('chrome', mock.chrome);
+
+    const mod = await import('./cdp');
+    await mod.setFileInputFiles(1, ['/tmp/upload.bin']);
+
+    // Order matters: Runtime.releaseObject for the direct-path objectId
+    // must fire BEFORE the fallback DOM.setFileInputFiles, otherwise the
+    // inspector session keeps the remote alive through both paths.
+    const releaseIdx = mock.calls.findIndex((c) => c.method === 'Runtime.releaseObject');
+    const fallbackIdx = mock.calls.findIndex(
+      (c, i) => c.method === 'DOM.setFileInputFiles' && i > releaseIdx,
+    );
+    expect(releaseIdx).toBeGreaterThanOrEqual(0);
+    expect(fallbackIdx).toBeGreaterThan(releaseIdx);
+    expect((mock.calls[releaseIdx].params as { objectId?: string })?.objectId).toBe('fake-object-id');
+  });
+
+  it('never arms Page.setInterceptFileChooserDialog across happy/fallback/failure paths', async () => {
+    const cases: Array<ReturnType<typeof createFileInputMock>> = [
+      createFileInputMock(),
+      createFileInputMock({ directResult: { throw: new Error('-32000 Not allowed') }, nodeId: 1 }),
+      createFileInputMock({ directResult: { throw: { code: -32000, message: 'Not allowed' } }, nodeId: 2 }),
+      createFileInputMock({
+        directResult: { throw: new Error('-32000 Not allowed') },
+        nodeIdSetFileResult: { throw: new Error('still failing') },
+      }),
+    ];
+    for (const mock of cases) {
+      vi.stubGlobal('chrome', mock.chrome);
+      const mod = await import('./cdp');
+      try { await mod.setFileInputFiles(1, ['/tmp/upload.bin']); } catch { /* expected on the failure case */ }
+      expect(mock.calls.some((c) => c.method === 'Page.setInterceptFileChooserDialog')).toBe(false);
+      expect(mock.calls.some((c) => c.method === 'Page.fileChooserOpened')).toBe(false);
+    }
+  });
+
+  it('forwards the original selector to the fallback DOM.querySelector', async () => {
+    const mock = createFileInputMock({
+      directResult: { throw: new Error('-32000 Not allowed') },
+      nodeId: 4321,
+    });
+    vi.stubGlobal('chrome', mock.chrome);
+
+    const mod = await import('./cdp');
+    await mod.setFileInputFiles(1, ['/tmp/upload.bin'], 'form#login input[type="file"]');
+
+    const queried = mock.calls.find((c) => c.method === 'DOM.querySelector');
+    expect(queried?.params).toMatchObject({
+      nodeId: 1,
+      selector: 'form#login input[type="file"]',
+    });
   });
 });
