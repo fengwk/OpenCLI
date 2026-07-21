@@ -388,10 +388,6 @@ const SELECTOR_NOT_FOUND_MESSAGE_PREFIX = 'No element found matching selector:';
  */
 export function normalizeCdpError(err: unknown): Error {
   if (err instanceof Error) {
-    // Best-effort: copy a raw `code` from the Error itself if some upstream
-    // stage already attached one (custom adapters, Promise rejection wrappers).
-    const existing = (err as Error & { code?: unknown }).code;
-    if (existing !== undefined) return err;
     return err;
   }
   if (err && typeof err === 'object') {
@@ -430,8 +426,8 @@ export function normalizeCdpError(err: unknown): Error {
  * reference at all.
  *
  * Accepts both `Error` instances and raw `{ code, message }` CDP rejection
- * objects; on raw objects the predicate keys off `code` directly so a
- * dropped/silent message doesn't suppress the fallback.
+ * objects; raw code is combined with a node-resolution message so unrelated
+ * `-32000` failures (for example a missing local file) never retry.
  */
 export function isFileInputFallbackEligible(err: unknown): boolean {
   let msg = '';
@@ -444,16 +440,8 @@ export function isFileInputFallbackEligible(err: unknown): boolean {
     code = obj.code;
     if (typeof obj.message === 'string') msg = obj.message;
   }
-  if (!msg && code === undefined) return false;
-  // Raw CDP code match: chrome.debugger surfaces `-32000` directly on the
-  // rejection object, and some Chrome builds omit the trailing
-  // "Not allowed" / "Invalid parameters" string. Treat code-only matches
-  // as eligible — the predicate's job is to gate the fallback, not to
-  // prove the exact protocol subreason.
-  if (code === -32000) return true;
-  // Message-only path: legacy Error-wrapped rejections and Chrome builds
-  // that put the protocol code in `.message` instead of `.code`.
-  return /-32000/.test(msg)
+  const isProtocolResolutionCode = code === -32000 || code === '-32000' || /-32000/.test(msg);
+  return isProtocolResolutionCode
     && /\b(not allowed|invalid parameters|invalid parameter|object .* not .*resolved|no node with given id|could not be resolved|cannot find context)\b/i.test(msg);
 }
 

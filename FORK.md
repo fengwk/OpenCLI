@@ -12,7 +12,7 @@ Use it when merging back to mainline or rebasing onto upstream.
 ## Why this fork exists
 
 1. **Long-lived WebSocket capture** for ChatGPT protocol streams (without relying on `webSocketCreated` for already-open sockets).
-2. **Hardened `setFileInput`** for Chrome debugger file chooser interception (`showPicker`, longer timeout, describeNode fallback).
+2. **Hardened `setFileInput`** with pure-CDP objectId/backendNodeId and nodeId fallback (no picker interception or in-page click).
 3. **Repeatable CLI flags** (`Arg.repeatable`) for multi `--file a --file b`.
 4. Supporting the **chatgpt-agent** plugin workflow (protocol-first turns, human-like downloads, sequential uploads).
 
@@ -27,7 +27,7 @@ Use it when merging back to mainline or rebasing onto upstream.
 || Area | Change | Paths |
 ||------|--------|--------|
 || setFileInput nodeId | Replace `Page.setInterceptFileChooserDialog` / `el.showPicker()` / `el.click()` fallback with a pure-CDP `DOM.getDocument` → `DOM.querySelector({nodeId, selector})` → `DOM.setFileInputFiles({ files, nodeId })` path (the shape Windows Chrome accepts from direct CDP attachments when objectId+backendNodeId is rejected with `-32000 Not allowed`). Raw `{code,message}` CDP rejections are normalized to Error via `normalizeCdpError` so the predicate no longer silently breaks on `[object Object]`. DOM.describeNode protocol rejections route to the same fallback. Direct transport/lifecycle failures still surface the original error. `Runtime.releaseObject` released best-effort. `Page.setInterceptFileChooserDialog`, `Page.fileChooserOpened`, and `Page.enable` are gone — no chooser interception, no in-page picker driving, no DataTransfer fallback. Strict HTMLInputElement[type=file] validation + legacy "No element found matching selector: <query>" prefix preserved across both direct and fallback paths. | `extension/src/cdp.ts`, `extension/src/cdp.test.ts` |
-|| setFileInput | Direct CDP path: `Runtime.evaluate` → `objectId` + `DOM.describeNode({objectId})` → `DOM.setFileInputFiles({ files, objectId, backendNodeId })`. Chooser interception only as fallback for protocol-resolution rejections (`-32000 Not allowed` / `Invalid parameters` / object-not-resolved); never waited on for transport / lifecycle errors. `Runtime.releaseObject` released best-effort. Strict HTMLInputElement[type=file] validation with precise not-file-input error; legacy "No element found matching selector: <query>" message preserved for plugin selector fallback. | `extension/src/cdp.ts`, `extension/src/cdp.test.ts` |
+|| setFileInput 1.0.26 (superseded) | Direct CDP path: `Runtime.evaluate` → `objectId` + `DOM.describeNode({objectId})` → `DOM.setFileInputFiles({ files, objectId, backendNodeId })`; its chooser fallback is superseded by the pure-CDP nodeId path above. `Runtime.releaseObject` released best-effort. Strict HTMLInputElement[type=file] validation with precise not-file-input error; legacy "No element found matching selector: <query>" message preserved for plugin selector fallback. | `extension/src/cdp.ts`, `extension/src/cdp.test.ts` |
 || daemon body cap | 1 MiB cap preserved; over-limit requests now drain + respond with structured HTTP 413 (`errorCode: request_body_too_large`, `error`, `errorHint`, `receivedBytes`, `limit`). No `req.destroy()` / socket reset. Extracted reader to `src/daemon-body.ts` for unit-testing. | `src/daemon.ts`, `src/daemon-body.ts`, `src/daemon-body.test.ts`, `src/daemon-utils.ts`, `src/daemon.test.ts` |
 || daemon-client 413 | 413 response is surfaced as a typed `BrowserCommandError(code='request_body_too_large')` and never auto-retried (1 fetch attempt, no `ensureBrowserBridgeReady`, no `daemon_shutting_down` retry). Daemon's own `error`/`errorHint` preserved verbatim. | `src/browser/daemon-client.ts`, `src/browser/daemon-client.test.ts` |
 || js-yaml security | Raised the direct production dependency floor from `^4.1.0` to `^4.3.0`, outside the `GHSA-52cp-r559-cp3m` affected range `<4.3.0`. | `package.json`, `package-lock.json` |
@@ -40,7 +40,7 @@ Use it when merging back to mainline or rebasing onto upstream.
 |------|--------|--------|
 | WS capture | `startWsCapture` / `readWsCapture`; arm before Network.enable; empty URL pattern for dedicated tabs | `extension/src/cdp.ts`, `extension/src/protocol.ts`, `extension/src/background.ts`, `src/browser/page.ts`, `src/browser/cdp.ts`, `src/browser/daemon-client.ts`, `src/types.ts` |
 | WS design note | Capture semantics & pitfalls | `docs/design/ws-stream-capture.md` |
-| setFileInput | Prefer `showPicker()`, 8s chooser wait, `DOM.describeNode` backendNodeId fallback | `extension/src/cdp.ts` |
+| setFileInput (historical; superseded) | Prefer `showPicker()`, 8s chooser wait, `DOM.describeNode` backendNodeId fallback; superseded by the 2026-07-21 pure-CDP nodeId path. | `extension/src/cdp.ts` |
 | CLI args | `Arg.repeatable` + Commander collect; manifest field | `src/registry.ts`, `src/commanderAdapter.ts`, `src/manifest-types.ts`, `src/build-manifest.ts` |
 
 #### Adapter (plugin only — not in core `clis/`)

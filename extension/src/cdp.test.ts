@@ -893,7 +893,8 @@ describe('cdp isFileInputFallbackEligible', () => {
   // The big regression: chrome.debugger surfaces protocol rejections as raw
   // `{ code, message }` objects. Passing those through `String(err)` yields
   // `'[object Object]'`, so a message-only predicate silently breaks and
-  // the fallback never runs. The new code path must key off `.code` directly.
+  // the fallback never runs. The new code path must preserve `.code` while
+  // still requiring a node-resolution reason.
   it('accepts raw CDP {code, message} object form (the chatgpt-agent regression)', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
@@ -903,12 +904,12 @@ describe('cdp isFileInputFallbackEligible', () => {
     expect(mod.isFileInputFallbackEligible({ code: -32000, message: 'Object reference could not be resolved' })).toBe(true);
   });
 
-  it('accepts raw CDP object with code only (no message) — robust to Chrome omitting strings', async () => {
+  it('rejects raw CDP object with code only because the rejection reason is unknown', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
     const mod = await import('./cdp');
-    expect(mod.isFileInputFallbackEligible({ code: -32000 })).toBe(true);
-    expect(mod.isFileInputFallbackEligible({ code: -32000, message: '' })).toBe(true);
+    expect(mod.isFileInputFallbackEligible({ code: -32000 })).toBe(false);
+    expect(mod.isFileInputFallbackEligible({ code: -32000, message: '' })).toBe(false);
   });
 
   it('rejects raw CDP objects with unrelated error codes', async () => {
@@ -919,16 +920,14 @@ describe('cdp isFileInputFallbackEligible', () => {
     expect(mod.isFileInputFallbackEligible({ code: -32001, message: 'No such file' })).toBe(false);
   });
 
-  it('rejects Error that carries code -32000 with unrelated message (no resolution keyword)', async () => {
+  it('rejects raw and Error code -32000 failures with unrelated messages', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
     const mod = await import('./cdp');
-    // normalizeCdpError stamps .code on the wrapped Error; the code-only
-    // short-circuit must still fire even when the message lacks the
-    // resolution keyword.
+    expect(mod.isFileInputFallbackEligible({ code: -32000, message: 'No such file' })).toBe(false);
     const err = new Error('No such file');
     (err as Error & { code?: unknown }).code = -32000;
-    expect(mod.isFileInputFallbackEligible(err)).toBe(true);
+    expect(mod.isFileInputFallbackEligible(err)).toBe(false);
   });
 });
 

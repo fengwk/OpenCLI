@@ -191,8 +191,6 @@ async function screenshot(tabId, options = {}) {
 const SELECTOR_NOT_FOUND_MESSAGE_PREFIX = "No element found matching selector:";
 function normalizeCdpError(err) {
   if (err instanceof Error) {
-    const existing = err.code;
-    if (existing !== void 0) return err;
     return err;
   }
   if (err && typeof err === "object") {
@@ -235,9 +233,8 @@ function isFileInputFallbackEligible(err) {
     code = obj.code;
     if (typeof obj.message === "string") msg = obj.message;
   }
-  if (!msg && code === void 0) return false;
-  if (code === -32e3) return true;
-  return /-32000/.test(msg) && /\b(not allowed|invalid parameters|invalid parameter|object .* not .*resolved|no node with given id|could not be resolved|cannot find context)\b/i.test(msg);
+  const isProtocolResolutionCode = code === -32e3 || code === "-32000" || /-32000/.test(msg);
+  return isProtocolResolutionCode && /\b(not allowed|invalid parameters|invalid parameter|object .* not .*resolved|no node with given id|could not be resolved|cannot find context)\b/i.test(msg);
 }
 async function setFileInputFiles(tabId, files, selector) {
   await ensureAttached(tabId);

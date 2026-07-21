@@ -157,16 +157,20 @@ if [[ "${PACKED_CLI_VERSION}" != "${CLI_VERSION}" ]]; then
   exit 1
 fi
 
-# Extension zip: fork-specific runtime markers + manifest version
+# Extension zip: pure-CDP file-input fallback markers + manifest version.
 PACKED_BG_JS="$(unzip -p "${EXT_ZIP_PATH}" dist/background.js)"
-if [[ "${PACKED_BG_JS}" != *showPicker* ]]; then
-  echo "ERROR: packaged background.js missing showPicker" >&2
-  exit 1
-fi
-if [[ "${PACKED_BG_JS}" != *'within 8s'* ]]; then
-  echo "ERROR: packaged background.js missing 8s chooser timeout" >&2
-  exit 1
-fi
+for required_marker in 'DOM.getDocument' 'DOM.querySelector' 'DOM.setFileInputFiles'; do
+  if [[ "${PACKED_BG_JS}" != *"${required_marker}"* ]]; then
+    echo "ERROR: packaged background.js missing ${required_marker}" >&2
+    exit 1
+  fi
+done
+for forbidden_marker in 'Page.setInterceptFileChooserDialog' 'Page.fileChooserOpened' 'Page.enable' 'showPicker'; do
+  if [[ "${PACKED_BG_JS}" == *"${forbidden_marker}"* ]]; then
+    echo "ERROR: packaged background.js still contains forbidden ${forbidden_marker}" >&2
+    exit 1
+  fi
+done
 PACKED_EXT_VERSION="$(unzip -p "${EXT_ZIP_PATH}" manifest.json | node -e "let s='';process.stdin.on('data',d=>s+=d);process.stdin.on('end',()=>console.log(JSON.parse(s).version))")"
 if [[ "${PACKED_EXT_VERSION}" != "${EXT_VERSION}" ]]; then
   echo "ERROR: packaged manifest.json version ${PACKED_EXT_VERSION} != ${EXT_VERSION}" >&2
