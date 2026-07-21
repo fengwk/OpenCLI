@@ -188,77 +188,141 @@ async function screenshot(tabId, options = {}) {
     }
   }
 }
+const SELECTOR_NOT_FOUND_MESSAGE_PREFIX = "No element found matching selector:";
+function isFileInputFallbackEligible(err) {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (!msg) return false;
+  return /-32000/.test(msg) && /\b(not allowed|invalid parameters|invalid parameter|object .* not .*resolved|no node with given id|could not be resolved|cannot find context)\b/i.test(msg);
+}
 async function setFileInputFiles(tabId, files, selector) {
   await ensureAttached(tabId);
   await sendDebuggerCommand({ tabId }, "DOM.enable");
   await sendDebuggerCommand({ tabId }, "Page.enable");
   const query = selector || 'input[type="file"]';
-  const found = await sendDebuggerCommand({ tabId }, "Runtime.evaluate", {
-    expression: `!!document.querySelector(${JSON.stringify(query)})`,
+  const validation = await sendDebuggerCommand({ tabId }, "Runtime.evaluate", {
+    expression: `(() => {
+      const el = document.querySelector(${JSON.stringify(query)});
+      if (!el) return { ok: false, reason: 'not-found' };
+      if (!(el instanceof HTMLInputElement) || el.type !== 'file') {
+        return { ok: false, reason: 'not-file-input', tag: el.tagName, type: el.type };
+      }
+      return { ok: true };
+    })()`,
     returnByValue: true
   });
-  if (!found.result?.value) {
-    throw new Error(`No element found matching selector: ${query}`);
+  const probe = validation.result?.value;
+  if (!probe) {
+    throw new Error(`${SELECTOR_NOT_FOUND_MESSAGE_PREFIX} ${query}`);
   }
-  await sendDebuggerCommand({ tabId }, "Page.setInterceptFileChooserDialog", { enabled: true });
-  try {
-    let backendNodeId;
-    try {
-      backendNodeId = await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-          cleanup();
-          reject(new Error("Page.fileChooserOpened not received within 8s — the input may not have opened a file chooser"));
-        }, 8e3);
-        const listener = (source, method, params) => {
-          if (source.tabId !== tabId || method !== "Page.fileChooserOpened") return;
-          cleanup();
-          const backend = params?.backendNodeId;
-          if (typeof backend === "number") resolve(backend);
-          else reject(new Error("Page.fileChooserOpened carried no backendNodeId"));
-        };
-        const cleanup = () => {
-          clearTimeout(timer);
-          chrome.debugger.onEvent.removeListener(listener);
-        };
-        chrome.debugger.onEvent.addListener(listener);
-        void sendDebuggerCommand({ tabId }, "Runtime.evaluate", {
-          expression: `(() => {
-            const el = document.querySelector(${JSON.stringify(query)});
-            if (!el) throw new Error('file input disappeared');
-            if (typeof el.showPicker === 'function') {
-              try { el.showPicker(); return 'showPicker'; } catch (_) {}
-            }
-            el.click();
-            return 'click';
-          })()`
-        }).catch((err) => {
-          cleanup();
-          reject(err instanceof Error ? err : new Error(String(err)));
-        });
-      });
-    } catch (chooserErr) {
-      const doc = await sendDebuggerCommand({ tabId }, "DOM.getDocument", { depth: 0 });
-      const rootId = doc?.root?.nodeId;
-      if (typeof rootId !== "number") throw chooserErr;
-      const q = await sendDebuggerCommand({ tabId }, "DOM.querySelector", {
-        nodeId: rootId,
-        selector: query
-      });
-      if (typeof q?.nodeId !== "number" || q.nodeId <= 0) throw chooserErr;
-      const desc = await sendDebuggerCommand({ tabId }, "DOM.describeNode", {
-        nodeId: q.nodeId
-      });
-      const backend = desc?.node?.backendNodeId;
-      if (typeof backend !== "number") throw chooserErr;
-      backendNodeId = backend;
+  if (!probe.ok) {
+    if (probe.reason === "not-file-input") {
+      throw new Error(
+        `setFileInputFiles: selector "${query}" matched <${probe.tag ?? "?"} type="${probe.type ?? ""}">, expected HTMLInputElement[type=file]`
+      );
     }
+    throw new Error(`${SELECTOR_NOT_FOUND_MESSAGE_PREFIX} ${query}`);
+  }
+  const resolveResult = await sendDebuggerCommand({ tabId }, "Runtime.evaluate", {
+    expression: `document.querySelector(${JSON.stringify(query)})`
+  });
+  const objectId = resolveResult.result?.objectId;
+  if (!objectId) {
+    throw new Error(`${SELECTOR_NOT_FOUND_MESSAGE_PREFIX} ${query}`);
+  }
+  const describe = await sendDebuggerCommand({ tabId }, "DOM.describeNode", {
+    objectId
+  });
+  const backendNodeId = describe.node?.backendNodeId;
+  if (typeof backendNodeId !== "number") {
+    await releaseRuntimeObject(tabId, objectId);
+    throw new Error(
+      `setFileInputFiles: DOM.describeNode returned no backendNodeId for selector "${query}"`
+    );
+  }
+  let directErr = null;
+  try {
     await sendDebuggerCommand({ tabId }, "DOM.setFileInputFiles", {
       files,
+      objectId,
       backendNodeId
     });
-  } finally {
-    await sendDebuggerCommand({ tabId }, "Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => {
+    await releaseRuntimeObject(tabId, objectId);
+    return;
+  } catch (e) {
+    directErr = e instanceof Error ? e : new Error(String(e));
+  }
+  await releaseRuntimeObject(tabId, objectId);
+  if (!isFileInputFallbackEligible(directErr)) {
+    throw directErr;
+  }
+  let interceptionArmed = false;
+  try {
+    await sendDebuggerCommand({ tabId }, "Page.setInterceptFileChooserDialog", { enabled: true });
+    interceptionArmed = true;
+    const chooserBackendNodeId = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error("Page.fileChooserOpened not received within 8s — the input may not have opened a file chooser"));
+      }, 8e3);
+      const listener = (source, method, params) => {
+        if (source.tabId !== tabId || method !== "Page.fileChooserOpened") return;
+        cleanup();
+        const backend = params?.backendNodeId;
+        if (typeof backend === "number") resolve(backend);
+        else reject(new Error("Page.fileChooserOpened carried no backendNodeId"));
+      };
+      const cleanup = () => {
+        clearTimeout(timer);
+        chrome.debugger.onEvent.removeListener(listener);
+      };
+      chrome.debugger.onEvent.addListener(listener);
+      void sendDebuggerCommand({ tabId }, "Runtime.evaluate", {
+        expression: `(() => {
+          const el = document.querySelector(${JSON.stringify(query)});
+          if (!el) throw new Error('file input disappeared');
+          if (typeof el.showPicker === 'function') {
+            try { el.showPicker(); return 'showPicker'; } catch (_) {}
+          }
+          el.click();
+          return 'click';
+        })()`
+      }).catch((err) => {
+        cleanup();
+        reject(err instanceof Error ? err : new Error(String(err)));
+      });
     });
+    try {
+      await sendDebuggerCommand({ tabId }, "DOM.setFileInputFiles", {
+        files,
+        backendNodeId: chooserBackendNodeId
+      });
+      return;
+    } catch (fallbackErr) {
+      const fbMsg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+      throw new Error(
+        `setFileInputFiles: direct CDP path failed (${directErr?.message ?? "unknown"}); chooser fallback DOM.setFileInputFiles also failed (${fbMsg})`
+      );
+    }
+  } catch (chooserErr) {
+    if (chooserErr instanceof Error && chooserErr.message.startsWith("setFileInputFiles:")) {
+      throw chooserErr;
+    }
+    const chMsg = chooserErr instanceof Error ? chooserErr.message : String(chooserErr);
+    throw new Error(
+      `setFileInputFiles: direct CDP path failed (${directErr?.message ?? "unknown"}); chooser fallback also failed (${chMsg})`
+    );
+  } finally {
+    if (interceptionArmed) {
+      await sendDebuggerCommand({ tabId }, "Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => {
+      });
+    }
+  }
+}
+async function releaseRuntimeObject(tabId, objectId) {
+  if (!objectId) return;
+  try {
+    await sendDebuggerCommand({ tabId }, "Runtime.releaseObject", { objectId });
+  } catch {
   }
 }
 function matchesDownloadPattern(item, pattern) {

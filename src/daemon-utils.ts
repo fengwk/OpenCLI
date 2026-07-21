@@ -6,6 +6,78 @@ export const COMMAND_RESULT_UNKNOWN_HINT =
 export const PROFILE_DISCONNECTED_HINT =
   'Open that Chrome profile and make sure the OpenCLI extension is enabled, or choose another profile with opencli profile use <name>.';
 
+/**
+ * 1 MiB cap on every HTTP request body the daemon accepts. CLI commands are
+ * short; oversized bodies are a misuse signal (e.g. someone piping a file's
+ * contents instead of its path), not a legitimate command.
+ */
+export const REQUEST_BODY_LIMIT_BYTES = 1024 * 1024;
+
+/** Stable machine code for the over-limit HTTP body rejection. */
+export const REQUEST_BODY_TOO_LARGE_CODE = 'request_body_too_large';
+
+/** HTTP status returned for an over-limit body — RFC 7231 §6.5.11. */
+export const REQUEST_BODY_TOO_LARGE_STATUS = 413;
+
+export const REQUEST_BODY_TOO_LARGE_HINT =
+  'Reduce the request payload: this command exceeded the daemon 1 MiB body cap. ' +
+  'Local file paths should be passed as strings, never as base64-encoded contents — ' +
+  'see `opencli <site> upload --file <path>` for the native file-input path.';
+
+/**
+ * Structured failure returned by the daemon when an HTTP body exceeds the cap.
+ * The CLI surfaces this as a typed `BrowserCommandError` with
+ * `retryable=false` — a body too large on attempt N will still be too large
+ * on attempt N+1, and a retry would burn the rest of the daemon deadline
+ * against a guaranteed-rejected request.
+ */
+export interface RequestBodyTooLargeFailure {
+  ok: false;
+  errorCode: typeof REQUEST_BODY_TOO_LARGE_CODE;
+  message: string;
+  errorHint: string;
+  status: typeof REQUEST_BODY_TOO_LARGE_STATUS;
+  receivedBytes: number;
+  limit: number;
+  /** Always false: the daemon must not auto-retry this — payload must shrink. */
+  retryable: false;
+}
+
+export function buildRequestBodyTooLargeFailure(
+  receivedBytes: number,
+  limit: number = REQUEST_BODY_LIMIT_BYTES,
+): RequestBodyTooLargeFailure {
+  return {
+    ok: false,
+    errorCode: REQUEST_BODY_TOO_LARGE_CODE,
+    message: `Request body of ${receivedBytes} bytes exceeded the daemon limit of ${limit} bytes.`,
+    errorHint: REQUEST_BODY_TOO_LARGE_HINT,
+    status: REQUEST_BODY_TOO_LARGE_STATUS,
+    receivedBytes,
+    limit,
+    retryable: false,
+  };
+}
+
+/**
+ * Pure classifier — single source of truth for "is this body too big?". Used
+ * by the daemon's incremental `data`-event reader. The cap is strict (>), so
+ * a body exactly at the limit still passes.
+ */
+export type RequestBodyClassification =
+  | { kind: 'ok'; receivedBytes: number; limit: number }
+  | { kind: 'too-large'; receivedBytes: number; limit: number };
+
+export function classifyRequestBodySize(
+  receivedBytes: number,
+  limit: number = REQUEST_BODY_LIMIT_BYTES,
+): RequestBodyClassification {
+  if (receivedBytes > limit) {
+    return { kind: 'too-large', receivedBytes, limit };
+  }
+  return { kind: 'ok', receivedBytes, limit };
+}
+
 export type DaemonFailureContract = {
   message: string;
   errorCode: string;

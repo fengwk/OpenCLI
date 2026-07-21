@@ -363,9 +363,67 @@ export async function screenshot(
 }
 
 /**
+ * Phrase that downstream plugins (Instagram `post.js`, see `clis/instagram/
+ * post.js`) match against to decide whether the selector is stale and should
+ * be re-resolved. Keep this string verbatim — the contract predates this fork
+ * and plugins rely on a stable substring, not a stable type.
+ */
+const SELECTOR_NOT_FOUND_MESSAGE_PREFIX = 'No element found matching selector:';
+
+/**
+ * True when a CDP rejection from `DOM.setFileInputFiles` indicates that the
+ * call itself was rejected by Chrome's protocol layer for a node/object
+ * resolution reason — i.e. the input element reference we passed is not
+ * usable as-is, and a different code path (file-chooser interception that
+ * supplies backendNodeId from `Page.fileChooserOpened`) might still work.
+ *
+ * Strictly excludes transport / lifecycle failures: file-not-found,
+ * permission errors, debugger detach, command timeouts, network errors.
+ * Falling back for those would just burn an 8-second wait without ever
+ * opening a chooser — the rejection isn't about the input reference at all.
+ */
+export function isFileInputFallbackEligible(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (!msg) return false;
+  // Chrome CDP `-32000` protocol rejections. The current leading cause is
+  // crbug 928255 ("Not allowed" when chrome.debugger is the attachment and
+  // the call carries only a bare nodeId / backendNodeId), but the predicate
+  // also accepts the symmetric "Invalid parameters" / "Object reference
+  // could not be resolved" shapes that have shipped in the wild.
+  return /-32000/.test(msg)
+    && /\b(not allowed|invalid parameters|invalid parameter|object .* not .*resolved|no node with given id|could not be resolved|cannot find context)\b/i.test(msg);
+}
+
+/**
  * Set local file paths on a file input element via CDP DOM.setFileInputFiles.
- * This bypasses the need to send large base64 payloads through the message channel —
- * Chrome reads the files directly from the local filesystem.
+ * Chrome reads the files directly from the local filesystem — no base64 / DataTransfer
+ * payload has to cross the message channel or extension-CDP boundary.
+ *
+ * Preferred path (Puppeteer / Playwright direct CDP, no native chooser):
+ *   1. Runtime.evaluate returns the input element so its `objectId` is on the
+ *      result envelope. We deliberately do NOT use `returnByValue: true` — the
+ *      `objectId` is what bypasses crbug 928255, which makes chrome.debugger
+ *      reject DOM.setFileInputFiles with a bare nodeId/backendNodeId
+ *      ("-32000 Not allowed").
+ *   2. DOM.describeNode({objectId}) → backendNodeId.
+ *   3. DOM.setFileInputFiles({ files, objectId, backendNodeId }).
+ *   4. Runtime.releaseObject({objectId}) — best-effort, releases the Runtime
+ *      remote so the inspector session isn't leaked when the upload repeats.
+ *
+ * Compatibility fallback (only for protocol-resolution rejections, NOT for
+ * file/path/permission/transport/timeout errors — those have nothing to do
+ * with the input reference and an 8-second wait would be wasted):
+ *   - Enable Page.setInterceptFileChooserDialog, then drive the input via
+ *     `el.showPicker()` / `el.click()` to surface Page.fileChooserOpened,
+ *     which carries the backendNodeId of the same input. A second
+ *     DOM.setFileInputFiles with that backendNodeId completes the upload.
+ *   - The interception flag is always cleared in `finally`, even when both
+ *     paths fail, so the OS file dialog never pops up after the call returns.
+ *
+ * Selector contract is preserved: a missing match throws the legacy
+ * `"No element found matching selector: ${query}"` message verbatim (the
+ * Instagram `post.js` plugin greps this string to decide whether to
+ * re-resolve the upload selector — see `clis/instagram/post.js`).
  *
  * @param tabId - Target tab ID
  * @param files - Array of absolute local file paths
@@ -378,89 +436,197 @@ export async function setFileInputFiles(
 ): Promise<void> {
   await ensureAttached(tabId);
 
-  // Enable DOM + Page domains. Page is needed for file-chooser interception.
+  // DOM is needed for describeNode/setFileInputFiles; Page is needed for the
+  // file-chooser interception fallback. Enabling Page unconditionally keeps
+  // the fallback one round-trip faster when the direct path rejects.
   await sendDebuggerCommand({ tabId }, 'DOM.enable');
   await sendDebuggerCommand({ tabId }, 'Page.enable');
 
-  // Find the file input element (used to trigger the chooser).
   const query = selector || 'input[type="file"]';
-  const found = await sendDebuggerCommand({ tabId }, 'Runtime.evaluate', {
-    expression: `!!document.querySelector(${JSON.stringify(query)})`,
+
+  // 1. Validate the selector strictly: it must resolve to a file input.
+  //    We intentionally run this as a separate `returnByValue` evaluate so
+  //    the rejection path returns a structured `{ ok, reason }` discriminator
+  //    without burning an objectId on a failed resolution.
+  const validation = await sendDebuggerCommand({ tabId }, 'Runtime.evaluate', {
+    expression: `(() => {
+      const el = document.querySelector(${JSON.stringify(query)});
+      if (!el) return { ok: false, reason: 'not-found' };
+      if (!(el instanceof HTMLInputElement) || el.type !== 'file') {
+        return { ok: false, reason: 'not-file-input', tag: el.tagName, type: el.type };
+      }
+      return { ok: true };
+    })()`,
     returnByValue: true,
-  }) as { result?: { value?: boolean } };
-  if (!found.result?.value) {
-    throw new Error(`No element found matching selector: ${query}`);
+  }) as { result?: { value?: { ok: boolean; reason?: string; tag?: string; type?: string } } };
+
+  const probe = validation.result?.value;
+  if (!probe) {
+    throw new Error(`${SELECTOR_NOT_FOUND_MESSAGE_PREFIX} ${query}`);
+  }
+  if (!probe.ok) {
+    if (probe.reason === 'not-file-input') {
+      throw new Error(
+        `setFileInputFiles: selector "${query}" matched <${probe.tag ?? '?'} type="${probe.type ?? ''}">, expected HTMLInputElement[type=file]`,
+      );
+    }
+    // Preserved selector-miss contract — used by Instagram post.js plugin.
+    throw new Error(`${SELECTOR_NOT_FOUND_MESSAGE_PREFIX} ${query}`);
   }
 
-  // Chrome rejects DOM.setFileInputFiles with a plain nodeId/backendNodeId when
-  // the debugger is attached via chrome.debugger (crbug 928255, "-32000 Not
-  // allowed"). Preferred path: file-chooser interception (Page.fileChooserOpened
-  // backendNodeId). Interception suppresses the native OS file manager.
-  // See issue #2108.
-  await sendDebuggerCommand({ tabId }, 'Page.setInterceptFileChooserDialog', { enabled: true });
-  try {
-    let backendNodeId: number | undefined;
-    try {
-      backendNodeId = await new Promise<number>((resolve, reject) => {
-        const timer = setTimeout(() => {
-          cleanup();
-          reject(new Error('Page.fileChooserOpened not received within 8s — the input may not have opened a file chooser'));
-        }, 8000);
-        const listener = (source: chrome.debugger.Debuggee, method: string, params: unknown) => {
-          if (source.tabId !== tabId || method !== 'Page.fileChooserOpened') return;
-          cleanup();
-          const backend = (params as { backendNodeId?: number })?.backendNodeId;
-          if (typeof backend === 'number') resolve(backend);
-          else reject(new Error('Page.fileChooserOpened carried no backendNodeId'));
-        };
-        const cleanup = () => {
-          clearTimeout(timer);
-          chrome.debugger.onEvent.removeListener(listener);
-        };
-        chrome.debugger.onEvent.addListener(listener);
-        // Open chooser programmatically. Prefer showPicker() (Playwright-like);
-        // fall back to click(). Interception suppresses the native dialog.
-        void sendDebuggerCommand({ tabId }, 'Runtime.evaluate', {
-          expression: `(() => {
-            const el = document.querySelector(${JSON.stringify(query)});
-            if (!el) throw new Error('file input disappeared');
-            if (typeof el.showPicker === 'function') {
-              try { el.showPicker(); return 'showPicker'; } catch (_) {}
-            }
-            el.click();
-            return 'click';
-          })()`,
-        }).catch((err) => {
-          cleanup();
-          reject(err instanceof Error ? err : new Error(String(err)));
-        });
-      });
-    } catch (chooserErr) {
-      // Fallback: resolve backendNodeId via DOM.describeNode (works on some Chrome builds).
-      const doc = await sendDebuggerCommand({ tabId }, 'DOM.getDocument', { depth: 0 }) as {
-        root?: { nodeId?: number };
-      };
-      const rootId = doc?.root?.nodeId;
-      if (typeof rootId !== 'number') throw chooserErr;
-      const q = await sendDebuggerCommand({ tabId }, 'DOM.querySelector', {
-        nodeId: rootId,
-        selector: query,
-      }) as { nodeId?: number };
-      if (typeof q?.nodeId !== 'number' || q.nodeId <= 0) throw chooserErr;
-      const desc = await sendDebuggerCommand({ tabId }, 'DOM.describeNode', {
-        nodeId: q.nodeId,
-      }) as { node?: { backendNodeId?: number } };
-      const backend = desc?.node?.backendNodeId;
-      if (typeof backend !== 'number') throw chooserErr;
-      backendNodeId = backend;
-    }
+  // 2. Resolve the element via a fresh Runtime.evaluate — NO returnByValue, so
+  // the result envelope carries an objectId pointing at the live DOM node.
+  // That objectId is what DOM.setFileInputFiles will resolve against on the
+  // direct path; without it we are forced back to the chooser fallback.
+  const resolveResult = await sendDebuggerCommand({ tabId }, 'Runtime.evaluate', {
+    expression: `document.querySelector(${JSON.stringify(query)})`,
+  }) as { result?: { objectId?: string } };
 
+  const objectId = resolveResult.result?.objectId;
+  if (!objectId) {
+    // Should be impossible after the validation step, but guard for CDP
+    // implementations that strip objectId from non-DOM results.
+    throw new Error(`${SELECTOR_NOT_FOUND_MESSAGE_PREFIX} ${query}`);
+  }
+
+  // 3. DOM.describeNode({objectId}) → backendNodeId. We pass both IDs to
+  // DOM.setFileInputFiles because Chrome's resolver prefers the most specific
+  // reference (objectId > backendNodeId > nodeId); including the extras is
+  // harmless and makes the call work on every Chrome variant we ship to.
+  const describe = await sendDebuggerCommand({ tabId }, 'DOM.describeNode', {
+    objectId,
+  }) as { node?: { backendNodeId?: number } };
+
+  const backendNodeId = describe.node?.backendNodeId;
+  if (typeof backendNodeId !== 'number') {
+    await releaseRuntimeObject(tabId, objectId);
+    throw new Error(
+      `setFileInputFiles: DOM.describeNode returned no backendNodeId for selector "${query}"`,
+    );
+  }
+
+  // 4. Direct CDP path. Try it first — if the browser accepts it, we are
+  // done without ever arming file-chooser interception, so no cleanup is
+  // needed. Capture the error so the fallback branch can attribute its own
+  // failure to "direct path + fallback both failed".
+  let directErr: Error | null = null;
+  try {
     await sendDebuggerCommand({ tabId }, 'DOM.setFileInputFiles', {
       files,
+      objectId,
       backendNodeId,
     });
+    await releaseRuntimeObject(tabId, objectId);
+    return; // success — interception was never armed
+  } catch (e) {
+    directErr = e instanceof Error ? e : new Error(String(e));
+  }
+
+  // Release the direct-path objectId before we move on — the chooser branch
+  // resolves its own reference through Page.fileChooserOpened.
+  await releaseRuntimeObject(tabId, objectId);
+
+  // Only protocol-resolution rejections qualify for the chooser fallback.
+  // Transport / lifecycle failures (file not found, permission denied,
+  // debugger detach, command timeout, network error) share the same wire
+  // shape but never indicate that the input reference is bad — retrying
+  // them via interception would just burn 8 seconds without surfacing a
+  // chooser.
+  if (!isFileInputFallbackEligible(directErr)) {
+    throw directErr;
+  }
+
+  // 5. Fallback: native CDP file-chooser interception. Arm interception,
+  // drive the input to surface Page.fileChooserOpened, then call
+  // DOM.setFileInputFiles with the event's backendNodeId.
+  //
+  // The interception flag is tracked so the `finally` block knows whether to
+  // disable it — never leaving Page.setInterceptFileChooserDialog armed after
+  // a failed call, or the next legitimate file picker in the tab would be
+  // silently swallowed by the daemon.
+  let interceptionArmed = false;
+  try {
+    await sendDebuggerCommand({ tabId }, 'Page.setInterceptFileChooserDialog', { enabled: true });
+    interceptionArmed = true;
+
+    const chooserBackendNodeId = await new Promise<number>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error('Page.fileChooserOpened not received within 8s — the input may not have opened a file chooser'));
+      }, 8000);
+      const listener = (source: chrome.debugger.Debuggee, method: string, params: unknown) => {
+        if (source.tabId !== tabId || method !== 'Page.fileChooserOpened') return;
+        cleanup();
+        const backend = (params as { backendNodeId?: number })?.backendNodeId;
+        if (typeof backend === 'number') resolve(backend);
+        else reject(new Error('Page.fileChooserOpened carried no backendNodeId'));
+      };
+      const cleanup = () => {
+        clearTimeout(timer);
+        chrome.debugger.onEvent.removeListener(listener);
+      };
+      chrome.debugger.onEvent.addListener(listener);
+      // Drive the picker: prefer showPicker() (Playwright-style, no UI side
+      // effect), fall back to click() which is suppressed by interception.
+      void sendDebuggerCommand({ tabId }, 'Runtime.evaluate', {
+        expression: `(() => {
+          const el = document.querySelector(${JSON.stringify(query)});
+          if (!el) throw new Error('file input disappeared');
+          if (typeof el.showPicker === 'function') {
+            try { el.showPicker(); return 'showPicker'; } catch (_) {}
+          }
+          el.click();
+          return 'click';
+        })()`,
+      }).catch((err) => {
+        cleanup();
+        reject(err instanceof Error ? err : new Error(String(err)));
+      });
+    });
+
+    try {
+      await sendDebuggerCommand({ tabId }, 'DOM.setFileInputFiles', {
+        files,
+        backendNodeId: chooserBackendNodeId,
+      });
+      return; // fallback success
+    } catch (fallbackErr) {
+      const fbMsg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+      throw new Error(
+        `setFileInputFiles: direct CDP path failed (${directErr?.message ?? 'unknown'}); ` +
+        `chooser fallback DOM.setFileInputFiles also failed (${fbMsg})`,
+      );
+    }
+  } catch (chooserErr) {
+    // If we already wrapped this with the direct+failure combined message
+    // (DOM.setFileInputFiles rejection), rethrow that as-is so the user sees
+    // both failures. Otherwise wrap the chooser-side error similarly.
+    if (chooserErr instanceof Error && chooserErr.message.startsWith('setFileInputFiles:')) {
+      throw chooserErr;
+    }
+    const chMsg = chooserErr instanceof Error ? chooserErr.message : String(chooserErr);
+    throw new Error(
+      `setFileInputFiles: direct CDP path failed (${directErr?.message ?? 'unknown'}); ` +
+      `chooser fallback also failed (${chMsg})`,
+    );
   } finally {
-    await sendDebuggerCommand({ tabId }, 'Page.setInterceptFileChooserDialog', { enabled: false }).catch(() => {});
+    if (interceptionArmed) {
+      await sendDebuggerCommand({ tabId }, 'Page.setInterceptFileChooserDialog', { enabled: false }).catch(() => {});
+    }
+  }
+}
+
+/**
+ * Best-effort release of a Runtime remote object. Failures are swallowed —
+ * a stale handle is harmless compared to failing an upload that already
+ * succeeded on the direct path.
+ */
+async function releaseRuntimeObject(tabId: number, objectId: string): Promise<void> {
+  if (!objectId) return;
+  try {
+    await sendDebuggerCommand({ tabId }, 'Runtime.releaseObject', { objectId });
+  } catch {
+    // already gone — no-op
   }
 }
 

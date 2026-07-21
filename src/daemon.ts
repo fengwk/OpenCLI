@@ -28,10 +28,12 @@ import { log } from './logger.js';
 import { PKG_VERSION } from './version.js';
 import { DEFAULT_CONTEXT_ID } from './browser/profile.js';
 import { recordExtensionVersion } from './update-check.js';
+import { readBody } from './daemon-body.js';
 import {
   COMMAND_RESULT_UNKNOWN_CODE,
   COMMAND_RESULT_UNKNOWN_HINT,
   PROFILE_DISCONNECTED_HINT,
+  REQUEST_BODY_TOO_LARGE_STATUS,
   buildCommandDispatchFailure,
   buildCommandTimeoutFailure,
   buildExtensionDisconnectFailure,
@@ -510,23 +512,6 @@ function unregisterExtensionConnection(ws: WebSocket): void {
 
 // ─── HTTP Server ─────────────────────────────────────────────────────
 
-const MAX_BODY = 1024 * 1024; // 1 MB — commands are tiny; this prevents OOM
-
-function readBody(req: IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let size = 0;
-    let aborted = false;
-    req.on('data', (c: Buffer) => {
-      size += c.length;
-      if (size > MAX_BODY) { aborted = true; req.destroy(); reject(new Error('Body too large')); return; }
-      chunks.push(c);
-    });
-    req.on('end', () => { if (!aborted) resolve(Buffer.concat(chunks).toString('utf-8')); });
-    req.on('error', (err) => { if (!aborted) reject(err); });
-  });
-}
-
 function jsonResponse(
   res: ServerResponse,
   status: number,
@@ -642,7 +627,27 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
   if (req.method === 'POST' && pathname === '/session-leases/recover') {
     try {
-      const body = JSON.parse(await readBody(req)) as Record<string, unknown>;
+      const readOutcome = await readBody(req);
+      if (readOutcome.kind === 'too-large') {
+        jsonResponse(res, REQUEST_BODY_TOO_LARGE_STATUS, {
+          ok: false,
+          errorCode: readOutcome.failure.errorCode,
+          error: readOutcome.failure.message,
+          errorHint: readOutcome.failure.errorHint,
+          receivedBytes: readOutcome.failure.receivedBytes,
+          limit: readOutcome.failure.limit,
+        });
+        return;
+      }
+      if (readOutcome.kind === 'read-error') {
+        jsonResponse(res, 400, {
+          ok: false,
+          errorCode: 'invalid_session_recovery_request',
+          error: readOutcome.error.message,
+        });
+        return;
+      }
+      const body = JSON.parse(readOutcome.body) as Record<string, unknown>;
       const contextId = typeof body.contextId === 'string' ? body.contextId.trim() : '';
       const surface = typeof body.surface === 'string' ? body.surface.trim() : '';
       const session = typeof body.session === 'string' ? body.session.trim() : '';
@@ -681,7 +686,27 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
   if (req.method === 'POST' && url === '/command') {
     try {
-      const body = JSON.parse(await readBody(req));
+      const readOutcome = await readBody(req);
+      if (readOutcome.kind === 'too-large') {
+        // 413 carries the canonical structured failure the CLI surfaces as a
+        // BrowserCommandError(request_body_too_large, retryable=false). id is
+        // intentionally absent: the body was never fully parsed, so echoing a
+        // truncated id back would only confuse the client's journal lookup.
+        jsonResponse(res, REQUEST_BODY_TOO_LARGE_STATUS, {
+          ok: false,
+          errorCode: readOutcome.failure.errorCode,
+          error: readOutcome.failure.message,
+          errorHint: readOutcome.failure.errorHint,
+          receivedBytes: readOutcome.failure.receivedBytes,
+          limit: readOutcome.failure.limit,
+        });
+        return;
+      }
+      if (readOutcome.kind === 'read-error') {
+        jsonResponse(res, 400, { ok: false, error: readOutcome.error.message });
+        return;
+      }
+      const body = JSON.parse(readOutcome.body);
       if (!body.id) {
         jsonResponse(res, 400, { ok: false, error: 'Missing command id' });
         return;

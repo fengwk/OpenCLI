@@ -3,9 +3,15 @@ import { describe, expect, it } from 'vitest';
 import {
   COMMAND_RESULT_UNKNOWN_CODE,
   COMMAND_RESULT_UNKNOWN_HINT,
+  REQUEST_BODY_LIMIT_BYTES,
+  REQUEST_BODY_TOO_LARGE_CODE,
+  REQUEST_BODY_TOO_LARGE_HINT,
+  REQUEST_BODY_TOO_LARGE_STATUS,
   buildCommandDispatchFailure,
   buildCommandTimeoutFailure,
   buildExtensionDisconnectFailure,
+  buildRequestBodyTooLargeFailure,
+  classifyRequestBodySize,
   commandResultUnknownMessage,
   getResponseCorsHeaders,
   resolveProfileRoute,
@@ -126,5 +132,63 @@ describe('daemon command dispatch', () => {
       status: 408,
       countAsCommandResultUnknown: true,
     });
+  });
+});
+
+describe('request body cap', () => {
+  // Single source of truth — keep the public constant in sync with the
+  // expected 1 MiB cap so future drift is caught at unit-test time.
+  it('keeps the limit at 1 MiB', () => {
+    expect(REQUEST_BODY_LIMIT_BYTES).toBe(1024 * 1024);
+  });
+
+  it('classifies a body exactly at the cap as ok (strict >)', () => {
+    expect(classifyRequestBodySize(REQUEST_BODY_LIMIT_BYTES)).toEqual({
+      kind: 'ok',
+      receivedBytes: REQUEST_BODY_LIMIT_BYTES,
+      limit: REQUEST_BODY_LIMIT_BYTES,
+    });
+  });
+
+  it('classifies a body one byte over the cap as too-large', () => {
+    expect(classifyRequestBodySize(REQUEST_BODY_LIMIT_BYTES + 1)).toEqual({
+      kind: 'too-large',
+      receivedBytes: REQUEST_BODY_LIMIT_BYTES + 1,
+      limit: REQUEST_BODY_LIMIT_BYTES,
+    });
+  });
+
+  it('classifies an empty body as ok', () => {
+    expect(classifyRequestBodySize(0)).toEqual({ kind: 'ok', receivedBytes: 0, limit: REQUEST_BODY_LIMIT_BYTES });
+  });
+
+  it('builds a structured 413 failure with received bytes and limit surfaced in the message and hint', () => {
+    const failure = buildRequestBodyTooLargeFailure(REQUEST_BODY_LIMIT_BYTES + 1024);
+    expect(failure).toMatchObject({
+      ok: false,
+      errorCode: REQUEST_BODY_TOO_LARGE_CODE,
+      errorHint: REQUEST_BODY_TOO_LARGE_HINT,
+      status: REQUEST_BODY_TOO_LARGE_STATUS,
+      receivedBytes: REQUEST_BODY_LIMIT_BYTES + 1024,
+      limit: REQUEST_BODY_LIMIT_BYTES,
+      retryable: false,
+    });
+    expect(failure.message).toContain(String(REQUEST_BODY_LIMIT_BYTES + 1024));
+    expect(failure.message).toContain(String(REQUEST_BODY_LIMIT_BYTES));
+    // Hint must be actionable — naming the native file-input path keeps the
+    // contract aligned with the page-side setFileInputFiles work.
+    expect(REQUEST_BODY_TOO_LARGE_HINT).toContain('1 MiB');
+    expect(REQUEST_BODY_TOO_LARGE_HINT).toContain('base64');
+    expect(REQUEST_BODY_TOO_LARGE_HINT).toContain('upload --file');
+  });
+
+  it('always marks the failure as non-retryable so the CLI never re-posts the same oversized body', () => {
+    expect(buildRequestBodyTooLargeFailure(2_000_000).retryable).toBe(false);
+    expect(buildRequestBodyTooLargeFailure(2_000_000, 1024).retryable).toBe(false);
+  });
+
+  it('uses 413 as the structured HTTP status (RFC 7231 §6.5.11)', () => {
+    expect(REQUEST_BODY_TOO_LARGE_STATUS).toBe(413);
+    expect(REQUEST_BODY_TOO_LARGE_CODE).toBe('request_body_too_large');
   });
 });

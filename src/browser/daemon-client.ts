@@ -506,6 +506,20 @@ async function sendCommandRaw(
 
       if (result.ok) return result;
 
+      // 413 — request body exceeded the daemon's 1 MiB cap. Terminal by
+      // contract: the same payload on attempt N+1 will still be too large, so
+      // we throw a typed BrowserCommandError up-front (before the retry
+      // classifier can misread the message as a transient browser hiccup).
+      // We preserve the daemon's own errorCode/errorHint so the message stays
+      // in lock-step with the server contract.
+      if (res.status === 413 || result.errorCode === 'request_body_too_large') {
+        throw new BrowserCommandError(
+          result.error ?? 'Request body exceeded the daemon 1 MiB cap.',
+          result.errorCode ?? 'request_body_too_large',
+          result.errorHint,
+        );
+      }
+
       // A second concurrent write on the same persistent site session is
       // rejected before the daemon dispatches anything — terminal, never
       // retried, and surfaced as a CliError so the busy message is the output.

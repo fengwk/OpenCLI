@@ -782,3 +782,111 @@ describe('isUnknownOutcomeError', () => {
     expect(isUnknownOutcomeError(wrapped)).toBe(true);
   });
 });
+
+describe('daemon-client request_body_too_large handling', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn());
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    setDaemonRunContext(null);
+    setDaemonCommandTimeoutSeconds(null);
+  });
+
+  /**
+   * Build a fetch Response that mimics the daemon's structured 413 reply.
+   * The daemon returns `{ ok: false, errorCode, error, errorHint,
+   * receivedBytes, limit }` with HTTP status 413. We do NOT start the real
+   * daemon; this avoids the fixed-port convention used by
+   * tests/e2e/daemon-transport.test.ts.
+   */
+  function make413Response(body: unknown): Response {
+    return new Response(JSON.stringify(body), {
+      status: 413,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  it('surfaces a structured 413 as a typed BrowserCommandError and never retries', async () => {
+    vi.mocked(fetch).mockResolvedValue(make413Response({
+      ok: false,
+      errorCode: 'request_body_too_large',
+      error: 'Request body of 2097152 bytes exceeded the daemon limit of 1048576 bytes.',
+      errorHint: 'Reduce the request payload: this command exceeded the daemon 1 MiB body cap. ...',
+      receivedBytes: 2_097_152,
+      limit: 1_048_576,
+    }));
+
+    // Spy on the bridge-ensure path: a retry would call ensureBrowserBridgeReady
+    // (which itself spawns a daemon). Asserting that it is never called proves
+    // the 413 path terminates before any retry logic.
+    const ensureSpy = vi.spyOn(daemonLifecycle, 'ensureBrowserBridgeReady').mockResolvedValue({
+      health: { state: 'ready', status: { ok: true, pid: 1, uptime: 0, extensionConnected: true, pending: 0, memoryMB: 0, port: 19825 } },
+      spawnedProcess: null,
+    });
+
+    await expect(sendCommand('exec', { code: '1+1' })).rejects.toMatchObject({
+      name: 'BrowserCommandError',
+      code: 'request_body_too_large',
+      message: expect.stringContaining('1048576'),
+    });
+
+    expect(ensureSpy).not.toHaveBeenCalled();
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves the daemon-supplied hint verbatim so the CLI hint stack can render it', async () => {
+    vi.mocked(fetch).mockResolvedValue(make413Response({
+      ok: false,
+      errorCode: 'request_body_too_large',
+      error: 'Request body of 5000000 bytes exceeded the daemon limit of 1048576 bytes.',
+      errorHint: 'Custom hint: do not retry this command — shrink the payload and try again.',
+      receivedBytes: 5_000_000,
+      limit: 1_048_576,
+    }));
+
+    let caught: unknown;
+    try {
+      await sendCommand('exec', { code: '1+1' });
+    } catch (e) { caught = e; }
+    expect(caught).toBeInstanceOf(BrowserCommandError);
+    expect((caught as BrowserCommandError).hint).toBe('Custom hint: do not retry this command — shrink the payload and try again.');
+    expect((caught as BrowserCommandError).code).toBe('request_body_too_large');
+  });
+
+  it('still recognizes request_body_too_large when the daemon returned only errorCode (no status check)', async () => {
+    // Defensive path: some intermediaries downgrade the HTTP status but pass
+    // the body through. The client must still classify this as 413-shaped.
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify({
+      ok: false,
+      errorCode: 'request_body_too_large',
+      error: 'Request body of 2097152 bytes exceeded the daemon limit of 1048576 bytes.',
+      errorHint: '...',
+      receivedBytes: 2_097_152,
+      limit: 1_048_576,
+    }), { status: 500, headers: { 'Content-Type': 'application/json' } }));
+
+    await expect(sendCommand('exec', { code: '1+1' })).rejects.toMatchObject({
+      name: 'BrowserCommandError',
+      code: 'request_body_too_large',
+    });
+  });
+
+  it('does not auto-retry: a single fetch attempt regardless of the configured command timeout', async () => {
+    setDaemonCommandTimeoutSeconds(120);
+    vi.mocked(fetch).mockResolvedValue(make413Response({
+      ok: false,
+      errorCode: 'request_body_too_large',
+      error: 'Request body of 2097152 bytes exceeded the daemon limit of 1048576 bytes.',
+      errorHint: '...',
+      receivedBytes: 2_097_152,
+      limit: 1_048_576,
+    }));
+
+    await expect(sendCommand('exec', { code: '1+1' })).rejects.toBeInstanceOf(BrowserCommandError);
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+    setDaemonCommandTimeoutSeconds(null);
+  });
+});
