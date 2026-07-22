@@ -199,7 +199,22 @@ function createChromeMock() {
       onEvent: { addListener: vi.fn() } as Listener<(source: any, method: string, params: any) => void>,
     },
     windows: {
-      get: vi.fn(async (windowId: number) => ({ id: windowId, focused: windowId === lastFocusedWindowId })),
+      get: vi.fn(async (windowId: number) => ({ id: windowId, focused: windowId === lastFocusedWindowId, type: 'normal' as const })),
+      getAll: vi.fn(async (queryInfo?: { windowTypes?: chrome.windows.windowTypeEnum[] }) => {
+        const windowIds = new Set<number>();
+        for (const tab of tabs) windowIds.add(tab.windowId);
+        const allowedTypes = queryInfo?.windowTypes ?? ['normal'];
+        if (!allowedTypes.includes('normal')) return [];
+        return [...windowIds]
+          .filter((id) => id !== undefined)
+          .map((id) => ({
+            id,
+            focused: id === lastFocusedWindowId,
+            incognito: false,
+            alwaysOnTop: false,
+            type: 'normal' as const,
+          }));
+      }),
       create: vi.fn(async ({ url, focused, width, height, type }: any) => ({ id: 1, url, focused, width, height, type })),
       remove: vi.fn(async (_windowId: number) => {}),
       onRemoved: { addListener: vi.fn() } as Listener<(windowId: number) => void>,
@@ -647,6 +662,282 @@ describe('background tab isolation', () => {
     expect(chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining({ url: 'https://first.example' }));
     expect(update).toHaveBeenCalledWith(1, { url: 'https://first.example' });
     expect(create).not.toHaveBeenCalled();
+  });
+
+  it('adopts a normal Chrome window with a single about:blank placeholder for the first automation lease', async () => {
+    const { chrome, tabs, create } = createChromeMock();
+    // Add a startup placeholder window (window 5) with one available tab (id 50).
+    tabs.push({
+      id: 50,
+      windowId: 5,
+      url: 'about:blank',
+      title: 'New Tab',
+      active: true,
+      status: 'complete',
+      groupId: -1,
+    });
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'), 'https://work.example');
+
+    // The placeholder window was adopted: chrome.windows.create must NOT have
+    // been called, the lease must land in window 5, and the placeholder tab
+    // is updated to the target URL.
+    expect(chrome.windows.create).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+    expect(tabId).toBe(50);
+    expect(tabs.find((tab) => tab.id === tabId)?.windowId).toBe(5);
+    expect(chrome.tabs.update).toHaveBeenCalledWith(50, { url: 'https://work.example' });
+    expect(mod.__test__.getAutomationWindowId(adapterKey('twitter'))).toBe(5);
+  });
+
+  it('also adopts a chrome://newtab/ placeholder window for the first automation lease', async () => {
+    const { chrome, tabs, create } = createChromeMock();
+    tabs.push({
+      id: 60,
+      windowId: 6,
+      url: 'chrome://newtab/',
+      title: 'New Tab',
+      active: true,
+      status: 'complete',
+      groupId: -1,
+    });
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'));
+
+    expect(chrome.windows.create).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+    expect(tabId).toBe(60);
+    expect(tabs.find((tab) => tab.id === tabId)?.windowId).toBe(6);
+    expect(mod.__test__.getAutomationWindowId(adapterKey('twitter'))).toBe(6);
+  });
+
+  it('falls back to chrome.windows.create when only user-content, chrome://extensions, or multi-tab windows exist', async () => {
+    const { chrome, tabs, create } = createChromeMock();
+    // Window 5 — user browsing: one http(s) tab (must be rejected).
+    tabs.push({
+      id: 50,
+      windowId: 5,
+      url: 'https://user-content.example',
+      title: 'User',
+      active: true,
+      status: 'complete',
+      groupId: -1,
+    });
+    // Window 6 — chrome://extensions: NOT in the placeholder whitelist
+    // (user content), must be rejected even though it has a single tab.
+    tabs.push({
+      id: 60,
+      windowId: 6,
+      url: 'chrome://extensions',
+      title: 'Extensions',
+      active: true,
+      status: 'complete',
+      groupId: -1,
+    });
+    // Window 7 — a multi-tab user window: even if a placeholder URL snuck in,
+    // the >1 tab count must reject it.
+    tabs.push({
+      id: 70,
+      windowId: 7,
+      url: 'https://trip.example',
+      title: 'Trip',
+      active: true,
+      status: 'complete',
+      groupId: -1,
+    });
+    tabs.push({
+      id: 71,
+      windowId: 7,
+      url: 'about:blank',
+      title: 'New Tab',
+      active: false,
+      status: 'complete',
+      groupId: -1,
+    });
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'), 'https://work.example');
+
+    // None of the candidate windows were adopted; the original
+    // chrome.windows.create fallback path ran instead.
+    expect(chrome.windows.create).toHaveBeenCalledTimes(1);
+    expect(chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining({
+      url: 'https://work.example',
+      type: 'normal',
+    }));
+    expect(create).not.toHaveBeenCalled();
+    // No user window was claimed — the new lease tab must not be in any of
+    // the rejected candidate windows.
+    expect([5, 6, 7]).not.toContain(tabs.find((tab) => tab.id === tabId)?.windowId);
+    expect(tabs.find((tab) => tab.id === 50)?.groupId).toBe(-1);
+    expect(tabs.find((tab) => tab.id === 60)?.groupId).toBe(-1);
+    expect(tabs.find((tab) => tab.id === 70)?.groupId).toBe(-1);
+    expect(tabs.find((tab) => tab.id === 71)?.groupId).toBe(-1);
+  });
+
+  it('falls back to chrome.windows.create when the placeholder candidate is invalidated between scan and adoption', async () => {
+    const { chrome, tabs, query } = createChromeMock();
+    // Candidate placeholder tab at scan time.
+    tabs.push({
+      id: 80,
+      windowId: 8,
+      url: 'about:blank',
+      title: 'New Tab',
+      active: true,
+      status: 'complete',
+      groupId: -1,
+    });
+    // Simulate a race: the user opens a second tab in window 8 between the
+    // scan in `findStartupPlaceholderWindowId` and the re-validation inside
+    // `adoptStartupPlaceholderWindow`. The first `chrome.tabs.query({ windowId: 8 })`
+    // call (during the scan) still sees the single placeholder; the second
+    // call (during re-validation) must see the new tab and reject adoption.
+    const originalQuery = query.getMockImplementation();
+    let window8QueryCalls = 0;
+    query.mockImplementation(async (queryInfo: any = {}) => {
+      if (queryInfo?.windowId === 8) {
+        window8QueryCalls += 1;
+        if (window8QueryCalls >= 2) {
+          // Second query during re-validation: user opened a new tab.
+          tabs.push({
+            id: 81,
+            windowId: 8,
+            url: 'https://user-opened.example',
+            title: 'User',
+            active: true,
+            status: 'complete',
+            groupId: -1,
+          });
+        }
+      }
+      return (originalQuery as any)(queryInfo);
+    });
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'), 'https://work.example');
+
+    // The candidate failed TOCTOU re-validation; the original
+    // chrome.windows.create fallback ran instead.
+    expect(window8QueryCalls).toBeGreaterThanOrEqual(2);
+    expect(chrome.windows.create).toHaveBeenCalledTimes(1);
+    expect(chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining({
+      url: 'https://work.example',
+      type: 'normal',
+    }));
+    // The placeholder tab was NOT adopted — no tabs.update against tab 80.
+    expect(chrome.tabs.update).not.toHaveBeenCalledWith(80, expect.anything());
+    expect(tabId).not.toBe(80);
+    expect(tabs.find((tab) => tab.id === 80)?.groupId).toBe(-1);
+    // The user-opened tab is also untouched (not grouped).
+    expect(tabs.find((tab) => tab.id === 81)?.groupId).toBe(-1);
+  });
+
+  it('falls back to chrome.windows.create when the placeholder tab URL navigates away before adoption', async () => {
+    const { chrome, tabs, query } = createChromeMock();
+    tabs.push({
+      id: 90,
+      windowId: 9,
+      url: 'about:blank',
+      title: 'New Tab',
+      active: true,
+      status: 'complete',
+      groupId: -1,
+    });
+    // Simulate a navigation race: between the scan and the re-validation,
+    // the placeholder tab begins loading user content. The re-validation
+    // query observes the navigated URL.
+    const originalQuery = query.getMockImplementation();
+    let window9QueryCalls = 0;
+    query.mockImplementation(async (queryInfo: any = {}) => {
+      if (queryInfo?.windowId === 9) {
+        window9QueryCalls += 1;
+        if (window9QueryCalls >= 2) {
+          const placeholder = tabs.find((t) => t.id === 90);
+          if (placeholder) placeholder.url = 'https://navigated-away.example';
+        }
+      }
+      return (originalQuery as any)(queryInfo);
+    });
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    await mod.__test__.resolveTabId(undefined, adapterKey('twitter'), 'https://work.example');
+
+    // Placeholder URL no longer matches the whitelist — adoption aborted,
+    // fallback ran.
+    expect(window9QueryCalls).toBeGreaterThanOrEqual(2);
+    expect(chrome.windows.create).toHaveBeenCalledTimes(1);
+    expect(chrome.windows.create).toHaveBeenCalledWith(expect.objectContaining({ url: 'https://work.example' }));
+    expect(chrome.tabs.update).not.toHaveBeenCalledWith(90, expect.anything());
+    expect(tabs.find((tab) => tab.id === 90)?.groupId).toBe(-1);
+  });
+
+  it('focuses the adopted placeholder window when foreground mode is requested', async () => {
+    const { chrome, tabs } = createChromeMock();
+    // chrome.windows.update is the established focus helper entry point; the
+    // mock doesn't define one yet, so install a tracking implementation.
+    const updateWindow = vi.fn(async (_windowId: number, _info: { focused?: boolean }) => ({}));
+    (chrome.windows as any).update = updateWindow;
+    tabs.push({
+      id: 100,
+      windowId: 10,
+      url: 'about:blank',
+      title: 'New Tab',
+      active: true,
+      status: 'complete',
+      groupId: -1,
+    });
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    const result = await mod.__test__.handleCommand({
+      id: 'foreground-adopt',
+      action: 'tabs',
+      op: 'new',
+      session: 'twitter',
+      surface: 'adapter',
+      url: 'https://x.com',
+      windowMode: 'foreground',
+    });
+
+    expect(result).toEqual(expect.objectContaining({ ok: true }));
+    // The placeholder window was adopted (no fresh chrome.windows.create).
+    expect(chrome.windows.create).not.toHaveBeenCalled();
+    // And foreground mode triggered the focus helper on the adopted window.
+    expect(updateWindow).toHaveBeenCalledWith(10, { focused: true });
+    // Lease must land in the adopted window.
+    expect(mod.__test__.getAutomationWindowId(adapterKey('twitter'))).toBe(10);
+  });
+
+  it('does not focus the adopted placeholder window when background mode is requested', async () => {
+    const { chrome, tabs } = createChromeMock();
+    const updateWindow = vi.fn(async (_windowId: number, _info: { focused?: boolean }) => ({}));
+    (chrome.windows as any).update = updateWindow;
+    tabs.push({
+      id: 110,
+      windowId: 11,
+      url: 'about:blank',
+      title: 'New Tab',
+      active: true,
+      status: 'complete',
+      groupId: -1,
+    });
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'), 'https://work.example');
+
+    expect(chrome.windows.create).not.toHaveBeenCalled();
+    // Background mode must NOT focus the adopted window.
+    expect(updateWindow).not.toHaveBeenCalled();
+    expect(tabId).toBe(110);
+    expect(tabs.find((tab) => tab.id === tabId)?.windowId).toBe(11);
   });
 
   it('closes a tab by page identity', async () => {
@@ -1216,7 +1507,7 @@ describe('background tab isolation', () => {
     const { chrome } = createChromeMock();
     chrome.windows.get = vi.fn(async (windowId: number) => {
       if (windowId === 90 || windowId === 91) throw new Error(`stale window ${windowId}`);
-      return { id: windowId, focused: false };
+      return { id: windowId, focused: false, type: 'normal' as const };
     });
     vi.stubGlobal('chrome', chrome);
 

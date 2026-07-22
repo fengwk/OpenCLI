@@ -921,6 +921,128 @@ async function ensureOwnedContainerGroupUnlocked(
 }
 
 /**
+ * Scan existing Chrome windows for a safe startup placeholder we can adopt
+ * instead of calling `chrome.windows.create`. The safety contract is strict:
+ *
+ *   1. Window type must be 'normal' (skips devtools/popup/app panels).
+ *   2. The window must contain EXACTLY one tab — multi-tab windows are user
+ *      browsing sessions, even if that one tab is a placeholder.
+ *   3. The single tab must not already be leased by another owned session.
+ *   4. The tab must not belong to any tab group — a grouped tab is either
+ *      user-grouped or part of a previously adopted container; either way it
+ *      is no longer a "fresh" placeholder.
+ *   5. The tab URL must be an EXACT match against `STARTUP_PLACEHOLDER_URLS`.
+ *      Anything else (http(s), chrome://extensions, devtools, settings,
+ *      file://, etc.) is user content and must not be claimed.
+ *
+ * Returns the first eligible `(windowId, tabId)` pair, or null when nothing
+ * qualifies so the caller falls back to the existing `chrome.windows.create`
+ * path. The result is only a *hint* — `adoptStartupPlaceholderWindow`
+ * re-validates against fresh state to close the TOCTOU window before claiming
+ * ownership.
+ */
+async function findStartupPlaceholderWindow(): Promise<{ windowId: number; tabId: number } | null> {
+  let allWindows: chrome.windows.Window[] = [];
+  try {
+    allWindows = await chrome.windows.getAll({ windowTypes: ['normal'] });
+  } catch {
+    return null;
+  }
+  for (const win of allWindows) {
+    if (!win || win.type !== 'normal' || typeof win.id !== 'number') continue;
+    let tabs: chrome.tabs.Tab[];
+    try {
+      tabs = await chrome.tabs.query({ windowId: win.id });
+    } catch {
+      continue;
+    }
+    if (tabs.length !== 1) continue; // multi-tab windows are user content
+    const tab = tabs[0];
+    if (!tab || tab.id === undefined) continue;
+    if (!initialTabIsAvailable(tab.id)) continue; // already leased
+    if (tab.groupId !== undefined && tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
+      // A grouped tab is user-organized or part of a legacy container — never
+      // a fresh startup placeholder. Adopting it would yank it out of the
+      // user's grouping.
+      continue;
+    }
+    if (!isStartupPlaceholderUrl(tab.url)) continue; // not a safe placeholder
+    return { windowId: win.id, tabId: tab.id };
+  }
+  return null;
+}
+
+/**
+ * Adopt a verified startup placeholder window as the owned container for the
+ * given role. Persists the windowId and reuses the same post-create flow as
+ * the `chrome.windows.create` path so subsequent lease acquisition treats the
+ * adopted window indistinguishably from a freshly opened one.
+ *
+ * TOCTOU safety: between the scan that picked the candidate and the moment
+ * we claim ownership, Chrome (or another extension, or the user) could have
+ * closed the window, opened a second tab in it, navigated the placeholder
+ * away, leased the tab to a different session, or grouped it. We re-query
+ * the exact candidate and re-check every gate that
+ * `findStartupPlaceholderWindowId` enforced. Any mismatch returns null so
+ * the caller falls back to `chrome.windows.create` and never claims a
+ * window that no longer matches the safety contract.
+ *
+ * Semantics parity: when `mode === 'foreground'`, calls
+ * `focusOwnedWindowIfRequested` exactly like the post-create path, so an
+ * adopted window behaves identically to a freshly opened one with respect
+ * to user-facing focus.
+ *
+ * Returns null on any failure; the caller must fall back to
+ * `chrome.windows.create`.
+ */
+async function adoptStartupPlaceholderWindow(
+  role: OwnedWindowRole,
+  windowId: number,
+  initialTabId: number,
+  mode: WindowMode,
+): Promise<{ windowId: number; initialTabId: number } | null> {
+  // 1. Window must still exist and still be a normal-type window.
+  try {
+    const win = await chrome.windows.get(windowId);
+    if (!win || win.type !== 'normal') return null;
+  } catch {
+    return null;
+  }
+  // 2. Re-query tabs and re-check every eligibility gate. Any failure
+  //    here means the placeholder mutated between scan and claim — abort
+  //    and let the caller open a fresh window instead.
+  let tabs: chrome.tabs.Tab[];
+  try {
+    tabs = await chrome.tabs.query({ windowId });
+  } catch {
+    return null;
+  }
+  if (tabs.length !== 1) return null; // user opened another tab → user content
+  const tab = tabs[0];
+  if (!tab || tab.id === undefined) return null;
+  if (tab.id !== initialTabId) return null; // tab identity drifted
+  if (!isStartupPlaceholderUrl(tab.url)) return null; // URL navigated away
+  if (!initialTabIsAvailable(tab.id)) return null; // another session leased
+  if (tab.groupId !== undefined && tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
+    // Tab was grouped between scan and claim — never a fresh placeholder now.
+    return null;
+  }
+
+  const container = ownedContainers[role];
+  container.windowId = windowId;
+  container.groupId = null;
+  // Persist windowId immediately so a worker crash before the subsequent
+  // `tabs.update` call still lets the next ensure cycle reuse this window
+  // instead of spawning a second owned window in `chrome.windows.create`.
+  await persistRuntimeState();
+  console.log(`[opencli] Adopted ${role} window ${windowId} from startup placeholder tab ${initialTabId}`);
+
+  // Semantics parity with the windows.create path: honor foreground mode.
+  await focusOwnedWindowIfRequested(windowId, mode);
+  return { windowId, initialTabId };
+}
+
+/**
  * Ensure the owned window for the requested role exists.
  *
  * First-principles model:
@@ -989,6 +1111,29 @@ async function ensureOwnedContainerWindowUnlocked(
       windowId: existingGroup.windowId,
       initialTabId,
     };
+  }
+
+  // Adapter automation runs in an invisible background window and would
+  // otherwise spawn yet another top-level window whenever Chrome was opened
+  // with a fresh placeholder tab. Reuse that placeholder when it is safe to
+  // claim: a normal window with exactly one available tab whose URL is one
+  // of the whitelisted startup placeholders. The interactive role is
+  // intentionally NOT adopted here — `chrome.tabs.group` rejects internal
+  // `chrome://newtab` pages, so an adopted interactive placeholder would
+  // break the group-creation flow that owns its visible tab group.
+  //
+  // The scan result is only a hint: `adoptStartupPlaceholderWindow`
+  // re-queries and re-validates the exact candidate before claiming, so any
+  // race (window closed, second tab opened, URL navigated away, tab
+  // leased/grouped) aborts and falls through to `chrome.windows.create`.
+  if (role === 'automation') {
+    const candidate = await findStartupPlaceholderWindow();
+    if (candidate !== null) {
+      const adopted = await adoptStartupPlaceholderWindow(role, candidate.windowId, candidate.tabId, mode);
+      if (adopted) {
+        return adopted;
+      }
+    }
   }
 
   const startUrl = (initialUrl && isSafeNavigationUrl(initialUrl)) ? initialUrl : BLANK_PAGE;
@@ -1372,6 +1517,18 @@ async function handleCommand(cmd: Command): Promise<Result> {
 /** Internal blank page used when no user URL is provided. */
 const BLANK_PAGE = 'about:blank';
 
+/**
+ * Whitelist of Chrome startup placeholder URLs we may adopt instead of opening
+ * a new top-level window. The set is intentionally narrow: anything outside
+ * these URLs (chrome://extensions, devtools, settings, file://, etc.) is
+ * treated as user-owned content and never claimed.
+ */
+const STARTUP_PLACEHOLDER_URLS: ReadonlySet<string> = new Set([
+  'about:blank',
+  'chrome://newtab/',
+  'chrome://new-tab-page/',
+]);
+
 /** Check if a URL can be attached via CDP — only allow http(s) and blank pages. */
 function isDebuggableUrl(url?: string): boolean {
   if (!url) return true;  // empty/undefined = tab still loading, allow it
@@ -1381,6 +1538,11 @@ function isDebuggableUrl(url?: string): boolean {
 /** Check if a URL is safe for user-facing navigation (http/https only). */
 function isSafeNavigationUrl(url: string): boolean {
   return url.startsWith('http://') || url.startsWith('https://');
+}
+
+/** True only for the exact Chrome startup placeholder URLs we are allowed to adopt. */
+function isStartupPlaceholderUrl(url: string | undefined): boolean {
+  return typeof url === 'string' && STARTUP_PLACEHOLDER_URLS.has(url);
 }
 
 /** Minimal URL normalization for same-page comparison: root slash + default port only. */
