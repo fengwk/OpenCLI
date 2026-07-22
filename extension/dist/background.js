@@ -1630,6 +1630,63 @@ async function ensureOwnedContainerGroupUnlocked(role, fallbackWindowId, ids) {
     throw err;
   }
 }
+async function findStartupPlaceholderWindow() {
+  let allWindows = [];
+  try {
+    allWindows = await chrome.windows.getAll({ windowTypes: ["normal"] });
+  } catch {
+    return null;
+  }
+  for (const win of allWindows) {
+    if (!win || win.type !== "normal" || typeof win.id !== "number") continue;
+    let tabs;
+    try {
+      tabs = await chrome.tabs.query({ windowId: win.id });
+    } catch {
+      continue;
+    }
+    if (tabs.length !== 1) continue;
+    const tab = tabs[0];
+    if (!tab || tab.id === void 0) continue;
+    if (!initialTabIsAvailable(tab.id)) continue;
+    if (tab.groupId !== void 0 && tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
+      continue;
+    }
+    if (!isStartupPlaceholderUrl(tab.url)) continue;
+    return { windowId: win.id, tabId: tab.id };
+  }
+  return null;
+}
+async function adoptStartupPlaceholderWindow(role, windowId, initialTabId, mode) {
+  try {
+    const win = await chrome.windows.get(windowId);
+    if (!win || win.type !== "normal") return null;
+  } catch {
+    return null;
+  }
+  let tabs;
+  try {
+    tabs = await chrome.tabs.query({ windowId });
+  } catch {
+    return null;
+  }
+  if (tabs.length !== 1) return null;
+  const tab = tabs[0];
+  if (!tab || tab.id === void 0) return null;
+  if (tab.id !== initialTabId) return null;
+  if (!isStartupPlaceholderUrl(tab.url)) return null;
+  if (!initialTabIsAvailable(tab.id)) return null;
+  if (tab.groupId !== void 0 && tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
+    return null;
+  }
+  const container = ownedContainers[role];
+  container.windowId = windowId;
+  container.groupId = null;
+  await persistRuntimeState();
+  console.log(`[opencli] Adopted ${role} window ${windowId} from startup placeholder tab ${initialTabId}`);
+  await focusOwnedWindowIfRequested(windowId, mode);
+  return { windowId, initialTabId };
+}
 async function ensureOwnedContainerWindow(role, initialUrl, mode = "background") {
   const container = ownedContainers[role];
   if (container.promise) return container.promise;
@@ -1679,6 +1736,15 @@ async function ensureOwnedContainerWindowUnlocked(role, initialUrl, mode = "back
       windowId: existingGroup.windowId,
       initialTabId: initialTabId2
     };
+  }
+  if (role === "automation") {
+    const candidate = await findStartupPlaceholderWindow();
+    if (candidate !== null) {
+      const adopted = await adoptStartupPlaceholderWindow(role, candidate.windowId, candidate.tabId, mode);
+      if (adopted) {
+        return adopted;
+      }
+    }
   }
   const startUrl = initialUrl && isSafeNavigationUrl(initialUrl) ? initialUrl : BLANK_PAGE;
   const win = await chrome.windows.create({
@@ -1968,12 +2034,20 @@ async function handleCommand(cmd) {
   }
 }
 const BLANK_PAGE = "about:blank";
+const STARTUP_PLACEHOLDER_URLS = /* @__PURE__ */ new Set([
+  "about:blank",
+  "chrome://newtab/",
+  "chrome://new-tab-page/"
+]);
 function isDebuggableUrl(url) {
   if (!url) return true;
   return url.startsWith("http://") || url.startsWith("https://") || url === "about:blank" || url.startsWith("data:");
 }
 function isSafeNavigationUrl(url) {
   return url.startsWith("http://") || url.startsWith("https://");
+}
+function isStartupPlaceholderUrl(url) {
+  return typeof url === "string" && STARTUP_PLACEHOLDER_URLS.has(url);
 }
 function normalizeUrlForComparison(url) {
   if (!url) return "";

@@ -20,6 +20,14 @@ Use it when merging back to mainline or rebasing onto upstream.
 
 ## Changelog (fork)
 
+### 2026-07-22
+
+#### Runtime / extension
+
+||| Area | Change | Paths |
+|||------|--------|--------|
+||| startup placeholder reuse | New `findStartupPlaceholderWindow` / `adoptStartupPlaceholderWindow` flow in the service-worker lease bootstrap adopts the Chrome startup placeholder tab (`about:blank` / `chrome://newtab/` / `chrome://new-tab-page/`) instead of calling `chrome.windows.create` for the `automation` role. The candidate must be a normal window holding exactly one tab that is un-leased, un-grouped, and whose URL is in the `STARTUP_PLACEHOLDER_URLS` whitelist; `adoptStartupPlaceholderWindow` re-queries and re-validates the candidate before claim so any TOCTOU mutation (window closed, second tab opened, URL navigated away, tab leased/grouped by another session) returns null and falls through to `chrome.windows.create`. Interactive role deliberately skips adoption so the chrome.tabs.group flow that owns the visible tab group keeps working. `windowId` is persisted to `chrome.storage.session` immediately so a worker crash before the next `tabs.update` does not duplicate the owned window. | `extension/src/background.ts`, `extension/src/background.test.ts` |
+
 ### 2026-07-21
 
 #### Runtime / extension
@@ -60,8 +68,8 @@ Use it when merging back to mainline or rebasing onto upstream.
 
 | Component | Version |
 |-----------|---------|
-| CLI (`@jackwener/opencli`) | `1.8.7-fengwk.6` |
-| Extension | `1.0.27` (`compatRange`: `>=1.8.7`) |
+| CLI (`@jackwener/opencli`) | `1.8.7-fengwk.7` |
+| Extension | `1.0.28` (`compatRange`: `>=1.8.7`) |
 
 ### Auto-update policy (fork)
 
@@ -115,15 +123,15 @@ npm ci
 
 Artifacts (version-based names, no timestamps):
 
-- `jackwener-opencli-1.8.7-fengwk.6.tgz`
-- `opencli-extension-v1.0.27.zip`
+- `jackwener-opencli-1.8.7-fengwk.7.tgz`
+- `opencli-extension-v1.0.28.zip`
 - `SHA256SUMS`
 - `build-info.json`
 
 ```bash
 # install CLI from the tarball (not npm publish)
-npm install -g ./artifacts/jackwener-opencli-1.8.7-fengwk.6.tgz
-opencli --version   # → 1.8.7-fengwk.6
+npm install -g ./artifacts/jackwener-opencli-1.8.7-fengwk.7.tgz
+opencli --version   # → 1.8.7-fengwk.7
 
 # plugin
 opencli plugin install ~/proj/my-opencli/packages/chatgpt-agent
@@ -133,6 +141,6 @@ opencli chatgpt-agent ask --help
 ### GitHub fork release
 
 1. Ensure `package.json` version is `X` and commit any regenerated `cli-manifest.json` / `extension/dist`.
-2. Tag exactly `fork-vX` (example: `fork-v1.8.7-fengwk.6`) and push the tag.
+2. Tag exactly `fork-vX` (example: `fork-v1.8.7-fengwk.7`) and push the tag.
 3. Workflow `Fork Release` packages, uploads the Actions artifact bundle, and attaches tgz/zip/SHA256SUMS/build-info.json to the GitHub Release.
 4. Never runs `npm publish` or upstream website dispatch jobs.
