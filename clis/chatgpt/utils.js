@@ -922,18 +922,27 @@ export async function selectChatGPTTool(page, tool) {
 }
 
 export async function clearChatGPTDraft(page) {
-    await page.evaluate(`
-        (() => {
-            const removeLabels = [/^remove file/i, /^移除文件/];
-            for (let pass = 0; pass < 10; pass += 1) {
+    // Remove attachments one click at a time (fixed short gap). A single evaluate
+    // that fires many remove clicks back-to-back looks like a zero-interval burst.
+    for (let pass = 0; pass < 10; pass += 1) {
+        const removed = unwrapEvaluateResult(await page.evaluate(`
+            (() => {
+                const removeLabels = [/^remove file/i, /^移除文件/];
                 const button = Array.from(document.querySelectorAll('button')).find((node) => {
                     const label = node.getAttribute('aria-label') || '';
                     return removeLabels.some((pattern) => pattern.test(label));
                 });
-                if (!button) break;
+                if (!button) return false;
                 button.click();
-            }
+                return true;
+            })()
+        `));
+        if (!removed) break;
+        await page.wait(0.25);
+    }
 
+    await page.evaluate(`
+        (() => {
             const selectors = ${JSON.stringify(COMPOSER_SELECTORS)};
             for (const selector of selectors) {
                 for (const node of document.querySelectorAll(selector)) {
@@ -1170,6 +1179,8 @@ async function submitChatGPTMessage(page) {
 export async function sendChatGPTMessage(page, text) {
     const filled = await fillChatGPTMessage(page, text);
     if (!filled) return false;
+    // Brief pause after paste/fill before submit (users rarely send in the same instant).
+    await page.wait(0.35);
     return submitChatGPTMessage(page);
 }
 

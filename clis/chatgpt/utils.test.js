@@ -4,7 +4,7 @@ import path from 'node:path';
 import { JSDOM } from 'jsdom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ArgumentError, AuthRequiredError, CommandExecutionError } from '@jackwener/opencli/errors';
-import { __test__, getChatGPTDetailRows, getChatGPTImageAssets, getChatGPTResponsePairCounts, getChatGPTVisibleImageUrls, getCurrentChatGPTModel, getCurrentChatGPTTool, getVisibleMessages, isGenerating, navigateToProject, openChatGPTConversation, prepareChatGPTImagePaths, selectChatGPTModel, selectChatGPTTool, sendChatGPTMessage, uploadChatGPTImages, waitForChatGPTDeepResearchResult, waitForChatGPTDetailRows, waitForChatGPTImages, waitForChatGPTResponse } from './utils.js';
+import { __test__, clearChatGPTDraft, getChatGPTDetailRows, getChatGPTImageAssets, getChatGPTResponsePairCounts, getChatGPTVisibleImageUrls, getCurrentChatGPTModel, getCurrentChatGPTTool, getVisibleMessages, isGenerating, navigateToProject, openChatGPTConversation, prepareChatGPTImagePaths, selectChatGPTModel, selectChatGPTTool, sendChatGPTMessage, uploadChatGPTImages, waitForChatGPTDeepResearchResult, waitForChatGPTDetailRows, waitForChatGPTImages, waitForChatGPTResponse } from './utils.js';
 
 const tempDirs = [];
 
@@ -1227,6 +1227,9 @@ describe('chatgpt send selectors', () => {
 
         await expect(sendChatGPTMessage(page, 'hello')).resolves.toBe(true);
         expect(page.nativeClick).toHaveBeenCalledWith(12, 34);
+        expect(page.wait).toHaveBeenNthCalledWith(1, 0.2);
+        expect(page.wait).toHaveBeenNthCalledWith(2, 0.35);
+        expect(page.wait).toHaveBeenNthCalledWith(3, 0.5);
     });
 
     it('uses the composer submit fallback consistently for readiness and click', async () => {
@@ -1261,6 +1264,28 @@ describe('chatgpt send selectors', () => {
         expect(__test__.SEND_BUTTON_FALLBACK_SELECTORS).toContain('#composer-submit-button:not([disabled])');
         expect(__test__.SEND_BUTTON_LABELS).toEqual(expect.arrayContaining(['Send prompt', 'Send message', 'Send', '发送', '发送消息', '发送提示']));
         expect(__test__.CLOSE_SIDEBAR_LABELS).toEqual(expect.arrayContaining(['Close sidebar', '关闭边栏']));
+    });
+});
+
+describe('chatgpt draft clearing', () => {
+    it('removes attachments one at a time before clearing the composer', async () => {
+        const page = createDomEvaluatePage(`
+            <button aria-label="Remove file first.png"></button>
+            <button aria-label="Remove file second.png"></button>
+            <div id="prompt-textarea" contenteditable="true">stale draft</div>
+        `);
+        const buttons = Array.from(page.dom.window.document.querySelectorAll('button'));
+        for (const button of buttons) {
+            button.addEventListener('click', () => button.remove());
+        }
+
+        await clearChatGPTDraft(page);
+
+        expect(page.dom.window.document.querySelectorAll('button')).toHaveLength(0);
+        expect(page.dom.window.document.querySelector('#prompt-textarea').textContent).toBe('');
+        expect(page.wait).toHaveBeenNthCalledWith(1, 0.25);
+        expect(page.wait).toHaveBeenNthCalledWith(2, 0.25);
+        expect(page.wait).toHaveBeenNthCalledWith(3, 0.5);
     });
 });
 
