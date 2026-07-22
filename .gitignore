@@ -29,3 +29,6 @@ npm-shrinkwrap.json
 *.db
 autoresearch/results/
 autoresearch-results.tsv
+
+# Local agent workspaces
+.workspace/
