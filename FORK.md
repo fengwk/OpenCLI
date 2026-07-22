@@ -68,8 +68,8 @@ Use it when merging back to mainline or rebasing onto upstream.
 
 | Component | Version |
 |-----------|---------|
-| CLI (`@jackwener/opencli`) | `1.8.7-fengwk.7` |
-| Extension | `1.0.28` (`compatRange`: `>=1.8.7`) |
+| CLI (`@jackwener/opencli`) | `1.8.7-fengwk.8` |
+| Extension | `1.0.29` (`compatRange`: `>=1.8.7`) |
 
 ### Auto-update policy (fork)
 
@@ -123,15 +123,15 @@ npm ci
 
 Artifacts (version-based names, no timestamps):
 
-- `jackwener-opencli-1.8.7-fengwk.7.tgz`
-- `opencli-extension-v1.0.28.zip`
+- `jackwener-opencli-1.8.7-fengwk.8.tgz`
+- `opencli-extension-v1.0.29.zip`
 - `SHA256SUMS`
 - `build-info.json`
 
 ```bash
 # install CLI from the tarball (not npm publish)
-npm install -g ./artifacts/jackwener-opencli-1.8.7-fengwk.7.tgz
-opencli --version   # → 1.8.7-fengwk.7
+npm install -g ./artifacts/jackwener-opencli-1.8.7-fengwk.8.tgz
+opencli --version   # → 1.8.7-fengwk.8
 
 # plugin
 opencli plugin install ~/proj/my-opencli/packages/chatgpt-agent
@@ -141,6 +141,6 @@ opencli chatgpt-agent ask --help
 ### GitHub fork release
 
 1. Ensure `package.json` version is `X` and commit any regenerated `cli-manifest.json` / `extension/dist`.
-2. Tag exactly `fork-vX` (example: `fork-v1.8.7-fengwk.7`) and push the tag.
+2. Tag exactly `fork-vX` (example: `fork-v1.8.7-fengwk.8`) and push the tag.
 3. Workflow `Fork Release` packages, uploads the Actions artifact bundle, and attaches tgz/zip/SHA256SUMS/build-info.json to the GitHub Release.
 4. Never runs `npm publish` or upstream website dispatch jobs.
