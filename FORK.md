@@ -20,6 +20,23 @@ Use it when merging back to mainline or rebasing onto upstream.
 
 ## Changelog (fork)
 
+### 2026-08-28
+
+#### Upstream merge / release
+
+This fork now includes upstream `origin/main` at
+`90d507091cbec9d01334a0d0a8c784c522d490f3` through a two-parent merge
+commit. The merge commit intentionally kept the previous fork versions
+(`1.8.7-fengwk.8` / `1.0.29`); this release then bumps them independently to
+CLI `1.8.7-fengwk.9` and extension `1.0.30`.
+
+| Area | Upstream increment carried into the fork | Paths |
+|------|------------------------------------------|--------|
+| security / dependencies | Patched `js-yaml` at `4.3.1`, the dependency refresh for CVE-2026-13697, and the `undici` `7.29.0` lock update are retained; the Node floor is declared as `>=20.18.1` to match `undici` 7.x. | `package.json`, `package-lock.json`, `bun.lock` |
+| runtime | Cross-platform `scripts/prepare.cjs` is retained with the fork's `OPENCLI_SKIP_PREPARE_BUILD=1` packaging fence. Preferred profile routing, `OPENCLI_SITE_SESSION`, structured network capture with credential/CSRF redaction, and credential-free extension `/ping` requests are retained. | `scripts/prepare.cjs`, `src/browser/`, `src/daemon*.ts`, `src/execution.ts`, `extension/src/background.ts` |
+| adapters | The browser-backed Gmail adapter and new/updated Pinterest, Midjourney, Trip.com, Google Images, Pixiv novel, and structured Jike capabilities are included, together with the upstream adapter drift fixes and sitemap/docs updates. | `clis/`, `docs/adapters/`, `sitemaps/`, `cli-manifest.json` |
+| fork capabilities retained | Long-lived WebSocket capture, pure-CDP `setFileInput`, repeatable arguments, session lease/recovery (including bounded signal recovery), startup-placeholder reuse, fork update policy, and fork packaging/release scripts remain available. | `src/browser/`, `src/session-lease.ts`, `extension/src/`, `src/update-check.ts`, `scripts/package-fork.sh`, `.github/workflows/fork-release.yml` |
+
 ### 2026-07-22
 
 #### Runtime / extension
@@ -68,8 +85,8 @@ Use it when merging back to mainline or rebasing onto upstream.
 
 | Component | Version |
 |-----------|---------|
-| CLI (`@jackwener/opencli`) | `1.8.7-fengwk.8` |
-| Extension | `1.0.29` (`compatRange`: `>=1.8.7`) |
+| CLI (`@jackwener/opencli`) | `1.8.7-fengwk.9` |
+| Extension | `1.0.30` (`compatRange`: `>=1.8.7`) |
 
 ### Auto-update policy (fork)
 
@@ -123,15 +140,15 @@ npm ci
 
 Artifacts (version-based names, no timestamps):
 
-- `jackwener-opencli-1.8.7-fengwk.8.tgz`
-- `opencli-extension-v1.0.29.zip`
+- `jackwener-opencli-1.8.7-fengwk.9.tgz`
+- `opencli-extension-v1.0.30.zip`
 - `SHA256SUMS`
 - `build-info.json`
 
 ```bash
 # install CLI from the tarball (not npm publish)
-npm install -g ./artifacts/jackwener-opencli-1.8.7-fengwk.8.tgz
-opencli --version   # → 1.8.7-fengwk.8
+npm install -g ./artifacts/jackwener-opencli-1.8.7-fengwk.9.tgz
+opencli --version   # → 1.8.7-fengwk.9
 
 # plugin
 opencli plugin install ~/proj/my-opencli/packages/chatgpt-agent
@@ -141,6 +158,6 @@ opencli chatgpt-agent ask --help
 ### GitHub fork release
 
 1. Ensure `package.json` version is `X` and commit any regenerated `cli-manifest.json` / `extension/dist`.
-2. Tag exactly `fork-vX` (example: `fork-v1.8.7-fengwk.8`) and push the tag.
+2. Tag exactly `fork-vX` (example: `fork-v1.8.7-fengwk.9`) and push the tag.
 3. Workflow `Fork Release` packages, uploads the Actions artifact bundle, and attaches tgz/zip/SHA256SUMS/build-info.json to the GitHub Release.
 4. Never runs `npm publish` or upstream website dispatch jobs.
