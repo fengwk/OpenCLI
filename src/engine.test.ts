@@ -3,6 +3,7 @@ import { discoverClis, discoverPlugins, ensureUserCliCompatShims, ensureUserAdap
 import { executeCommand } from './execution.js';
 import { getRegistry, cli, Strategy } from './registry.js';
 import { clearAllHooks, onAfterExecute } from './hooks.js';
+import * as runtime from './runtime.js';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -552,10 +553,12 @@ describe('executeCommand', () => {
   });
 
   it('uses launcher for registered Electron apps (chatwise)', async () => {
-    // Mock the launcher to return a fake endpoint (avoids real HTTP/process calls)
+    // Mock the launcher to return a fake endpoint (avoids real HTTP/process calls).
     const launcher = await import('./launcher.js');
-    const spy = vi.spyOn(launcher, 'resolveElectronEndpoint')
+    const launcherSpy = vi.spyOn(launcher, 'resolveElectronEndpoint')
       .mockResolvedValue('http://127.0.0.1:9228');
+    const fakePage = {} as any;
+    vi.spyOn(runtime, 'browserSession').mockImplementation(async (_Factory, fn) => fn(fakePage));
 
     const cmd = cli({
       site: 'chatwise',
@@ -566,10 +569,11 @@ describe('executeCommand', () => {
       func: async () => [{ ok: true }],
     });
 
-    // CDPBridge.connect() will fail (no actual CDP server), but the launcher
-    // should have been called with 'chatwise'.
-    await expect(executeCommand(cmd, {})).rejects.toThrow();
-    expect(spy).toHaveBeenCalledWith('chatwise');
-    spy.mockRestore();
+    try {
+      await expect(executeCommand(cmd, {})).resolves.toEqual([{ ok: true }]);
+      expect(launcherSpy).toHaveBeenCalledWith('chatwise');
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });
