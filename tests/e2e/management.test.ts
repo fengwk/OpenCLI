@@ -4,6 +4,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { PKG_VERSION } from '../../src/version.js';
 import { runCli, parseJsonOutput } from './helpers.js';
 
 describe('management commands E2E', () => {
@@ -83,10 +84,10 @@ describe('management commands E2E', () => {
   });
 
   // ── version ──
-  it('--version shows version number', async () => {
+  it('--version shows package version', async () => {
     const { stdout, code } = await runCli(['--version']);
     expect(code).toBe(0);
-    expect(stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(stdout.trim()).toBe(PKG_VERSION);
   });
 
   // ── help ──

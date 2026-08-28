@@ -519,7 +519,8 @@ describe('daemon transport contracts (real daemon)', () => {
     }
   });
 
-  it('performs bounded SIGTERM recovery before restoring normal signal termination', async () => {
+  // Windows cannot deliver a catchable POSIX SIGTERM to a child process.
+  it.skipIf(process.platform === 'win32')('performs bounded SIGTERM recovery before restoring normal signal termination', async () => {
     if (guard()) return;
     const helperUrl = pathToFileURL(path.join(ROOT, 'dist', 'src', 'browser', 'session-recovery.js')).href;
     const script = `
