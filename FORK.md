@@ -21,15 +21,15 @@ Use it when merging back to mainline or rebasing onto upstream.
 
 ## Changelog (fork)
 
-### Unreleased
+### 2026-09-02
 
 #### Ephemeral warm-tab reuse
+
+Released as CLI `1.8.7-fengwk.11` with paired extension `1.0.32`.
 
 | Area | Change | Paths |
 |------|--------|-------|
 | adapter tab lifecycle | Releasing an owned ephemeral adapter lease now detaches automation state but leaves the tab open at its current URL. Later ephemeral sessions may reuse an idle tab from the dedicated adapter window, preferring an exact target URL; actively leased tabs remain ineligible. Persistent and borrowed-tab cleanup semantics are unchanged. | `extension/src/background.ts`, `extension/src/background.test.ts` |
-
-### 2026-09-02
 
 #### Tab-scoped downloads & attach lifecycle
 
@@ -105,8 +105,8 @@ CLI `1.8.7-fengwk.9` and extension `1.0.30`.
 
 | Component | Version |
 |-----------|---------|
-| CLI (`@jackwener/opencli`) | `1.8.7-fengwk.11` unreleased (latest release: `1.8.7-fengwk.10`) |
-| Extension | `1.0.32` unreleased (`compatRange`: `>=1.8.7`; latest released pair: `1.0.31`) |
+| CLI (`@jackwener/opencli`) | `1.8.7-fengwk.11` |
+| Extension | `1.0.32` (`compatRange`: `>=1.8.7`) |
 
 ### Auto-update policy (fork)
 
@@ -178,6 +178,6 @@ opencli chatgpt-agent ask --help
 ### GitHub fork release
 
 1. Ensure `package.json` version is `X` and commit any regenerated `cli-manifest.json` / `extension/dist`.
-2. Tag exactly `fork-vX` (example: `fork-v1.8.7-fengwk.10`) and push the tag.
+2. Tag exactly `fork-vX` (example: `fork-v1.8.7-fengwk.11`) and push the tag.
 3. Workflow `Fork Release` packages, uploads the Actions artifact bundle, and attaches tgz/zip/SHA256SUMS/build-info.json to the GitHub Release.
 4. Never runs `npm publish` or upstream website dispatch jobs.
