@@ -165,7 +165,10 @@ for required_marker in 'DOM.getDocument' 'DOM.querySelector' 'DOM.setFileInputFi
     exit 1
   fi
 done
-for forbidden_marker in 'Page.setInterceptFileChooserDialog' 'Page.fileChooserOpened' 'Page.enable' 'showPicker'; do
+# Page.enable is deliberately allowed: it arms Page.downloadWillBegin /
+# Page.downloadProgress, which tab-scoped download waits route by source.tabId.
+# File chooser interception stays forbidden (native DOM.setFileInputFiles only).
+for forbidden_marker in 'Page.setInterceptFileChooserDialog' 'Page.fileChooserOpened' 'showPicker'; do
   if [[ "${PACKED_BG_JS}" == *"${forbidden_marker}"* ]]; then
     echo "ERROR: packaged background.js still contains forbidden ${forbidden_marker}" >&2
     exit 1

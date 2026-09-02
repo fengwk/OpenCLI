@@ -8,6 +8,14 @@
 
 const attached = new Set<number>();
 
+/**
+ * Per-tab in-flight attach flow. Concurrent ensureAttached callers for the
+ * same tab await this single flow instead of running interleaved attach
+ * attempts (each of which force-detaches and pauses/restores download
+ * waiters). Cleared in a finally once the flow settles.
+ */
+const attachInFlight = new Map<number, Promise<void>>();
+
 const tabFrameContexts = new Map<number, Map<string, number>>();
 const frameTargets = new Map<string, string>();
 const frameTargetKeys = new Map<string, string>();
@@ -138,6 +146,22 @@ function isDebuggableUrl(url?: string): boolean {
 }
 
 export async function ensureAttached(tabId: number, aggressiveRetry: boolean = false): Promise<void> {
+  // Coalesce per tab: concurrent callers (e.g. a tab-scoped waitForDownload
+  // liveness attach racing the click command's own ensureAttached) must share
+  // ONE attach flow. Two interleaved flows would each force-detach and each
+  // pause/resume the tab's download waiters — the second force-detach could
+  // kill waiters the first flow had already resumed. The in-flight promise is
+  // cleaned up in a finally so a failed attach never wedges later retries.
+  const inFlight = attachInFlight.get(tabId);
+  if (inFlight) return inFlight;
+  const flow = ensureAttachedInternal(tabId, aggressiveRetry).finally(() => {
+    attachInFlight.delete(tabId);
+  });
+  attachInFlight.set(tabId, flow);
+  return flow;
+}
+
+async function ensureAttachedInternal(tabId: number, aggressiveRetry: boolean): Promise<void> {
   // Verify the tab URL is debuggable before attempting attach
   try {
     const tab = await chrome.tabs.get(tabId);
@@ -183,6 +207,11 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
   // network-capture-read / ws-capture-read returning [] even though traffic fired.
   const preservedNetworkCapture = networkCaptures.get(tabId);
   const preservedWsCapture = wsCaptures.get(tabId);
+  // Tab-scoped download waiters: the forced detach below fires onDetach, whose
+  // handler finishes armed download waiters ("debugger detached"). Pause them
+  // here and resume after a successful attach so a routine re-attach cannot
+  // kill an in-flight download wait. (Same pattern as the capture snapshot.)
+  const pausedDownloadWaiters = pauseTabDownloadWaiters(tabId);
 
   for (let attempt = 1; attempt <= MAX_ATTACH_RETRIES; attempt++) {
     try {
@@ -227,6 +256,9 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
     const hint = lastError.includes('chrome-extension://')
       ? '. Tip: another Chrome extension may be interfering — try disabling other extensions'
       : '';
+    // Attach failed for good — let paused download waiters fail with the
+    // real cause instead of hanging until their own timeout.
+    failPausedTabDownloadWaiters(pausedDownloadWaiters, `CDP attach failed: ${lastError}`);
     throw new Error(`attach failed: ${lastError}${hint}`);
   }
   attached.add(tabId);
@@ -236,6 +268,14 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
   } catch {
     // Some pages may not need explicit enable
   }
+
+  // Page.enable arms Page.* CDP events (notably downloadWillBegin /
+  // downloadProgress) for this tab. chrome.debugger only honors Page.* here —
+  // the Browser.* domain is rejected — so tab-scoped download waits rely on
+  // this being re-armed after every (re-)attach. Awaited (best-effort) so the
+  // paused download waiters below only resume once the Page domain can
+  // actually deliver events; a failed enable never fails the command itself.
+  await sendDebuggerCommand({ tabId }, 'Page.enable').catch(() => {});
 
   // Restore network/ws capture that the re-attach (detach + onDetach) tore down.
   // The detach always disables the CDP Network domain, so re-enable it and put
@@ -252,6 +292,11 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
       // the next start-capture re-arms cleanly.
     }
   }
+
+  // Download waiters paused for this re-attach resume only here — after the
+  // attach succeeded AND the awaited Page.enable completed — so the Page
+  // domain is already delivering download events when they observe again.
+  resumeTabDownloadWaiters(tabId, pausedDownloadWaiters);
 }
 
 export async function evaluate(
@@ -705,18 +750,98 @@ async function releaseRuntimeObject(tabId: number, objectId: string): Promise<vo
   }
 }
 
-function matchesDownloadPattern(item: chrome.downloads.DownloadItem, pattern: string): boolean {
+/**
+ * Tab-scoped download waiters, keyed by tabId. Driven by
+ * Page.downloadWillBegin / Page.downloadProgress CDP events routed by
+ * chrome.debugger.onEvent's source.tabId — another tab's Page download events
+ * never drive them. The final DownloadItem join is narrowed by begin evidence +
+ * time bounds + claim exclusivity (see correlateDownloadItem), not proven
+ * absolute.
+ */
+type TabDownloadWaiter = {
+  pattern: string;
+  startedAt: number;
+  /** guid → Page.downloadWillBegin evidence for the chrome.downloads match. */
+  begins: Map<string, { url: string; suggestedFilename: string }>;
+  /** guid → latest Page.downloadProgress state (inProgress/completed/canceled). */
+  progress: Map<string, { state: string; completedAt?: number }>;
+  /** chrome.downloads id claimed via evidence-gated correlation. */
+  claimedId?: number;
+  resolved: boolean;
+  /** Returns false once the owning waitForDownload promise has settled. */
+  finish: (result: DownloadWaitResult) => boolean;
+};
+
+const tabDownloadWaiters = new Map<number, Set<TabDownloadWaiter>>();
+
+/**
+ * chrome.downloads ids currently or previously claimed by tab-scoped waiters.
+ * Claims are global (not per-waiter) because a resolved waiter leaves the
+ * waiter registry immediately — a concurrent waiter's correlation search must
+ * still see the claim. Download ids are never reused within a browser
+ * session, so a claim kept by the waiter that resolved from the item is
+ * harmless; claims orphaned by timeout/cancel/detach are released so a later
+ * waiter can adopt the still-downloading item. Each waiter holds at most one
+ * claim.
+ */
+const claimedDownloadIds = new Set<number>();
+
+let downloadListenersRegistered = false;
+
+/** Lowercase substring match over the evidence strings a waiter knows. */
+function matchesDownloadEvidence(
+  waiter: TabDownloadWaiter,
+  ...evidence: Array<string | undefined>
+): boolean {
+  const pattern = waiter.pattern.toLowerCase();
   if (!pattern) return true;
-  const haystack = [
-    item.filename,
-    item.url,
-    item.finalUrl,
-    item.mime,
-  ].filter(Boolean).join('\n').toLowerCase();
-  return haystack.includes(pattern.toLowerCase());
+  return evidence.some((value) => typeof value === 'string' && value.toLowerCase().includes(pattern));
 }
 
-function downloadResult(item: chrome.downloads.DownloadItem, startedAt: number): DownloadWaitResult {
+/**
+ * Claim a chrome.downloads id exclusively so two tab-scoped waiters can never
+ * resolve from the same DownloadItem, and each waiter holds at most one item.
+ */
+function claimDownloadId(waiter: TabDownloadWaiter, id: number): boolean {
+  if (waiter.claimedId !== undefined) return false;
+  if (claimedDownloadIds.has(id)) return false;
+  claimedDownloadIds.add(id);
+  waiter.claimedId = id;
+  return true;
+}
+
+/** Release a waiter's claim (timeout / cancel / detach / tab gone). */
+function releaseOrphanClaims(waiter: TabDownloadWaiter): void {
+  if (waiter.claimedId === undefined) return;
+  claimedDownloadIds.delete(waiter.claimedId);
+  waiter.claimedId = undefined;
+}
+
+/** True when the waiter observed Page.downloadProgress(completed) for a guid. */
+function hasCompletedGuid(waiter: TabDownloadWaiter): boolean {
+  for (const state of waiter.progress.values()) {
+    if (state.state === 'completed') return true;
+  }
+  return false;
+}
+
+/**
+ * Re-run evidence-gated correlation for every guid this waiter saw reach
+ * Page.downloadProgress(completed). Used by chrome.downloads onCreated /
+ * onChanged ticks: the DownloadItem may appear or gain its final filename
+ * only after the CDP completion event, and the wait must then still complete
+ * through the begin-evidence match — never via a bare global pattern match.
+ */
+function correlateCompletedGuids(waiter: TabDownloadWaiter): void {
+  if (waiter.resolved || waiter.claimedId !== undefined) return;
+  for (const guid of waiter.begins.keys()) {
+    if (waiter.progress.get(guid)?.state === 'completed') {
+      void correlateDownloadItem(waiter, guid);
+    }
+  }
+}
+
+function downloadResultFromItem(item: chrome.downloads.DownloadItem, startedAt: number): DownloadWaitResult {
   return {
     downloaded: item.state === 'complete',
     id: item.id,
@@ -732,74 +857,301 @@ function downloadResult(item: chrome.downloads.DownloadItem, startedAt: number):
   };
 }
 
-export async function waitForDownload(pattern: string = '', timeoutMs: number = 30000): Promise<DownloadWaitResult> {
+/**
+ * Correlate a CDP-observed download with its final chrome.downloads item.
+ *
+ * Chrome offers no guid → DownloadItem join, so the match is narrowed by:
+ *   1. the waiter pattern over item url/finalUrl/filename (when provided);
+ *   2. the Page.downloadWillBegin evidence (url, suggestedFilename) of the
+ *      guid whose progress completed — two-way substring containment across
+ *      the original URL, final URL, suggested filename, and local filename;
+ *   3. the full time window — item.startTime must be a valid timestamp and
+ *      satisfy waiter.armTime <= startTime <= completedAt (when the guid's
+ *      completion has been delivered). The download this waiter observed must
+ *      have begun after the waiter armed and before its completion arrived;
+ *      anything started earlier (a stale item from a previous attempt or
+ *      another tab) or later is a different download.
+ *   4. claim exclusivity — an id claimed by another waiter is never matched,
+ *      and each waiter holds at most one claim.
+ * There is deliberately NO negative cache of rejected items: a DownloadItem
+ * seen early may still lack its final filename/finalUrl, so a later
+ * onCreated/onChanged tick must be able to re-correlate it. When nothing
+ * matches yet the item is left for those later ticks; this helper never
+ * falls back to an unrelated global download.
+ */
+async function correlateDownloadItem(waiter: TabDownloadWaiter, guid: string): Promise<void> {
+  if (waiter.resolved || waiter.claimedId !== undefined) return;
+  const begin = waiter.begins.get(guid);
+  const beginEvidence = [begin?.url, begin?.suggestedFilename].filter(
+    (value): value is string => typeof value === 'string' && value.length > 0,
+  ).map((value) => value.toLowerCase());
+  const completedAt = waiter.progress.get(guid)?.completedAt;
+  const startedAfter = new Date(waiter.startedAt).toISOString();
+  try {
+    const recent = await chrome.downloads.search({
+      limit: 100,
+      orderBy: ['-startTime'],
+      startedAfter,
+    });
+    if (waiter.resolved || waiter.claimedId !== undefined) return;
+    for (const item of recent) {
+      const evidence = [item.url, item.finalUrl, item.filename];
+      if (!matchesDownloadEvidence(waiter, ...evidence)) continue;
+      if (beginEvidence.length && !evidenceOverlapsBegin(beginEvidence, evidence)) continue;
+      // Full time bound: the item backing this guid must have started after
+      // the waiter armed (no stale/foreign same-URL item) and — once the
+      // completion event was delivered — no later than that delivery. Items
+      // with an invalid startTime never match (fail-safe).
+      const itemStartedAt = Date.parse(item.startTime);
+      if (Number.isNaN(itemStartedAt) || itemStartedAt < waiter.startedAt) continue;
+      if (completedAt !== undefined && itemStartedAt > completedAt) continue;
+      if (!claimDownloadId(waiter, item.id)) continue;
+      if (item.state === 'complete' || item.state === 'interrupted') {
+        waiter.finish(downloadResultFromItem(item, waiter.startedAt));
+        return;
+      }
+      // in_progress: the single claim stands; completion arrives via onChanged below.
+      return;
+    }
+  } catch {
+    // chrome.downloads unavailable — the timeout path still resolves.
+  }
+}
+
+/** Two-way substring containment between begin evidence and item fields. */
+function evidenceOverlapsBegin(beginEvidence: string[], itemEvidence: Array<string | undefined>): boolean {
+  return beginEvidence.some((beginValue) =>
+    itemEvidence.some((itemValue) => {
+      if (!itemValue) return false;
+      const itemValueLower = itemValue.toLowerCase();
+      return itemValueLower.includes(beginValue) || beginValue.includes(itemValueLower);
+    }),
+  );
+}
+
+function tabWaitersFor(tabId: number): Set<TabDownloadWaiter> | undefined {
+  return tabDownloadWaiters.get(tabId);
+}
+
+/** Pause this tab's armed waiters (re-attach window). Returns the paused set. */
+function pauseTabDownloadWaiters(tabId: number): TabDownloadWaiter[] {
+  const waiters = tabWaitersFor(tabId);
+  if (!waiters) return [];
+  tabDownloadWaiters.delete(tabId);
+  return [...waiters];
+}
+
+/** Put paused waiters back after a successful re-attach. */
+function resumeTabDownloadWaiters(tabId: number, paused: TabDownloadWaiter[]): void {
+  if (!paused.length) return;
+  const waiters = tabWaitersFor(tabId) ?? new Set<TabDownloadWaiter>();
+  for (const waiter of paused) {
+    if (!waiter.resolved) waiters.add(waiter);
+  }
+  if (waiters.size) tabDownloadWaiters.set(tabId, waiters);
+}
+
+/** Fail paused waiters when the attach itself failed for good. */
+function failPausedTabDownloadWaiters(paused: TabDownloadWaiter[], error: string): void {
+  for (const waiter of paused) {
+    waiter.finish({
+      downloaded: false,
+      state: 'interrupted',
+      error,
+      elapsedMs: Date.now() - waiter.startedAt,
+    });
+  }
+}
+
+/**
+ * Drive tab-scoped waiters from chrome.debugger Page.* download events.
+ * Registered once (idempotent) alongside the frame-tracking listeners.
+ */
+function registerDownloadEventRouting(): void {
+  if (downloadListenersRegistered) return;
+  downloadListenersRegistered = true;
+
+  chrome.debugger.onEvent.addListener((source, method, params) => {
+    const tabId = source.tabId;
+    if (!tabId) return;
+    if (method !== 'Page.downloadWillBegin' && method !== 'Page.downloadProgress') return;
+    const eventParams = params as Record<string, any> | undefined;
+    const waiters = tabWaitersFor(tabId);
+    if (!waiters || !waiters.size) return;
+
+    if (method === 'Page.downloadWillBegin') {
+      const guid = String(eventParams?.guid ?? '');
+      if (!guid) return;
+      const evidence = {
+        url: String(eventParams?.url ?? ''),
+        suggestedFilename: String(eventParams?.suggestedFilename ?? ''),
+      };
+      for (const waiter of [...waiters]) {
+        waiter.begins.set(guid, evidence);
+      }
+      return;
+    }
+
+    // Page.downloadProgress — state: inProgress | completed | canceled.
+    const guid = String(eventParams?.guid ?? '');
+    const state = String(eventParams?.state ?? '');
+    if (!guid || !state) return;
+    // Timestamp taken when the completion event was DELIVERED to this
+    // extension. A DownloadItem whose startTime is after this instant cannot
+    // be this tab's guid — the item would have existed (with an earlier
+    // startTime) before the completion arrived. This is the deterministic
+    // half of the guid↔DownloadItem join.
+    const completedAt = state === 'completed' ? Date.now() : undefined;
+
+    for (const waiter of [...waiters]) {
+      waiter.progress.set(guid, { state, completedAt });
+      const begin = waiter.begins.get(guid);
+      if (!begin || !matchesDownloadEvidence(waiter, begin.url, begin.suggestedFilename)) continue;
+
+      if (state === 'completed') {
+        void correlateDownloadItem(waiter, guid);
+      } else if (state === 'canceled') {
+        waiter.finish({
+          downloaded: false,
+          state: 'interrupted',
+          error: `Download canceled before completion (url=${begin.url || 'unknown'})`,
+          elapsedMs: Date.now() - waiter.startedAt,
+        });
+      }
+    }
+  });
+
+  chrome.debugger.onDetach.addListener((source) => {
+    if (!source.tabId) return;
+    const waiters = tabWaitersFor(source.tabId);
+    if (!waiters) return;
+    tabDownloadWaiters.delete(source.tabId);
+    for (const waiter of waiters) {
+      // The re-attach path pauses/resumes waiters around the forced detach;
+      // a detach that reaches this listener unpaused is final (tab closed,
+      // external debugger) — fail instead of hanging until timeout.
+      waiter.finish({
+        downloaded: false,
+        state: 'interrupted',
+        error: 'Debugger detached from the tab while waiting for download',
+        elapsedMs: Date.now() - waiter.startedAt,
+      });
+    }
+  });
+
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    const waiters = tabWaitersFor(tabId);
+    if (!waiters) return;
+    tabDownloadWaiters.delete(tabId);
+    for (const waiter of waiters) {
+      waiter.finish({
+        downloaded: false,
+        state: 'interrupted',
+        error: 'Tab closed while waiting for download',
+        elapsedMs: Date.now() - waiter.startedAt,
+      });
+    }
+  });
+
+  // chrome.downloads ticks. Tab-scoped waiters are NEVER resolved by a bare
+  // global pattern match: onChanged/onCreated only re-run the evidence-gated
+  // correlation for guids this waiter actually observed reach
+  // Page.downloadProgress(completed) on its own tab. This covers the two
+  // real-world orderings:
+  //   - the DownloadItem appears (onCreated) only after the CDP completion;
+  //   - the item exists but gains its final filename/finalUrl later (onChanged).
+  // Claimed in-progress items still resolve through onChanged state changes.
+  chrome.downloads.onChanged.addListener((delta) => {
+    if (!delta.id) return;
+    for (const waiters of tabDownloadWaiters.values()) {
+      for (const waiter of waiters) {
+        if (waiter.claimedId === delta.id) {
+          if (delta.state?.current === 'complete' || delta.state?.current === 'interrupted') {
+            void chrome.downloads.search({ id: delta.id }).then((items) => {
+              const item = items[0];
+              if (item && !waiter.resolved) waiter.finish(downloadResultFromItem(item, waiter.startedAt));
+            }).catch(() => {});
+          }
+          continue;
+        }
+        if (hasCompletedGuid(waiter)
+          && (delta.filename?.current || delta.url?.current || delta.state?.current)) {
+          correlateCompletedGuids(waiter);
+        }
+      }
+    }
+  });
+
+  chrome.downloads.onCreated.addListener((item) => {
+    for (const waiters of tabDownloadWaiters.values()) {
+      for (const waiter of waiters) {
+        if (waiter.claimedId !== undefined) continue;
+        if (hasCompletedGuid(waiter)) correlateCompletedGuids(waiter);
+      }
+    }
+  });
+}
+
+export async function waitForDownload(
+  pattern: string,
+  timeoutMs: number,
+  tabId: number,
+): Promise<DownloadWaitResult> {
   const startedAt = Date.now();
   const timeout = Math.max(1, timeoutMs);
 
+  // Tab-scoped path: arm the waiter synchronously (before the first await) so
+  // Page.downloadWillBegin / Page.downloadProgress fired by the click that the
+  // caller performs right after calling (without awaiting) are never missed.
+  // Page lifecycle events are isolated per chrome.debugger source.tabId, so a
+  // second tab's Page download events never drive this waiter; the final
+  // DownloadItem join is narrowed by begin evidence + time bounds + claim
+  // exclusivity (see correlateDownloadItem) — no absolute guarantee, but no
+  // cross-tab event leakage either.
+  registerDownloadEventRouting();
   return await new Promise<DownloadWaitResult>((resolve) => {
-    let done = false;
-    const inProgressIds = new Set<number>();
-    const finish = (result: DownloadWaitResult) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      chrome.downloads.onCreated.removeListener(onCreated);
-      chrome.downloads.onChanged.removeListener(onChanged);
-      resolve(result);
-    };
-
-    const inspectById = async (id: number) => {
-      const items = await chrome.downloads.search({ id });
-      const item = items[0];
-      if (!item || !matchesDownloadPattern(item, pattern)) return;
-      inProgressIds.add(id);
-      if (item.state === 'complete' || item.state === 'interrupted') finish(downloadResult(item, startedAt));
-    };
-
-    const onCreated = (item: chrome.downloads.DownloadItem) => {
-      if (!matchesDownloadPattern(item, pattern)) return;
-      inProgressIds.add(item.id);
-      if (item.state === 'complete' || item.state === 'interrupted') finish(downloadResult(item, startedAt));
-    };
-    const onChanged = (delta: chrome.downloads.DownloadDelta) => {
-      if (!delta.id) return;
-      if (!inProgressIds.has(delta.id) && !delta.filename && !delta.url) return;
-      if (delta.filename?.current || delta.url?.current) {
-        void inspectById(delta.id);
-        return;
-      }
-      if (delta.state?.current === 'complete' || delta.state?.current === 'interrupted') {
-        void inspectById(delta.id);
-      }
+    const waiter: TabDownloadWaiter = {
+      pattern,
+      startedAt,
+      begins: new Map(),
+      progress: new Map(),
+      resolved: false,
+      finish: (result) => {
+        if (waiter.resolved) return false;
+        waiter.resolved = true;
+        clearTimeout(timer);
+        const waiters = tabWaitersFor(tabId);
+        waiters?.delete(waiter);
+        if (waiters && !waiters.size) tabDownloadWaiters.delete(tabId);
+        // A waiter that finishes without a download never resolved from its
+        // claims — release them so a later waiter can still adopt the
+        // in-flight item.
+        if (!result.downloaded) releaseOrphanClaims(waiter);
+        resolve(result);
+        return true;
+      },
     };
     const timer = setTimeout(() => {
-      finish({
+      waiter.finish({
         downloaded: false,
         state: 'interrupted',
         error: `No download matched "${pattern || '*'}" within ${timeout}ms`,
         elapsedMs: Date.now() - startedAt,
       });
     }, timeout);
-
-    chrome.downloads.onCreated.addListener(onCreated);
-    chrome.downloads.onChanged.addListener(onChanged);
-
-    void chrome.downloads.search({
-      limit: 50,
-      orderBy: ['-startTime'],
-      startedAfter: new Date(startedAt - Math.max(timeout, 1000)).toISOString(),
-    }).then((recent) => {
-      if (done) return;
-      const completed = recent.find((item) => item.state === 'complete' && matchesDownloadPattern(item, pattern));
-      if (completed) {
-        finish(downloadResult(completed, startedAt));
-        return;
-      }
-      for (const item of recent) {
-        if (item.state === 'in_progress' && matchesDownloadPattern(item, pattern)) inProgressIds.add(item.id);
-      }
-    }).catch((err) => {
-      finish({
+    const waiters = tabWaitersFor(tabId) ?? new Set<TabDownloadWaiter>();
+    waiters.add(waiter);
+    tabDownloadWaiters.set(tabId, waiters);
+    // Minimal liveness handling AFTER the synchronous arm: make sure the tab
+    // is attached and Page.enable has been issued (wait-download may be the
+    // first command on a freshly resolved tab). ensureAttached pauses and
+    // resumes armed waiters around any forced re-attach. Failures here are
+    // fail-fast: an initial attach failure (tab gone, non-debuggable URL,
+    // attach rejection) surfaces on the waiter immediately instead of
+    // hanging until the timeout. Normal re-attach flows never reach this
+    // catch — they pause/restore the waiter internally and resolve.
+    void ensureAttached(tabId).catch((err) => {
+      waiter.finish({
         downloaded: false,
         state: 'interrupted',
         error: err instanceof Error ? err.message : String(err),

@@ -526,7 +526,7 @@ describe('background tab isolation', () => {
         elapsedMs: 12,
       },
     });
-    expect(waitForDownload).toHaveBeenCalledWith('receipt', 1234);
+    expect(waitForDownload).toHaveBeenCalledWith('receipt', 1234, 1);
   });
 
   it('routes exec frameIndex through the same cross-origin frame ordering as handleFrames', async () => {
@@ -1251,7 +1251,7 @@ describe('background tab isolation', () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const fetchMock = vi.fn(async () => ({ ok: false, status: 431 }));
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => ({ ok: false, status: 431 }));
     vi.stubGlobal('fetch', fetchMock);
 
     await import('./background');
@@ -1262,7 +1262,7 @@ describe('background tab isolation', () => {
 
     // The ping must not attach the localhost cookie jar — that is what pushes
     // the request past Node's header limit and makes the daemon answer 431.
-    expect(fetchMock.mock.calls[0][1]).toMatchObject({ credentials: 'omit' });
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ credentials: 'omit' });
     // A non-OK ping must be logged, not silently swallowed.
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('HTTP 431'));
     // The WebSocket must not be attempted after a failed ping.
@@ -1567,7 +1567,9 @@ describe('background tab isolation', () => {
     // SW restart and can dodge idle expiry indefinitely.
     expect(scheduledWhen).toBeLessThan(now + 15_000);
     expect(scheduledWhen).toBeGreaterThan(now + 1_000);
-    expect(mod.__test__.getSession(adapterKey('twitter')).idleDeadlineAt).toBeLessThan(now + 15_000);
+    const restoredSession = mod.__test__.getSession(adapterKey('twitter'));
+    if (!restoredSession) throw new Error('Expected restored twitter session');
+    expect(restoredSession.idleDeadlineAt).toBeLessThan(now + 15_000);
   });
 
   it('releases owned leases from the idle alarm path', async () => {

@@ -1505,7 +1505,7 @@ async function handleCommand(cmd: Command): Promise<Result> {
       case 'ws-capture-stop':
         return await handleWsCaptureStop(cmd, leaseKey);
       case 'wait-download':
-        return await handleWaitDownload(cmd);
+        return await handleWaitDownload(cmd, leaseKey);
       case 'frames':
         return await handleFrames(cmd, leaseKey);
       default:
@@ -2312,9 +2312,15 @@ async function handleWsCaptureStop(cmd: Command, leaseKey: string): Promise<Resu
   }
 }
 
-async function handleWaitDownload(cmd: Command): Promise<Result> {
+async function handleWaitDownload(cmd: Command, leaseKey: string): Promise<Result> {
   try {
-    const data = await executor.waitForDownload(cmd.pattern ?? '', cmd.timeoutMs ?? 30000);
+    const cmdTabId = await resolveCommandTabId(cmd);
+    const tabId = await resolveTabId(cmdTabId, leaseKey);
+    const data = await executor.waitForDownload(
+      cmd.pattern ?? '',
+      cmd.timeoutMs ?? 30000,
+      tabId,
+    );
     return { id: cmd.id, ok: true, data };
   } catch (err) {
     return errorResult(cmd.id, err);

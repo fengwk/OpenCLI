@@ -293,17 +293,9 @@ function chromeMockForDownloads(initialItems: chrome.downloads.DownloadItem[] = 
     }),
     onCreated: {
       addListener: vi.fn((fn: (item: chrome.downloads.DownloadItem) => void) => { createdListeners.push(fn); }),
-      removeListener: vi.fn((fn: (item: chrome.downloads.DownloadItem) => void) => {
-        const idx = createdListeners.indexOf(fn);
-        if (idx >= 0) createdListeners.splice(idx, 1);
-      }),
     },
     onChanged: {
       addListener: vi.fn((fn: (delta: chrome.downloads.DownloadDelta) => void) => { changedListeners.push(fn); }),
-      removeListener: vi.fn((fn: (delta: chrome.downloads.DownloadDelta) => void) => {
-        const idx = changedListeners.indexOf(fn);
-        if (idx >= 0) changedListeners.splice(idx, 1);
-      }),
     },
   };
   return {
@@ -322,6 +314,67 @@ function chromeMockForDownloads(initialItems: chrome.downloads.DownloadItem[] = 
   };
 }
 
+/**
+ * Mock combining chrome.debugger (Page events) + chrome.downloads so tab-scoped
+ * download waits can be driven exactly the way Chrome drives them:
+ * chrome.debugger.onEvent delivers Page.download* with source.tabId, and
+ * chrome.downloads is the only source of the final DownloadItem (id, full
+ * filename, mime, danger, error) — DownloadItem.tabId does not exist.
+ */
+function chromeMockForTabDownloads() {
+  const base = chromeMockForDownloads();
+  const debuggerEventListeners: Array<(source: { tabId?: number }, method: string, params: any) => void> = [];
+  const onDetachListeners: Array<(source: { tabId?: number; targetId?: string }) => void> = [];
+  const tabRemovedListeners: Array<(tabId: number) => void> = [];
+  const debuggerApi = {
+    attach: vi.fn(async () => {}),
+    detach: vi.fn(async () => {}),
+    sendCommand: vi.fn(async () => ({})),
+    onDetach: { addListener: vi.fn((fn: (source: { tabId?: number; targetId?: string }) => void) => { onDetachListeners.push(fn); }) },
+    onEvent: {
+      addListener: vi.fn((fn: (source: { tabId?: number }, method: string, params: any) => void) => {
+        debuggerEventListeners.push(fn);
+      }),
+    },
+  };
+  const tabs = {
+    get: vi.fn(async () => ({ id: 1, windowId: 1, url: 'https://app.example/' })),
+    onRemoved: { addListener: vi.fn((fn: (tabId: number) => void) => { tabRemovedListeners.push(fn); }) },
+    onUpdated: { addListener: vi.fn() },
+  };
+  const fireDebuggerEvent = (source: { tabId?: number }, method: string, params: any) => {
+    for (const fn of [...debuggerEventListeners]) fn(source, method, params);
+  };
+  const fireDebuggerDetach = (source: { tabId?: number; targetId?: string }) => {
+    for (const fn of [...onDetachListeners]) fn(source);
+  };
+  const fireTabRemoved = (tabId: number) => {
+    for (const fn of [...tabRemovedListeners]) fn(tabId);
+  };
+  const chromeObj = { ...base.chrome, tabs, debugger: debuggerApi, runtime: { id: 'opencli-test' } };
+  return {
+    ...base,
+    chrome: chromeObj,
+    debuggerApi,
+    debuggerEventListeners,
+    fireDebuggerEvent,
+    fireDebuggerDetach,
+    fireTabRemoved,
+  };
+}
+
+const beginEvent = (guid: string, url: string, filename: string) => ({
+  guid,
+  url,
+  suggestedFilename: filename,
+  frameId: 'frame-1',
+});
+const progressEvent = (guid: string, state: string, extra: Record<string, unknown> = {}) => ({
+  guid,
+  state,
+  ...extra,
+});
+
 describe('cdp download waits', () => {
   beforeEach(() => {
     vi.resetModules();
@@ -333,66 +386,731 @@ describe('cdp download waits', () => {
     vi.useRealTimers();
   });
 
-  it('returns a recent completed download matching filename or URL', async () => {
-    const { chrome, downloads } = chromeMockForDownloads([
-      {
-        id: 7,
-        filename: '/tmp/receipt.pdf',
-        url: 'https://app.example/download?id=receipt',
-        finalUrl: 'https://cdn.example/receipt.pdf',
-        mime: 'application/pdf',
-        state: 'complete',
-        totalBytes: 1234,
-        danger: 'safe',
-        startTime: new Date().toISOString(),
-      } as chrome.downloads.DownloadItem,
-    ]);
-    vi.stubGlobal('chrome', chrome);
-
-    const mod = await import('./cdp');
-    const result = await mod.waitForDownload('receipt', 1000);
-
-    expect(result).toMatchObject({
-      downloaded: true,
-      id: 7,
-      filename: '/tmp/receipt.pdf',
-      state: 'complete',
-    });
-    expect(downloads.onCreated.removeListener).toHaveBeenCalledTimes(1);
-    expect(downloads.onChanged.removeListener).toHaveBeenCalledTimes(1);
-  });
-
-  it('waits for a matching in-progress download to complete', async () => {
-    const mock = chromeMockForDownloads();
+  // Regression (isolation): a chrome.downloads item created outside this
+  // tab's Page flow must never complete the tab-scoped waiter. Tab 8 fires a
+  // matching onCreated for the SAME pattern while tab 3 only sees its own
+  // guid; resolution must wait for tab 3's own item.
+  it('ignores a downloads.onCreated item from another tab even with the same pattern', async () => {
+    vi.useFakeTimers();
+    const mock = chromeMockForTabDownloads();
     vi.stubGlobal('chrome', mock.chrome);
 
     const mod = await import('./cdp');
-    const promise = mod.waitForDownload('invoice', 1000);
-    await Promise.resolve();
+    const promise = mod.waitForDownload('receipt', 400, 3);
+    let settled = false;
+    const observed = promise.then(() => { settled = true; }, () => { settled = true; });
 
-    const started = {
-      id: 42,
-      filename: '/tmp/invoice.crdownload',
-      url: 'https://app.example/invoice',
-      finalUrl: 'https://app.example/invoice',
+    // Tab 3's own download: begins after the waiter armed (startTime within
+    // the [armed, completed] window — as in real Chrome) and completes.
+    const itemStartMs = Date.now();
+    mock.fireDebuggerEvent({ tabId: 3 }, 'Page.downloadWillBegin', beginEvent('g-own', 'https://app.example/receipt.pdf', 'receipt.pdf'));
+    mock.fireDebuggerEvent({ tabId: 3 }, 'Page.downloadProgress', progressEvent('g-own', 'completed'));
+    const completedAtMs = Date.now();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(settled).toBe(false); // no DownloadItem yet — still waiting
+
+    // Tab 8's unrelated flow creates a same-pattern DownloadItem. Real Chrome
+    // registers it with a startTime AFTER tab 3's completion was delivered.
+    mock.emitCreated({
+      id: 77,
+      filename: '/tmp/receipt.pdf',
+      url: 'https://app.example/receipt.pdf',
+      state: 'complete',
+      startTime: new Date(completedAtMs + 5000).toISOString(),
+    } as chrome.downloads.DownloadItem);
+    await vi.advanceTimersByTimeAsync(10);
+    // Isolation: the tab-8 item must NOT complete tab 3's waiter.
+    expect(settled).toBe(false);
+
+    // Tab 3's own item appears — its startTime sits inside the waiter's
+    // [armed, completed] window, so the correlation may bind it and only it.
+    mock.emitCreated({
+      id: 9,
+      filename: '/tmp/receipt.pdf',
+      url: 'https://app.example/receipt.pdf',
+      finalUrl: 'https://cdn.example/receipt.pdf',
       mime: 'application/pdf',
+      state: 'complete',
+      totalBytes: 2048,
+      danger: 'safe',
+      startTime: new Date(itemStartMs).toISOString(),
+    } as chrome.downloads.DownloadItem);
+    await observed;
+    await expect(promise).resolves.toMatchObject({
+      downloaded: true,
+      id: 9,
+      filename: '/tmp/receipt.pdf',
+    });
+    vi.useRealTimers();
+  });
+
+  // Regression (stale item): an OLD download with the same pattern AND the
+  // same begin evidence, but started BEFORE the waiter armed, must never
+  // complete the current waiter — the full time window (arm <= startTime <=
+  // completedAt) rejects it; only the arm-time item does.
+  it('ignores a stale same-URL item started before the waiter armed', async () => {
+    vi.useFakeTimers();
+    const mock = chromeMockForTabDownloads();
+    vi.stubGlobal('chrome', mock.chrome);
+
+    const mod = await import('./cdp');
+    const promise = mod.waitForDownload('receipt', 400, 3);
+    const itemStartMs = Date.now();
+    mock.fireDebuggerEvent({ tabId: 3 }, 'Page.downloadWillBegin', beginEvent('g-own', 'https://app.example/receipt.pdf', 'receipt.pdf'));
+    mock.fireDebuggerEvent({ tabId: 3 }, 'Page.downloadProgress', progressEvent('g-own', 'completed'));
+    await vi.advanceTimersByTimeAsync(10);
+    let settled = false;
+    const observed = promise.then(() => { settled = true; }, () => { settled = true; });
+
+    // A stale completion of a PREVIOUS download with identical evidence:
+    // same pattern, same url/filename, but startTime before the arm.
+    mock.emitCreated({
+      id: 78,
+      filename: '/tmp/receipt.pdf',
+      url: 'https://app.example/receipt.pdf',
+      state: 'complete',
+      startTime: new Date(itemStartMs - 60_000).toISOString(),
+    } as chrome.downloads.DownloadItem);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(settled).toBe(false); // stale item must not resolve the waiter
+
+    // The current download's item (started at arm time) completes the wait.
+    mock.emitCreated({
+      id: 9,
+      filename: '/tmp/receipt.pdf',
+      url: 'https://app.example/receipt.pdf',
+      state: 'complete',
+      totalBytes: 2048,
+      startTime: new Date(itemStartMs).toISOString(),
+    } as chrome.downloads.DownloadItem);
+    await observed;
+    await expect(promise).resolves.toMatchObject({
+      downloaded: true,
+      id: 9,
+      filename: '/tmp/receipt.pdf',
+    });
+    vi.useRealTimers();
+  });
+
+  // Regression (late fields): a DownloadItem that exists before its final
+  // filename/finalUrl must not be permanently rejected — the onChanged tick
+  // that writes the final fields must complete the correlation.
+  it('resolves after downloads.onChanged writes the final filename to a pre-existing item', async () => {
+    vi.useFakeTimers();
+    const mock = chromeMockForTabDownloads();
+    vi.stubGlobal('chrome', mock.chrome);
+
+    const mod = await import('./cdp');
+    const startedMs = Date.now();
+    const promise = mod.waitForDownload('wanted', 600, 1);
+
+    // Tab 1's Page flow completes; the item exists but its filename is still
+    // the .crdownload placeholder (does not match the pattern). The item's
+    // startTime predates the completion delivery — as in real Chrome.
+    mock.setItem({
+      id: 61,
+      filename: '/tmp/wanted.crdownload',
+      url: 'https://app.example/redirect-target',
       state: 'in_progress',
-      totalBytes: 0,
+      startTime: new Date(startedMs).toISOString(),
+    } as chrome.downloads.DownloadItem);
+    mock.fireDebuggerEvent({ tabId: 1 }, 'Page.downloadWillBegin', beginEvent('g-late', 'https://app.example/wanted-start', 'wanted.bin'));
+    mock.fireDebuggerEvent({ tabId: 1 }, 'Page.downloadProgress', progressEvent('g-late', 'completed'));
+    await vi.advanceTimersByTimeAsync(10);
+    let settled = false;
+    const observed = promise.then(() => { settled = true; }, () => { settled = true; });
+    expect(settled).toBe(false);
+
+    // chrome.downloads.onChanged lands the final filename/finalUrl — the
+    // correlation must now match through begin evidence (the completed guid's
+    // startTime bound still holds: same item, same startTime).
+    mock.setItem({
+      id: 61,
+      filename: '/home/u/Downloads/wanted.bin',
+      url: 'https://app.example/wanted-start',
+      finalUrl: 'https://app.example/wanted-start',
+      state: 'complete',
+      totalBytes: 5,
+      startTime: new Date(startedMs).toISOString(),
+    } as chrome.downloads.DownloadItem);
+    mock.emitChanged({
+      id: 61,
+      filename: { previous: '/tmp/wanted.crdownload', current: '/home/u/Downloads/wanted.bin' },
+      state: { previous: 'in_progress', current: 'complete' },
+    } as chrome.downloads.DownloadDelta);
+    await observed;
+    await expect(promise).resolves.toMatchObject({
+      downloaded: true,
+      id: 61,
+      filename: '/home/u/Downloads/wanted.bin',
+    });
+    vi.useRealTimers();
+  });
+
+  // Regression: DownloadItem has NO tabId — tab isolation must come from
+  // chrome.debugger Page.* events routed by source.tabId, never from a
+  // DownloadItem field. This test would not compile against real @types/chrome.
+  it('does not match a completed download from another tab when scoped to a tab', async () => {
+    const mock = chromeMockForTabDownloads();
+    vi.stubGlobal('chrome', mock.chrome);
+
+    const mod = await import('./cdp');
+    const promise = mod.waitForDownload('receipt', 300, 3);
+
+    // Tab 8 begins AND completes a matching download — must not resolve tab 3's waiter.
+    mock.fireDebuggerEvent({ tabId: 8 }, 'Page.downloadWillBegin', beginEvent('g-other', 'https://app.example/receipt.pdf', 'receipt.pdf'));
+    mock.fireDebuggerEvent({ tabId: 8 }, 'Page.downloadProgress', progressEvent('g-other', 'completed'));
+
+    // Tab 3's own download arrives late and completes the waiter. The final
+    // DownloadItem is already registered in chrome.downloads (real Chrome
+    // registers it when the download starts), so the correlation search finds
+    // it as soon as tab 3's completion event arrives.
+    mock.setItem({
+      id: 9,
+      filename: '/tmp/receipt.pdf',
+      url: 'https://app.example/receipt.pdf',
+      finalUrl: 'https://cdn.example/receipt.pdf',
+      mime: 'application/pdf',
+      state: 'complete',
+      totalBytes: 2048,
       danger: 'safe',
       startTime: new Date().toISOString(),
-    } as chrome.downloads.DownloadItem;
-    mock.emitCreated(started);
-    mock.setItem({ ...started, filename: '/tmp/invoice.pdf', state: 'complete', totalBytes: 4567 });
-    mock.emitChanged({ id: 42, state: { current: 'complete', previous: 'in_progress' } } as chrome.downloads.DownloadDelta);
+    } as chrome.downloads.DownloadItem);
+    mock.fireDebuggerEvent({ tabId: 3 }, 'Page.downloadWillBegin', beginEvent('g-own', 'https://app.example/receipt.pdf', 'receipt.pdf'));
+    mock.fireDebuggerEvent({ tabId: 3 }, 'Page.downloadProgress', progressEvent('g-own', 'completed'));
 
     await expect(promise).resolves.toMatchObject({
       downloaded: true,
-      id: 42,
-      filename: '/tmp/invoice.pdf',
+      id: 9,
+      filename: '/tmp/receipt.pdf',
       state: 'complete',
     });
   });
+
+  // The waiter must be armed synchronously BEFORE the first await so a caller
+  // that triggers the click without awaiting waitForDownload cannot miss the
+  // Page.downloadWillBegin/Progress events.
+  it('resolves from Page events fired before the caller awaits (sync arm)', async () => {
+    const mock = chromeMockForTabDownloads();
+    vi.stubGlobal('chrome', mock.chrome);
+
+    const mod = await import('./cdp');
+    // No await — the caller fires the click right after arming.
+    const promise = mod.waitForDownload('invoice', 1000, 1);
+    mock.setItem({
+      id: 5,
+      filename: '/tmp/invoice.pdf',
+      url: 'https://app.example/invoice.pdf',
+      state: 'complete',
+      totalBytes: 10,
+      startTime: new Date().toISOString(),
+    } as chrome.downloads.DownloadItem);
+    mock.fireDebuggerEvent({ tabId: 1 }, 'Page.downloadWillBegin', beginEvent('g1', 'https://app.example/invoice.pdf', 'invoice.pdf'));
+    mock.fireDebuggerEvent({ tabId: 1 }, 'Page.downloadProgress', progressEvent('g1', 'completed', { totalBytes: 10, receivedBytes: 10 }));
+
+    await expect(promise).resolves.toMatchObject({
+      downloaded: true,
+      id: 5,
+      filename: '/tmp/invoice.pdf',
+    });
+  });
+
+  // Page.enable is what arms Page.download* events under chrome.debugger —
+  // without it the tab-scoped waiter can never see downloadWillBegin. This
+  // proves the enable happens on attach (and covers the claim exclusivity +
+  // legacy-guard behaviors below).
+  it('enables the Page domain after attach so Page download events flow', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./cdp');
+    await mod.ensureAttached(1);
+
+    const methods = chrome.debugger.sendCommand.mock.calls.map((c: unknown[]) => c[1] as string);
+    expect(methods).toContain('Page.enable');
+    expect(methods).not.toContain('Page.setDownloadBehavior');
+    expect(methods).not.toContain('Browser.setDownloadBehavior');
+    // Never any Browser.* domain — chrome.debugger rejects them on MV3.
+    expect(methods.some((m: string) => m.startsWith('Browser.'))).toBe(false);
+  });
+
+  // The DownloadItem (final filename, mime, danger, error) only exists in
+  // chrome.downloads — the CDP Page events carry no local path. This test
+  // proves the correlation bridge: CDP completion → downloads.search → final
+  // item surfaces with all its fields.
+  it('joins CDP completion to the final chrome.downloads item fields', async () => {
+    const mock = chromeMockForTabDownloads();
+    vi.stubGlobal('chrome', mock.chrome);
+
+    const mod = await import('./cdp');
+    const promise = mod.waitForDownload('report', 1000, 1);
+    mock.setItem({
+      id: 21,
+      filename: '/home/user/Downloads/report.pdf',
+      url: 'https://app.example/report?token=x',
+      finalUrl: 'https://cdn.example/report.pdf',
+      mime: 'application/pdf',
+      state: 'complete',
+      totalBytes: 9001,
+      danger: 'safe',
+      startTime: new Date().toISOString(),
+    } as chrome.downloads.DownloadItem);
+    mock.fireDebuggerEvent({ tabId: 1 }, 'Page.downloadWillBegin', beginEvent('g2', 'https://app.example/report?token=x', 'report.pdf'));
+    mock.fireDebuggerEvent({ tabId: 1 }, 'Page.downloadProgress', progressEvent('g2', 'completed'));
+
+    await expect(promise).resolves.toEqual(expect.objectContaining({
+      downloaded: true,
+      id: 21,
+      filename: '/home/user/Downloads/report.pdf',
+      url: 'https://app.example/report?token=x',
+      finalUrl: 'https://cdn.example/report.pdf',
+      mime: 'application/pdf',
+      totalBytes: 9001,
+      state: 'complete',
+      danger: 'safe',
+    }));
+  });
+
+  // Completion correlation may run before the DownloadItem exists (Chrome
+  // registers the download after downloadProgress(completed) in some flows).
+  // The claim must survive via onCreated — no silent drop, no global fallback.
+  it('resolves via downloads.onCreated when the item appears after CDP completion', async () => {
+    const mock = chromeMockForTabDownloads();
+    vi.stubGlobal('chrome', mock.chrome);
+
+    const mod = await import('./cdp');
+    const promise = mod.waitForDownload('late', 1000, 1);
+    mock.fireDebuggerEvent({ tabId: 1 }, 'Page.downloadWillBegin', beginEvent('g3', 'https://app.example/late.bin', 'late.bin'));
+    mock.fireDebuggerEvent({ tabId: 1 }, 'Page.downloadProgress', progressEvent('g3', 'completed'));
+
+    mock.emitCreated({
+      id: 31,
+      filename: '/tmp/late.bin',
+      url: 'https://app.example/late.bin',
+      state: 'complete',
+      totalBytes: 3,
+      startTime: new Date().toISOString(),
+    } as chrome.downloads.DownloadItem);
+
+    await expect(promise).resolves.toMatchObject({
+      downloaded: true,
+      id: 31,
+      filename: '/tmp/late.bin',
+    });
+  });
+
+  // Page.downloadProgress(canceled) is the only reliable cancel signal —
+  // chrome.downloads may never surface the item. Canceled must resolve the
+  // wait with downloaded=false instead of hanging to the timeout.
+  it('fails fast with downloaded=false when the download is canceled', async () => {
+    const mock = chromeMockForTabDownloads();
+    vi.stubGlobal('chrome', mock.chrome);
+
+    const mod = await import('./cdp');
+    const promise = mod.waitForDownload('cancel-me', 5000, 1);
+    mock.fireDebuggerEvent({ tabId: 1 }, 'Page.downloadWillBegin', beginEvent('g4', 'https://app.example/cancel-me.bin', 'cancel-me.bin'));
+    mock.fireDebuggerEvent({ tabId: 1 }, 'Page.downloadProgress', progressEvent('g4', 'canceled'));
+
+    await expect(promise).resolves.toMatchObject({
+      downloaded: false,
+      state: 'interrupted',
+    });
+  });
+
+  // A pattern-scoped waiter must not adopt a same-tab download whose CDP
+  // evidence (url/suggestedFilename) does not match the pattern — it keeps
+  // waiting until its own timeout instead of resolving with a wrong file.
+  it('keeps waiting when the tab download evidence does not match the pattern', async () => {
+    vi.useFakeTimers();
+    const mock = chromeMockForTabDownloads();
+    vi.stubGlobal('chrome', mock.chrome);
+
+    const mod = await import('./cdp');
+    const promise = mod.waitForDownload('wanted', 200, 1);
+    mock.setItem({
+      id: 41,
+      filename: '/tmp/unrelated.bin',
+      url: 'https://app.example/unrelated.bin',
+      state: 'complete',
+      startTime: new Date().toISOString(),
+    } as chrome.downloads.DownloadItem);
+    mock.fireDebuggerEvent({ tabId: 1 }, 'Page.downloadWillBegin', beginEvent('g5', 'https://app.example/unrelated.bin', 'unrelated.bin'));
+    mock.fireDebuggerEvent({ tabId: 1 }, 'Page.downloadProgress', progressEvent('g5', 'completed'));
+    // Let the async correlation search run — it must not claim the unrelated id.
+    let settled = false;
+    const observed = promise.then(() => { settled = true; }, () => { settled = true; });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(settled).toBe(false);
+
+    // Timeout is the only remaining exit — proves no wrong-resolution happened.
+    await vi.advanceTimersByTimeAsync(200);
+    await observed;
+    await expect(promise).resolves.toMatchObject({
+      downloaded: false,
+      state: 'interrupted',
+    });
+    vi.useRealTimers();
+  });
+
+  // Two concurrent tab waiters must not resolve from the same DownloadItem —
+  // claim exclusivity keeps the loser pending until its own timeout.
+  it('does not let two tab waiters claim the same download id', async () => {
+    vi.useFakeTimers();
+    const mock = chromeMockForTabDownloads();
+    vi.stubGlobal('chrome', mock.chrome);
+
+    const mod = await import('./cdp');
+    const waiterA = mod.waitForDownload('alpha', 300, 1);
+    const waiterB = mod.waitForDownload('alpha', 300, 2);
+
+    // Two tabs, identical download urls — only one waiter may claim id 51.
+    // Real Chrome registers the DownloadItem when the download starts, so the
+    // item exists before either completion event is delivered.
+    mock.setItem({
+      id: 51,
+      filename: '/tmp/alpha.bin',
+      url: 'https://app.example/alpha.bin',
+      state: 'complete',
+      startTime: new Date().toISOString(),
+    } as chrome.downloads.DownloadItem);
+    mock.fireDebuggerEvent({ tabId: 1 }, 'Page.downloadWillBegin', beginEvent('g6', 'https://app.example/alpha.bin', 'alpha.bin'));
+    mock.fireDebuggerEvent({ tabId: 2 }, 'Page.downloadWillBegin', beginEvent('g6b', 'https://app.example/alpha.bin', 'alpha.bin'));
+
+    let bSettled = false;
+    const observedB = waiterB.then(() => { bSettled = true; }, () => { bSettled = true; });
+
+    mock.fireDebuggerEvent({ tabId: 1 }, 'Page.downloadProgress', progressEvent('g6', 'completed'));
+    mock.fireDebuggerEvent({ tabId: 2 }, 'Page.downloadProgress', progressEvent('g6b', 'completed'));
+    await vi.advanceTimersByTimeAsync(20);
+
+    await expect(waiterA).resolves.toMatchObject({ downloaded: true, id: 51 });
+    expect(bSettled).toBe(false);
+
+    // B never sees its own download — times out unresolved.
+    await vi.advanceTimersByTimeAsync(400);
+    await observedB;
+    await expect(waiterB).resolves.toMatchObject({ downloaded: false, state: 'interrupted' });
+    vi.useRealTimers();
+  });
+
+  // A single waiter must never claim more than one item: once an in-progress
+  // candidate is claimed, subsequent correlation ticks must not claim or switch
+  // to another matching item, and the other item must remain unclaimed.
+  it('locks to the first claimed in-progress download and rejects subsequent candidate items', async () => {
+    const mock = chromeMockForTabDownloads();
+    vi.stubGlobal('chrome', mock.chrome);
+
+    const mod = await import('./cdp');
+    const itemStartMs = Date.now();
+    const promise = mod.waitForDownload('data', 1000, 1);
+
+    // Page lifecycle completes for tab 1's guid
+    mock.fireDebuggerEvent({ tabId: 1 }, 'Page.downloadWillBegin', beginEvent('g-single-claim', 'https://app.example/data.bin', 'data.bin'));
+    mock.fireDebuggerEvent({ tabId: 1 }, 'Page.downloadProgress', progressEvent('g-single-claim', 'completed'));
+
+    // Item A appears in_progress and is claimed by the waiter
+    const itemA: chrome.downloads.DownloadItem = {
+      id: 100,
+      filename: '/tmp/data.bin',
+      url: 'https://app.example/data.bin',
+      state: 'in_progress',
+      startTime: new Date(itemStartMs).toISOString(),
+    } as chrome.downloads.DownloadItem;
+    mock.emitCreated(itemA);
+    // Allow the async search in correlateDownloadItem to resolve and establish the claim
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // A second item B appears with identical matching evidence and state complete
+    const itemB: chrome.downloads.DownloadItem = {
+      id: 200,
+      filename: '/tmp/data.bin',
+      url: 'https://app.example/data.bin',
+      state: 'complete',
+      startTime: new Date(itemStartMs).toISOString(),
+    } as chrome.downloads.DownloadItem;
+    mock.emitCreated(itemB);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // Item A completes
+    mock.setItem({ ...itemA, state: 'complete', totalBytes: 1024 });
+    mock.emitChanged({
+      id: 100,
+      state: { current: 'complete', previous: 'in_progress' },
+    } as chrome.downloads.DownloadDelta);
+
+    // The waiter must resolve to item A (id: 100), not item B (id: 200)
+    await expect(promise).resolves.toMatchObject({
+      downloaded: true,
+      id: 100,
+    });
+
+    // Item B must not have been claimed or consumed: another waiter for tab 2
+    // with its own download flow can claim and resolve from item B.
+    const waiter2StartMs = Date.now();
+    const promise2 = mod.waitForDownload('data', 1000, 2);
+    mock.setItem({
+      id: 200,
+      filename: '/tmp/data.bin',
+      url: 'https://app.example/data.bin',
+      state: 'complete',
+      startTime: new Date(waiter2StartMs).toISOString(),
+    } as chrome.downloads.DownloadItem);
+    mock.fireDebuggerEvent({ tabId: 2 }, 'Page.downloadWillBegin', beginEvent('g-second-waiter', 'https://app.example/data.bin', 'data.bin'));
+    mock.fireDebuggerEvent({ tabId: 2 }, 'Page.downloadProgress', progressEvent('g-second-waiter', 'completed'));
+
+    await expect(promise2).resolves.toMatchObject({
+      downloaded: true,
+      id: 200,
+    });
+  });
+
+  // Tab removal must clean up armed waiters (no leaked timers) and fail the
+  // wait immediately instead of hanging until timeout.
+  it('fails pending tab waiters and cleans up when the tab is removed', async () => {
+    const mock = chromeMockForTabDownloads();
+    vi.stubGlobal('chrome', mock.chrome);
+
+    const mod = await import('./cdp');
+    const promise = mod.waitForDownload('gone', 5000, 1);
+    mock.fireTabRemoved(1);
+
+    await expect(promise).resolves.toMatchObject({
+      downloaded: false,
+      state: 'interrupted',
+    });
+  });
+
+  // An initial attach failure (tab gone) must surface on the waiter
+  // immediately — fail-fast with the attach error, never a silent hang until
+  // the timeout. Exercises the waitForDownload liveness catch handler.
+  it('fails fast when the initial attach fails because the tab is gone', async () => {
+    const mock = chromeMockForTabDownloads();
+    (mock.chrome.tabs.get as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error('Tab not found'),
+    );
+    vi.stubGlobal('chrome', mock.chrome);
+
+    const mod = await import('./cdp');
+    const promise = mod.waitForDownload('gone', 5000, 1);
+
+    await expect(promise).resolves.toMatchObject({
+      downloaded: false,
+      state: 'interrupted',
+      error: expect.stringContaining('Tab 1 no longer exists'),
+    });
+  });
+
+  // A non-debuggable URL must also fail the waiter fast, with the real URL
+  // check message instead of the generic timeout text.
+  it('fails fast when the tab URL is not debuggable', async () => {
+    const mock = chromeMockForTabDownloads();
+    (mock.chrome.tabs.get as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 1,
+      windowId: 1,
+      url: 'chrome://settings/',
+    });
+    vi.stubGlobal('chrome', mock.chrome);
+
+    const mod = await import('./cdp');
+    const promise = mod.waitForDownload('nope', 5000, 1);
+
+    await expect(promise).resolves.toMatchObject({
+      downloaded: false,
+      state: 'interrupted',
+      error: expect.stringContaining('Cannot debug tab'),
+    });
+  });
+
+  // Debugger detach during the wait must not leak the waiter — resolve with
+  // downloaded=false (the re-attach path pauses/resumes instead of failing).
+  it('fails pending tab waiters on debugger detach', async () => {
+    const mock = chromeMockForTabDownloads();
+    vi.stubGlobal('chrome', mock.chrome);
+
+    const mod = await import('./cdp');
+    const promise = mod.waitForDownload('detach', 5000, 1);
+    mock.fireDebuggerDetach({ tabId: 1 });
+
+    await expect(promise).resolves.toMatchObject({
+      downloaded: false,
+      state: 'interrupted',
+    });
+  });
+
+  // Concurrent attach flows must coalesce per tab: waitForDownload's liveness
+  // ensureAttached and evaluate's ensureAttached share ONE flow, so there is
+  // exactly one force detach, no interleaved pause/restore of the waiter, and
+  // the waiter resumes only after the awaited Page.enable completes.
+  it('coalesces concurrent attach flows: one detach, waiter survives, resumes after Page.enable', async () => {
+    const pageEnableStarted = vi.fn();
+    let releaseGate: () => void = () => {};
+    const pageEnableGate = new Promise<void>((resolve) => { releaseGate = resolve; });
+    const onDetachListeners: Array<(source: { tabId?: number }) => void> = [];
+    const debuggerApi = {
+      attach: vi.fn(async () => {}),
+      detach: vi.fn(async ({ tabId }: { tabId?: number }) => {
+        for (const fn of onDetachListeners) fn({ tabId });
+      }),
+      sendCommand: vi.fn(async (_target: unknown, method: string) => {
+        if (method === 'Page.enable') {
+          pageEnableStarted();
+          await pageEnableGate;
+          return {};
+        }
+        return {};
+      }),
+      onDetach: { addListener: vi.fn((fn: (s: { tabId?: number }) => void) => { onDetachListeners.push(fn); }) },
+      onEvent: { addListener: vi.fn() },
+    };
+    const chromeObj = {
+      tabs: {
+        get: vi.fn(async () => ({ id: 1, windowId: 1, url: 'https://x.com/home' })),
+        onRemoved: { addListener: vi.fn() },
+        onUpdated: { addListener: vi.fn() },
+      },
+      debugger: debuggerApi,
+      downloads: {
+        // Real Chrome registers the DownloadItem (startTime after the waiter
+        // armed) before the completion event is delivered, so the correlation
+        // finds it immediately within the [armed, completed] window.
+        search: vi.fn(async () => [{
+          id: 81,
+          filename: '/tmp/gate.bin',
+          url: 'https://app.example/gate.bin',
+          state: 'complete',
+          totalBytes: 1,
+          startTime: new Date(itemStartMs).toISOString(),
+        } as chrome.downloads.DownloadItem]),
+        onCreated: { addListener: vi.fn(), removeListener: vi.fn() },
+        onChanged: { addListener: vi.fn(), removeListener: vi.fn() },
+      },
+      runtime: { id: 'opencli-test' },
+    };
+    vi.stubGlobal('chrome', chromeObj);
+
+    const mod = await import('./cdp');
+    const promise = mod.waitForDownload('gate', 5000, 1);
+    const itemStartMs = Date.now(); // after the waiter armed, before completion
+
+    // The liveness attach starts and parks on the gated Page.enable.
+    await vi.waitFor(() => expect(pageEnableStarted).toHaveBeenCalled());
+    let settled = false;
+    const observed = promise.then(() => { settled = true; }, () => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    // Two more concurrent attach users for the SAME tab while flow #1 is
+    // parked: both must join it instead of running their own force-detach.
+    const joined = Promise.all([mod.ensureAttached(1), mod.evaluate(1, '1')]);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    // Coalescing proof: one attach flow = one force detach + one Page.enable.
+    expect(debuggerApi.detach).toHaveBeenCalledTimes(1);
+    expect(debuggerApi.attach).toHaveBeenCalledTimes(1);
+    expect(pageEnableStarted).toHaveBeenCalledTimes(1);
+    expect(settled).toBe(false); // paused for the attach window, not failed
+
+    // Completing Page.enable lets the single flow finish → waiter resumes.
+    releaseGate();
+    await joined;
+    // Let the awaited Page.enable continuation (resumeTabDownloadWaiters) run.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(settled).toBe(false); // resumed ≠ resolved; still waiting for its download
+
+    // The resumed waiter still resolves from its own tab's Page events.
+    mocklessFirePageEvent(debuggerApi, { tabId: 1 }, 'Page.downloadWillBegin', beginEvent('g-gate', 'https://app.example/gate.bin', 'gate.bin'));
+    mocklessFirePageEvent(debuggerApi, { tabId: 1 }, 'Page.downloadProgress', progressEvent('g-gate', 'completed'));
+    await vi.waitFor(() => expect(settled).toBe(true));
+    await expect(promise).resolves.toMatchObject({ downloaded: true, id: 81 });
+  });
+
+  // A GENUINE re-attach (stale-attach health-check failure) pauses the armed
+  // waiter around the forced detach and resumes it afterwards — the waiter is
+  // not failed by onDetach fired mid-re-attach.
+  it('pauses and resumes a tab waiter across a genuine forced re-attach', async () => {
+    let failNextHealthCheck = false;
+    const onDetachListeners: Array<(source: { tabId?: number }) => void> = [];
+    const debuggerApi = {
+      attach: vi.fn(async () => {}),
+      detach: vi.fn(async ({ tabId }: { tabId?: number }) => {
+        for (const fn of onDetachListeners) fn({ tabId });
+      }),
+      sendCommand: vi.fn(async (_target: unknown, method: string, params?: any) => {
+        if (method === 'Runtime.evaluate' && params?.expression === '1') {
+          if (failNextHealthCheck) {
+            failNextHealthCheck = false;
+            throw new Error('Inspected target navigated or closed');
+          }
+          return { result: { value: '1' } };
+        }
+        return {};
+      }),
+      onDetach: { addListener: vi.fn((fn: (s: { tabId?: number }) => void) => { onDetachListeners.push(fn); }) },
+      onEvent: { addListener: vi.fn() },
+    };
+    const chromeObj = {
+      tabs: {
+        get: vi.fn(async () => ({ id: 1, windowId: 1, url: 'https://x.com/home' })),
+        onRemoved: { addListener: vi.fn() },
+        onUpdated: { addListener: vi.fn() },
+      },
+      debugger: debuggerApi,
+      downloads: {
+        // startTime inside the waiter's [armed, completed] window — as in
+        // real Chrome, where the download begins after the wait armed.
+        search: vi.fn(async () => [{
+          id: 91,
+          filename: '/tmp/reattach.bin',
+          url: 'https://app.example/reattach.bin',
+          state: 'complete',
+          totalBytes: 1,
+          startTime: new Date(itemStartMs).toISOString(),
+        } as chrome.downloads.DownloadItem]),
+        onCreated: { addListener: vi.fn(), removeListener: vi.fn() },
+        onChanged: { addListener: vi.fn(), removeListener: vi.fn() },
+      },
+      runtime: { id: 'opencli-test' },
+    };
+    vi.stubGlobal('chrome', chromeObj);
+
+    const mod = await import('./cdp');
+    const promise = mod.waitForDownload('reattach', 5000, 1);
+    const itemStartMs = Date.now(); // after the waiter armed, before completion
+    // First attach completes fully (no gating).
+    await mod.ensureAttached(1);
+    const detachesAfterFirst = (debuggerApi.detach as ReturnType<typeof vi.fn>).mock.calls.length;
+    expect(detachesAfterFirst).toBe(1);
+    let settled = false;
+    const observed = promise.then(() => { settled = true; }, () => { settled = true; });
+    expect(settled).toBe(false);
+
+    // Stale-attach probe fails → a second, genuine attach flow: pause waiter
+    // → force detach (onDetach fires; the paused waiter must NOT be failed)
+    // → re-attach → resume.
+    failNextHealthCheck = true;
+    await mod.evaluate(1, '1');
+    expect((debuggerApi.detach as ReturnType<typeof vi.fn>).mock.calls.length).toBe(detachesAfterFirst + 1);
+    expect(settled).toBe(false); // survived the re-attach window
+
+    // The resumed waiter still resolves from its own tab's Page events.
+    mocklessFirePageEvent(debuggerApi, { tabId: 1 }, 'Page.downloadWillBegin', beginEvent('g-reattach', 'https://app.example/reattach.bin', 'reattach.bin'));
+    mocklessFirePageEvent(debuggerApi, { tabId: 1 }, 'Page.downloadProgress', progressEvent('g-reattach', 'completed'));
+    await vi.waitFor(() => expect(settled).toBe(true));
+    await expect(promise).resolves.toMatchObject({ downloaded: true, id: 91 });
+  });
 });
+
+/** Fire a debugger event through every listener registered on the mock. */
+function mocklessFirePageEvent(
+  debuggerApi: { onEvent: { addListener: ReturnType<typeof vi.fn> } },
+  source: { tabId?: number },
+  method: string,
+  params: unknown,
+): void {
+  for (const call of debuggerApi.onEvent.addListener.mock.calls) {
+    (call[0] as (source: { tabId?: number }, method: string, params: unknown) => void)(source, method, params);
+  }
+}
 
 describe('cdp network capture survives forced re-attach', () => {
   beforeEach(() => {
@@ -476,24 +1194,28 @@ describe('cdp network capture correctness', () => {
   });
 
   function createNetworkMock() {
-    const onEventListeners = [];
+    const onEventListeners: Array<(source: { tabId?: number }, method: string, params: any) => void | Promise<void>> = [];
     const debuggerApi = {
       attach: vi.fn(async () => {}),
       detach: vi.fn(async () => {}),
-      sendCommand: vi.fn(async (_target, method, params) => {
+      sendCommand: vi.fn(async (_target: unknown, method: string, params?: any) => {
         if (method === 'Runtime.evaluate' && params?.expression === '1') return { result: { value: '1' } };
         if (method === 'Network.getRequestPostData') return {}; // no override; use inline postData
         return {};
       }),
       onDetach: { addListener: vi.fn() },
-      onEvent: { addListener: vi.fn((fn) => { onEventListeners.push(fn); }) },
+      onEvent: {
+        addListener: vi.fn((fn: (source: { tabId?: number }, method: string, params: any) => void | Promise<void>) => {
+          onEventListeners.push(fn);
+        }),
+      },
     };
     const tabs = {
       get: vi.fn(async () => ({ id: 1, windowId: 1, url: 'https://x.com/home' })),
       onRemoved: { addListener: vi.fn() },
       onUpdated: { addListener: vi.fn() },
     };
-    const fire = async (method, params) => {
+    const fire = async (method: string, params: any) => {
       for (const fn of onEventListeners) await fn({ tabId: 1 }, method, params);
     };
     return {
@@ -748,7 +1470,7 @@ describe('cdp evaluateInFrame stale context fallback', () => {
   });
 
   it('falls back to the frame target when the cached context id went stale', async () => {
-    const debuggerEventListeners = [];
+    const debuggerEventListeners: Array<(source: { tabId?: number }, method: string, params: any) => void> = [];
     const debuggerApi = {
       attach: vi.fn(async () => {}),
       detach: vi.fn(async () => {}),
@@ -769,7 +1491,11 @@ describe('cdp evaluateInFrame stale context fallback', () => {
         return {};
       }),
       onDetach: { addListener: vi.fn() },
-      onEvent: { addListener: vi.fn((fn) => { debuggerEventListeners.push(fn); }) },
+      onEvent: {
+        addListener: vi.fn((fn: (source: { tabId?: number }, method: string, params: any) => void) => {
+          debuggerEventListeners.push(fn);
+        }),
+      },
     };
     const tabs = {
       get: vi.fn(async () => ({ id: 1, windowId: 1, url: 'https://x.com/home' })),

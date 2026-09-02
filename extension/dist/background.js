@@ -4,6 +4,7 @@ const DAEMON_WS_URL = `ws://${DAEMON_HOST}:${DAEMON_PORT}/ext`;
 const DAEMON_PING_URL = `http://${DAEMON_HOST}:${DAEMON_PORT}/ping`;
 
 const attached = /* @__PURE__ */ new Set();
+const attachInFlight = /* @__PURE__ */ new Map();
 const tabFrameContexts = /* @__PURE__ */ new Map();
 const frameTargets = /* @__PURE__ */ new Map();
 const frameTargetKeys = /* @__PURE__ */ new Map();
@@ -39,6 +40,15 @@ function isDebuggableUrl$1(url) {
   return url.startsWith("http://") || url.startsWith("https://") || url === "about:blank" || url.startsWith("data:");
 }
 async function ensureAttached(tabId, aggressiveRetry = false) {
+  const inFlight = attachInFlight.get(tabId);
+  if (inFlight) return inFlight;
+  const flow = ensureAttachedInternal(tabId, aggressiveRetry).finally(() => {
+    attachInFlight.delete(tabId);
+  });
+  attachInFlight.set(tabId, flow);
+  return flow;
+}
+async function ensureAttachedInternal(tabId, aggressiveRetry) {
   try {
     const tab = await chrome.tabs.get(tabId);
     if (!isDebuggableUrl$1(tab.url)) {
@@ -66,6 +76,7 @@ async function ensureAttached(tabId, aggressiveRetry = false) {
   let lastError = "";
   const preservedNetworkCapture = networkCaptures.get(tabId);
   const preservedWsCapture = wsCaptures.get(tabId);
+  const pausedDownloadWaiters = pauseTabDownloadWaiters(tabId);
   for (let attempt = 1; attempt <= MAX_ATTACH_RETRIES; attempt++) {
     try {
       try {
@@ -103,6 +114,7 @@ async function ensureAttached(tabId, aggressiveRetry = false) {
     }
     console.warn(`[opencli] attach failed for tab ${tabId}: url=${finalUrl}, windowId=${finalWindowId}, error=${lastError}`);
     const hint = lastError.includes("chrome-extension://") ? ". Tip: another Chrome extension may be interfering — try disabling other extensions" : "";
+    failPausedTabDownloadWaiters(pausedDownloadWaiters, `CDP attach failed: ${lastError}`);
     throw new Error(`attach failed: ${lastError}${hint}`);
   }
   attached.add(tabId);
@@ -110,6 +122,8 @@ async function ensureAttached(tabId, aggressiveRetry = false) {
     await sendDebuggerCommand({ tabId }, "Runtime.enable");
   } catch {
   }
+  await sendDebuggerCommand({ tabId }, "Page.enable").catch(() => {
+  });
   if (preservedNetworkCapture || preservedWsCapture) {
     try {
       await sendDebuggerCommand({ tabId }, "Network.enable");
@@ -118,6 +132,7 @@ async function ensureAttached(tabId, aggressiveRetry = false) {
     } catch {
     }
   }
+  resumeTabDownloadWaiters(tabId, pausedDownloadWaiters);
 }
 async function evaluate(tabId, expression, aggressiveRetry = false, timeoutMs = CDP_COMMAND_TIMEOUT_MS) {
   try {
@@ -353,17 +368,41 @@ async function releaseRuntimeObject(tabId, objectId) {
   } catch {
   }
 }
-function matchesDownloadPattern(item, pattern) {
+const tabDownloadWaiters = /* @__PURE__ */ new Map();
+const claimedDownloadIds = /* @__PURE__ */ new Set();
+let downloadListenersRegistered = false;
+function matchesDownloadEvidence(waiter, ...evidence) {
+  const pattern = waiter.pattern.toLowerCase();
   if (!pattern) return true;
-  const haystack = [
-    item.filename,
-    item.url,
-    item.finalUrl,
-    item.mime
-  ].filter(Boolean).join("\n").toLowerCase();
-  return haystack.includes(pattern.toLowerCase());
+  return evidence.some((value) => typeof value === "string" && value.toLowerCase().includes(pattern));
 }
-function downloadResult(item, startedAt) {
+function claimDownloadId(waiter, id) {
+  if (waiter.claimedId !== void 0) return false;
+  if (claimedDownloadIds.has(id)) return false;
+  claimedDownloadIds.add(id);
+  waiter.claimedId = id;
+  return true;
+}
+function releaseOrphanClaims(waiter) {
+  if (waiter.claimedId === void 0) return;
+  claimedDownloadIds.delete(waiter.claimedId);
+  waiter.claimedId = void 0;
+}
+function hasCompletedGuid(waiter) {
+  for (const state of waiter.progress.values()) {
+    if (state.state === "completed") return true;
+  }
+  return false;
+}
+function correlateCompletedGuids(waiter) {
+  if (waiter.resolved || waiter.claimedId !== void 0) return;
+  for (const guid of waiter.begins.keys()) {
+    if (waiter.progress.get(guid)?.state === "completed") {
+      void correlateDownloadItem(waiter, guid);
+    }
+  }
+}
+function downloadResultFromItem(item, startedAt) {
   return {
     downloaded: item.state === "complete",
     id: item.id,
@@ -378,69 +417,208 @@ function downloadResult(item, startedAt) {
     elapsedMs: Date.now() - startedAt
   };
 }
-async function waitForDownload(pattern = "", timeoutMs = 3e4) {
-  const startedAt = Date.now();
-  const timeout = Math.max(1, timeoutMs);
-  return await new Promise((resolve) => {
-    let done = false;
-    const inProgressIds = /* @__PURE__ */ new Set();
-    const finish = (result) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      chrome.downloads.onCreated.removeListener(onCreated);
-      chrome.downloads.onChanged.removeListener(onChanged);
-      resolve(result);
-    };
-    const inspectById = async (id) => {
-      const items = await chrome.downloads.search({ id });
-      const item = items[0];
-      if (!item || !matchesDownloadPattern(item, pattern)) return;
-      inProgressIds.add(id);
-      if (item.state === "complete" || item.state === "interrupted") finish(downloadResult(item, startedAt));
-    };
-    const onCreated = (item) => {
-      if (!matchesDownloadPattern(item, pattern)) return;
-      inProgressIds.add(item.id);
-      if (item.state === "complete" || item.state === "interrupted") finish(downloadResult(item, startedAt));
-    };
-    const onChanged = (delta) => {
-      if (!delta.id) return;
-      if (!inProgressIds.has(delta.id) && !delta.filename && !delta.url) return;
-      if (delta.filename?.current || delta.url?.current) {
-        void inspectById(delta.id);
+async function correlateDownloadItem(waiter, guid) {
+  if (waiter.resolved || waiter.claimedId !== void 0) return;
+  const begin = waiter.begins.get(guid);
+  const beginEvidence = [begin?.url, begin?.suggestedFilename].filter(
+    (value) => typeof value === "string" && value.length > 0
+  ).map((value) => value.toLowerCase());
+  const completedAt = waiter.progress.get(guid)?.completedAt;
+  const startedAfter = new Date(waiter.startedAt).toISOString();
+  try {
+    const recent = await chrome.downloads.search({
+      limit: 100,
+      orderBy: ["-startTime"],
+      startedAfter
+    });
+    if (waiter.resolved || waiter.claimedId !== void 0) return;
+    for (const item of recent) {
+      const evidence = [item.url, item.finalUrl, item.filename];
+      if (!matchesDownloadEvidence(waiter, ...evidence)) continue;
+      if (beginEvidence.length && !evidenceOverlapsBegin(beginEvidence, evidence)) continue;
+      const itemStartedAt = Date.parse(item.startTime);
+      if (Number.isNaN(itemStartedAt) || itemStartedAt < waiter.startedAt) continue;
+      if (completedAt !== void 0 && itemStartedAt > completedAt) continue;
+      if (!claimDownloadId(waiter, item.id)) continue;
+      if (item.state === "complete" || item.state === "interrupted") {
+        waiter.finish(downloadResultFromItem(item, waiter.startedAt));
         return;
       }
-      if (delta.state?.current === "complete" || delta.state?.current === "interrupted") {
-        void inspectById(delta.id);
+      return;
+    }
+  } catch {
+  }
+}
+function evidenceOverlapsBegin(beginEvidence, itemEvidence) {
+  return beginEvidence.some(
+    (beginValue) => itemEvidence.some((itemValue) => {
+      if (!itemValue) return false;
+      const itemValueLower = itemValue.toLowerCase();
+      return itemValueLower.includes(beginValue) || beginValue.includes(itemValueLower);
+    })
+  );
+}
+function tabWaitersFor(tabId) {
+  return tabDownloadWaiters.get(tabId);
+}
+function pauseTabDownloadWaiters(tabId) {
+  const waiters = tabWaitersFor(tabId);
+  if (!waiters) return [];
+  tabDownloadWaiters.delete(tabId);
+  return [...waiters];
+}
+function resumeTabDownloadWaiters(tabId, paused) {
+  if (!paused.length) return;
+  const waiters = tabWaitersFor(tabId) ?? /* @__PURE__ */ new Set();
+  for (const waiter of paused) {
+    if (!waiter.resolved) waiters.add(waiter);
+  }
+  if (waiters.size) tabDownloadWaiters.set(tabId, waiters);
+}
+function failPausedTabDownloadWaiters(paused, error) {
+  for (const waiter of paused) {
+    waiter.finish({
+      downloaded: false,
+      state: "interrupted",
+      error,
+      elapsedMs: Date.now() - waiter.startedAt
+    });
+  }
+}
+function registerDownloadEventRouting() {
+  if (downloadListenersRegistered) return;
+  downloadListenersRegistered = true;
+  chrome.debugger.onEvent.addListener((source, method, params) => {
+    const tabId = source.tabId;
+    if (!tabId) return;
+    if (method !== "Page.downloadWillBegin" && method !== "Page.downloadProgress") return;
+    const eventParams = params;
+    const waiters = tabWaitersFor(tabId);
+    if (!waiters || !waiters.size) return;
+    if (method === "Page.downloadWillBegin") {
+      const guid2 = String(eventParams?.guid ?? "");
+      if (!guid2) return;
+      const evidence = {
+        url: String(eventParams?.url ?? ""),
+        suggestedFilename: String(eventParams?.suggestedFilename ?? "")
+      };
+      for (const waiter of [...waiters]) {
+        waiter.begins.set(guid2, evidence);
+      }
+      return;
+    }
+    const guid = String(eventParams?.guid ?? "");
+    const state = String(eventParams?.state ?? "");
+    if (!guid || !state) return;
+    const completedAt = state === "completed" ? Date.now() : void 0;
+    for (const waiter of [...waiters]) {
+      waiter.progress.set(guid, { state, completedAt });
+      const begin = waiter.begins.get(guid);
+      if (!begin || !matchesDownloadEvidence(waiter, begin.url, begin.suggestedFilename)) continue;
+      if (state === "completed") {
+        void correlateDownloadItem(waiter, guid);
+      } else if (state === "canceled") {
+        waiter.finish({
+          downloaded: false,
+          state: "interrupted",
+          error: `Download canceled before completion (url=${begin.url || "unknown"})`,
+          elapsedMs: Date.now() - waiter.startedAt
+        });
+      }
+    }
+  });
+  chrome.debugger.onDetach.addListener((source) => {
+    if (!source.tabId) return;
+    const waiters = tabWaitersFor(source.tabId);
+    if (!waiters) return;
+    tabDownloadWaiters.delete(source.tabId);
+    for (const waiter of waiters) {
+      waiter.finish({
+        downloaded: false,
+        state: "interrupted",
+        error: "Debugger detached from the tab while waiting for download",
+        elapsedMs: Date.now() - waiter.startedAt
+      });
+    }
+  });
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    const waiters = tabWaitersFor(tabId);
+    if (!waiters) return;
+    tabDownloadWaiters.delete(tabId);
+    for (const waiter of waiters) {
+      waiter.finish({
+        downloaded: false,
+        state: "interrupted",
+        error: "Tab closed while waiting for download",
+        elapsedMs: Date.now() - waiter.startedAt
+      });
+    }
+  });
+  chrome.downloads.onChanged.addListener((delta) => {
+    if (!delta.id) return;
+    for (const waiters of tabDownloadWaiters.values()) {
+      for (const waiter of waiters) {
+        if (waiter.claimedId === delta.id) {
+          if (delta.state?.current === "complete" || delta.state?.current === "interrupted") {
+            void chrome.downloads.search({ id: delta.id }).then((items) => {
+              const item = items[0];
+              if (item && !waiter.resolved) waiter.finish(downloadResultFromItem(item, waiter.startedAt));
+            }).catch(() => {
+            });
+          }
+          continue;
+        }
+        if (hasCompletedGuid(waiter) && (delta.filename?.current || delta.url?.current || delta.state?.current)) {
+          correlateCompletedGuids(waiter);
+        }
+      }
+    }
+  });
+  chrome.downloads.onCreated.addListener((item) => {
+    for (const waiters of tabDownloadWaiters.values()) {
+      for (const waiter of waiters) {
+        if (waiter.claimedId !== void 0) continue;
+        if (hasCompletedGuid(waiter)) correlateCompletedGuids(waiter);
+      }
+    }
+  });
+}
+async function waitForDownload(pattern, timeoutMs, tabId) {
+  const startedAt = Date.now();
+  const timeout = Math.max(1, timeoutMs);
+  registerDownloadEventRouting();
+  return await new Promise((resolve) => {
+    const waiter = {
+      pattern,
+      startedAt,
+      begins: /* @__PURE__ */ new Map(),
+      progress: /* @__PURE__ */ new Map(),
+      resolved: false,
+      finish: (result) => {
+        if (waiter.resolved) return false;
+        waiter.resolved = true;
+        clearTimeout(timer);
+        const waiters2 = tabWaitersFor(tabId);
+        waiters2?.delete(waiter);
+        if (waiters2 && !waiters2.size) tabDownloadWaiters.delete(tabId);
+        if (!result.downloaded) releaseOrphanClaims(waiter);
+        resolve(result);
+        return true;
       }
     };
     const timer = setTimeout(() => {
-      finish({
+      waiter.finish({
         downloaded: false,
         state: "interrupted",
         error: `No download matched "${pattern || "*"}" within ${timeout}ms`,
         elapsedMs: Date.now() - startedAt
       });
     }, timeout);
-    chrome.downloads.onCreated.addListener(onCreated);
-    chrome.downloads.onChanged.addListener(onChanged);
-    void chrome.downloads.search({
-      limit: 50,
-      orderBy: ["-startTime"],
-      startedAfter: new Date(startedAt - Math.max(timeout, 1e3)).toISOString()
-    }).then((recent) => {
-      if (done) return;
-      const completed = recent.find((item) => item.state === "complete" && matchesDownloadPattern(item, pattern));
-      if (completed) {
-        finish(downloadResult(completed, startedAt));
-        return;
-      }
-      for (const item of recent) {
-        if (item.state === "in_progress" && matchesDownloadPattern(item, pattern)) inProgressIds.add(item.id);
-      }
-    }).catch((err) => {
-      finish({
+    const waiters = tabWaitersFor(tabId) ?? /* @__PURE__ */ new Set();
+    waiters.add(waiter);
+    tabDownloadWaiters.set(tabId, waiters);
+    void ensureAttached(tabId).catch((err) => {
+      waiter.finish({
         downloaded: false,
         state: "interrupted",
         error: err instanceof Error ? err.message : String(err),
@@ -2022,7 +2200,7 @@ async function handleCommand(cmd) {
       case "ws-capture-stop":
         return await handleWsCaptureStop(cmd, leaseKey);
       case "wait-download":
-        return await handleWaitDownload(cmd);
+        return await handleWaitDownload(cmd, leaseKey);
       case "frames":
         return await handleFrames(cmd, leaseKey);
       default:
@@ -2685,9 +2863,15 @@ async function handleWsCaptureStop(cmd, leaseKey) {
     return errorResult(cmd.id, err);
   }
 }
-async function handleWaitDownload(cmd) {
+async function handleWaitDownload(cmd, leaseKey) {
   try {
-    const data = await waitForDownload(cmd.pattern ?? "", cmd.timeoutMs ?? 3e4);
+    const cmdTabId = await resolveCommandTabId(cmd);
+    const tabId = await resolveTabId(cmdTabId, leaseKey);
+    const data = await waitForDownload(
+      cmd.pattern ?? "",
+      cmd.timeoutMs ?? 3e4,
+      tabId
+    );
     return { id: cmd.id, ok: true, data };
   } catch (err) {
     return errorResult(cmd.id, err);
