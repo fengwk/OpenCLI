@@ -1087,14 +1087,14 @@ async function ensureOwnedContainerWindowUnlocked(
       const group = await ensureOwnedContainerGroup(role, container.windowId, []);
       if (group) {
         await focusOwnedWindowIfRequested(group.windowId, mode);
-        const initialTabId = await findReusableOwnedContainerTab(group.windowId, group.id);
+        const initialTabId = await findReusableOwnedContainerTab(group.windowId, group.id, initialUrl);
         return {
           windowId: group.windowId,
           initialTabId,
         };
       }
       await focusOwnedWindowIfRequested(container.windowId, mode);
-      const initialTabId = await findReusableOwnedContainerTab(container.windowId, null);
+      const initialTabId = await findReusableOwnedContainerTab(container.windowId, null, initialUrl);
       const createdGroup = await ensureOwnedContainerGroup(role, container.windowId, [initialTabId]);
       if (createdGroup) {
         return {
@@ -1115,7 +1115,7 @@ async function ensureOwnedContainerWindowUnlocked(
   const existingGroup = await ensureOwnedContainerGroup(role, null, []);
   if (existingGroup) {
     await focusOwnedWindowIfRequested(existingGroup.windowId, mode);
-    const initialTabId = await findReusableOwnedContainerTab(existingGroup.windowId, existingGroup.id);
+    const initialTabId = await findReusableOwnedContainerTab(existingGroup.windowId, existingGroup.id, initialUrl);
     await persistRuntimeState();
     return {
       windowId: existingGroup.windowId,
@@ -1192,25 +1192,36 @@ async function ensureOwnedContainerWindowUnlocked(
   return { windowId: group?.windowId ?? container.windowId, initialTabId };
 }
 
-async function findReusableOwnedContainerTab(windowId: number, ownedGroupId?: number | null): Promise<number | undefined> {
+async function findReusableOwnedContainerTab(
+  windowId: number,
+  ownedGroupId?: number | null,
+  targetUrl?: string,
+): Promise<number | undefined> {
   try {
     const tabs = await chrome.tabs.query({ windowId });
     // When a canonical owned group lives in a user window (cross-window
     // convergence can land it there), an http(s) tab outside the group is
     // user content and must not be reused. Group members and non-http tabs
-    // (about:blank / data: / fresh container) stay eligible. A null group id
-    // means no ownership signal exists, so only non-http placeholders qualify.
-    const reusable = tabs.find(tab =>
+    // (about:blank / data: / fresh container) stay eligible. The dedicated
+    // adapter windowId is itself an ownership signal, so its released warm
+    // http(s) tabs are safe to reuse. A null group id in any other window means
+    // no ownership signal exists, so only non-http placeholders qualify.
+    const dedicatedAdapterWindow = ownedContainers.automation.windowId === windowId;
+    const reusable = tabs.filter(tab =>
       tab.id !== undefined &&
       initialTabIsAvailable(tab.id) &&
       isDebuggableUrl(tab.url) &&
       (
+        dedicatedAdapterWindow ||
         ownedGroupId === undefined ||
         (ownedGroupId !== null && tab.groupId === ownedGroupId) ||
         !isSafeNavigationUrl(tab.url ?? '')
       ),
     );
-    return reusable?.id;
+    const exactTarget = targetUrl
+      ? reusable.find(tab => isTargetUrl(tab.url, targetUrl))
+      : undefined;
+    return (exactTarget ?? reusable[0])?.id;
   } catch {
     return undefined;
   }
@@ -1732,7 +1743,10 @@ async function resolveTab(tabId: number | undefined, leaseKey: string, initialUr
   const role = getOwnedWindowRole(leaseKey);
   const group = existingSession?.owned ? await ensureOwnedContainerGroup(role, windowId, []) : null;
   const scopedWindowId = group?.windowId ?? windowId;
-  const reusableTabId = await findReusableOwnedContainerTab(scopedWindowId, existingSession?.owned ? (group?.id ?? null) : undefined);
+  const reusableTabId = await findReusableOwnedContainerTab(
+    scopedWindowId,
+    existingSession?.owned ? (group?.id ?? null) : undefined,
+  );
   if (reusableTabId !== undefined) return { tabId: reusableTabId, tab: await chrome.tabs.get(reusableTabId) };
 
   // No debuggable tab — another extension may have hijacked the tab URL.
@@ -2328,6 +2342,10 @@ async function handleWaitDownload(cmd: Command, leaseKey: string): Promise<Resul
 }
 
 async function releaseLease(leaseKey: string, reason: string = 'released'): Promise<void> {
+  return withLeaseMutation(() => releaseLeaseUnlocked(leaseKey, reason));
+}
+
+async function releaseLeaseUnlocked(leaseKey: string, reason: string): Promise<void> {
   const session = automationSessions.get(leaseKey);
   if (!session) {
     sessionOverrides.delete(leaseKey);
@@ -2342,26 +2360,30 @@ async function releaseLease(leaseKey: string, reason: string = 'released'): Prom
   if (session.owned) {
     const tabId = session.preferredTabId;
     if (tabId !== null) {
-      const hasOtherOwnedLease = [...automationSessions.entries()].some(([otherLease, otherSession]) =>
-        otherLease !== leaseKey &&
-        otherSession.owned &&
-        otherSession.windowId === session.windowId &&
-        otherSession.preferredTabId !== null,
-      );
       await safeDetach(tabId);
       identity.evictTab(tabId);
-      if (hasOtherOwnedLease) {
-        await chrome.tabs.remove(tabId).catch(() => {});
-        console.log(`[opencli] Released owned tab lease ${tabId} (session=${session.session}, surface=${session.surface}, ${reason})`);
+      if (session.surface === 'adapter' && session.lifecycle === 'ephemeral') {
+        console.log(`[opencli] Released ephemeral adapter tab lease ${tabId} as a warm reusable tab (session=${session.session}, ${reason})`);
       } else {
-        try {
-          const tab = await chrome.tabs.update(tabId, { url: BLANK_PAGE, active: true });
-          const group = await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), session.windowId, [tab.id ?? tabId]);
-          if (group) session.windowId = group.windowId;
-          console.log(`[opencli] Released owned tab lease ${tabId} as reusable placeholder (session=${session.session}, surface=${session.surface}, ${reason})`);
-        } catch {
+        const hasOtherOwnedLease = [...automationSessions.entries()].some(([otherLease, otherSession]) =>
+          otherLease !== leaseKey &&
+          otherSession.owned &&
+          otherSession.windowId === session.windowId &&
+          otherSession.preferredTabId !== null,
+        );
+        if (hasOtherOwnedLease) {
           await chrome.tabs.remove(tabId).catch(() => {});
           console.log(`[opencli] Released owned tab lease ${tabId} (session=${session.session}, surface=${session.surface}, ${reason})`);
+        } else {
+          try {
+            const tab = await chrome.tabs.update(tabId, { url: BLANK_PAGE, active: true });
+            const group = await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), session.windowId, [tab.id ?? tabId]);
+            if (group) session.windowId = group.windowId;
+            console.log(`[opencli] Released owned tab lease ${tabId} as reusable placeholder (session=${session.session}, surface=${session.surface}, ${reason})`);
+          } catch {
+            await chrome.tabs.remove(tabId).catch(() => {});
+            console.log(`[opencli] Released owned tab lease ${tabId} (session=${session.session}, surface=${session.surface}, ${reason})`);
+          }
         }
       }
     } else {

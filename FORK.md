@@ -21,6 +21,14 @@ Use it when merging back to mainline or rebasing onto upstream.
 
 ## Changelog (fork)
 
+### Unreleased
+
+#### Ephemeral warm-tab reuse
+
+| Area | Change | Paths |
+|------|--------|-------|
+| adapter tab lifecycle | Releasing an owned ephemeral adapter lease now detaches automation state but leaves the tab open at its current URL. Later ephemeral sessions may reuse an idle tab from the dedicated adapter window, preferring an exact target URL; actively leased tabs remain ineligible. Persistent and borrowed-tab cleanup semantics are unchanged. | `extension/src/background.ts`, `extension/src/background.test.ts` |
+
 ### 2026-09-02
 
 #### Tab-scoped downloads & attach lifecycle
@@ -97,8 +105,8 @@ CLI `1.8.7-fengwk.9` and extension `1.0.30`.
 
 | Component | Version |
 |-----------|---------|
-| CLI (`@jackwener/opencli`) | `1.8.7-fengwk.10` |
-| Extension | `1.0.31` (`compatRange`: `>=1.8.7`) |
+| CLI (`@jackwener/opencli`) | `1.8.7-fengwk.11` unreleased (latest release: `1.8.7-fengwk.10`) |
+| Extension | `1.0.32` unreleased (`compatRange`: `>=1.8.7`; latest released pair: `1.0.31`) |
 
 ### Auto-update policy (fork)
 
@@ -152,15 +160,15 @@ npm ci
 
 Artifacts (version-based names, no timestamps):
 
-- `jackwener-opencli-1.8.7-fengwk.10.tgz`
-- `opencli-extension-v1.0.31.zip`
+- `jackwener-opencli-1.8.7-fengwk.11.tgz`
+- `opencli-extension-v1.0.32.zip`
 - `SHA256SUMS`
 - `build-info.json`
 
 ```bash
 # install CLI from the tarball (not npm publish)
-npm install -g ./artifacts/jackwener-opencli-1.8.7-fengwk.10.tgz
-opencli --version   # → 1.8.7-fengwk.10
+npm install -g ./artifacts/jackwener-opencli-1.8.7-fengwk.11.tgz
+opencli --version   # → 1.8.7-fengwk.11
 
 # plugin
 opencli plugin install ~/proj/my-opencli/packages/chatgpt-agent

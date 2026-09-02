@@ -1004,12 +1004,14 @@ describe('background tab isolation', () => {
     expect(mod.__test__.getSession(adapterKey('twitter'))?.preferredTabId).toBe(1);
   });
 
-  it('keeps legacy implicit close bound to the preferred page', async () => {
-    const { chrome } = createChromeMock();
+  it('releases an implicit ephemeral adapter lease without clearing its preferred page', async () => {
+    const { chrome, tabs } = createChromeMock();
+    tabs[0].url = 'https://chatgpt.com/c/warm';
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
     mod.__test__.setSession(adapterKey('twitter'), { windowId: 1, owned: true, preferredTabId: 1 });
+    chrome.tabs.update.mockClear();
 
     const result = await mod.__test__.handleTabs(
       { id: 'implicit-close', action: 'tabs', op: 'close', session: adapterKey('twitter') },
@@ -1017,7 +1019,9 @@ describe('background tab isolation', () => {
     );
 
     expect(result).toEqual({ id: 'implicit-close', ok: true, data: { closed: 'target-1' } });
-    expect(chrome.tabs.update).toHaveBeenCalledWith(1, { url: 'about:blank', active: true });
+    expect(chrome.tabs.remove).not.toHaveBeenCalled();
+    expect(chrome.tabs.update).not.toHaveBeenCalled();
+    expect(tabs.find((tab) => tab.id === 1)?.url).toBe('https://chatgpt.com/c/warm');
     expect(mod.__test__.getSession(adapterKey('twitter'))).toBeNull();
   });
 
@@ -1391,34 +1395,138 @@ describe('background tab isolation', () => {
     expect(create).toHaveBeenCalledWith({ windowId: 1, url: 'about:blank', active: true });
   });
 
-  it('releases owned sessions without closing the shared container', async () => {
-    const { chrome } = createChromeMock();
+  it('retains released ephemeral tabs and reuses an exact warm target without disturbing an active lease', async () => {
+    const { chrome, tabs, create, update } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
+    const detachStarted = deferred<void>();
+    const allowDetach = deferred<void>();
+    vi.doMock('./cdp', () => ({
+      registerListeners: vi.fn(),
+      detach: vi.fn(async (tabId: number) => {
+        if (tabId !== 10) return;
+        detachStarted.resolve();
+        await allowDetach.promise;
+      }),
+    }));
 
     const mod = await import('./background');
-    await mod.__test__.resolveTabId(undefined, adapterKey('first'));
-    await mod.__test__.resolveTabId(undefined, adapterKey('second'));
-    expect(mod.__test__.getSession(adapterKey('second'))).toEqual(expect.objectContaining({ preferredTabId: 10 }));
+    const firstUrl = 'https://chatgpt.com/c/first';
+    const secondUrl = 'https://chatgpt.com/c/second';
+    await mod.__test__.handleCommand({
+      id: 'nav-first',
+      action: 'navigate',
+      session: 'first',
+      surface: 'adapter',
+      siteSession: 'ephemeral',
+      url: firstUrl,
+    });
+    await mod.__test__.handleCommand({
+      id: 'nav-second',
+      action: 'navigate',
+      session: 'second',
+      surface: 'adapter',
+      siteSession: 'ephemeral',
+      url: secondUrl,
+    });
+    const firstTabId = mod.__test__.getSession(adapterKey('first'))?.preferredTabId;
+    const secondTabId = mod.__test__.getSession(adapterKey('second'))?.preferredTabId;
+    expect(firstTabId).toBe(1);
+    expect(secondTabId).toBe(10);
+    const activeTabSnapshot = { ...tabs.find((tab) => tab.id === firstTabId) };
 
-    const closeSecond = await mod.__test__.handleCommand({ id: 'close-second', action: 'close-window', session: 'second', surface: 'adapter' });
+    create.mockClear();
+    update.mockClear();
+    chrome.tabs.remove.mockClear();
+
+    const closeSecondPromise = mod.__test__.handleCommand({ id: 'close-second', action: 'close-window', session: 'second', surface: 'adapter' });
+    await detachStarted.promise;
+    const thirdPromise = mod.__test__.handleCommand({
+      id: 'nav-third',
+      action: 'navigate',
+      session: 'third',
+      surface: 'adapter',
+      siteSession: 'ephemeral',
+      url: secondUrl,
+    });
+    await Promise.resolve();
+    expect(mod.__test__.getSession(adapterKey('third'))).toBeNull();
+    expect(create).not.toHaveBeenCalled();
+    allowDetach.resolve();
+
+    const [closeSecond, third] = await Promise.all([closeSecondPromise, thirdPromise]);
     expect(closeSecond).toEqual(expect.objectContaining({ ok: true }));
-    expect(chrome.tabs.remove).toHaveBeenCalledWith(10);
-    expect(chrome.tabs.update).not.toHaveBeenCalledWith(10, { url: 'about:blank', active: true });
+    expect(chrome.tabs.remove).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
     expect(chrome.windows.remove).not.toHaveBeenCalled();
-    expect(mod.__test__.getSession(adapterKey('first'))).not.toBeNull();
+    expect(mod.__test__.getSession(adapterKey('first'))).toEqual(expect.objectContaining({ preferredTabId: firstTabId }));
     expect(mod.__test__.getSession(adapterKey('second'))).toBeNull();
+    expect(tabs.find((tab) => tab.id === firstTabId)).toEqual(activeTabSnapshot);
+    expect(tabs.find((tab) => tab.id === firstTabId)?.url).toBe(firstUrl);
+    expect(tabs.find((tab) => tab.id === secondTabId)?.url).toBe(secondUrl);
 
-    await mod.__test__.handleCommand({ id: 'close-first', action: 'close-window', session: 'first', surface: 'adapter' });
-    expect(chrome.tabs.update).toHaveBeenCalledWith(1, { url: 'about:blank' });
+    expect(third).toEqual(expect.objectContaining({ ok: true, page: `target-${secondTabId}` }));
+    expect(mod.__test__.getSession(adapterKey('third'))).toEqual(expect.objectContaining({ preferredTabId: secondTabId }));
+    expect(mod.__test__.getSession(adapterKey('first'))).toEqual(expect.objectContaining({ preferredTabId: firstTabId }));
+    expect(tabs.find((tab) => tab.id === firstTabId)).toEqual(activeTabSnapshot);
+    expect(create).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
     expect(chrome.windows.remove).not.toHaveBeenCalled();
   });
 
+  it('preserves persistent adapter tab cleanup behavior', async () => {
+    const { chrome, update } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    await mod.__test__.handleCommand({
+      id: 'persistent-first',
+      action: 'navigate',
+      session: 'persistent-first',
+      surface: 'adapter',
+      siteSession: 'persistent',
+      url: 'https://chatgpt.com/c/persistent-first',
+    });
+    await mod.__test__.handleCommand({
+      id: 'persistent-second',
+      action: 'navigate',
+      session: 'persistent-second',
+      surface: 'adapter',
+      siteSession: 'persistent',
+      url: 'https://chatgpt.com/c/persistent-second',
+    });
+    const firstTabId = mod.__test__.getSession(adapterKey('persistent-first'))?.preferredTabId;
+    const secondTabId = mod.__test__.getSession(adapterKey('persistent-second'))?.preferredTabId;
+    update.mockClear();
+    chrome.tabs.remove.mockClear();
+
+    await mod.__test__.handleCommand({
+      id: 'persistent-close-second',
+      action: 'close-window',
+      session: 'persistent-second',
+      surface: 'adapter',
+    });
+    expect(chrome.tabs.remove).toHaveBeenCalledWith(secondTabId);
+    expect(update).not.toHaveBeenCalled();
+
+    chrome.tabs.remove.mockClear();
+    await mod.__test__.handleCommand({
+      id: 'persistent-close-first',
+      action: 'close-window',
+      session: 'persistent-first',
+      surface: 'adapter',
+    });
+    expect(chrome.tabs.remove).not.toHaveBeenCalled();
+    expect(update).toHaveBeenCalledWith(firstTabId, { url: 'about:blank', active: true });
+  });
+
   it('releases the current owned tab lease when tabs close targets it', async () => {
-    const { chrome } = createChromeMock();
+    const { chrome, tabs } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
     await mod.__test__.resolveTabId(undefined, adapterKey('twitter'));
+    tabs[0].url = 'https://chatgpt.com/c/current';
+    chrome.tabs.update.mockClear();
 
     const result = await mod.__test__.handleTabs(
       { id: 'close-current-lease', action: 'tabs', op: 'close', session: adapterKey('twitter') },
@@ -1430,12 +1538,14 @@ describe('background tab isolation', () => {
       ok: true,
       data: { closed: 'target-1' },
     }));
-    expect(chrome.tabs.update).toHaveBeenCalledWith(1, { url: 'about:blank', active: true });
+    expect(chrome.tabs.remove).not.toHaveBeenCalled();
+    expect(chrome.tabs.update).not.toHaveBeenCalled();
+    expect(tabs.find((tab) => tab.id === 1)?.url).toBe('https://chatgpt.com/c/current');
     expect(chrome.windows.remove).not.toHaveBeenCalled();
     expect(mod.__test__.getSession(adapterKey('twitter'))).toBeNull();
   });
 
-  it('reconciles an owned adapter container with no stored leases without closing it or grouping new tabs', async () => {
+  it('reuses a retained warm tab after restoring an adapter container with no stored leases', async () => {
     const { chrome, tabs, groups } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
     await chrome.storage.session.set({
@@ -1456,11 +1566,10 @@ describe('background tab isolation', () => {
 
     const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'), 'https://after.example');
 
-    expect(tabId).not.toBe(1);
+    expect(tabId).toBe(1);
     expect(chrome.windows.create).not.toHaveBeenCalled();
-    expect(tabs.find((tab) => tab.id === 1)?.url).toBe('https://automation.example');
+    expect(tabs.find((tab) => tab.id === 1)?.url).toBe('https://after.example');
     expect(tabs.find((tab) => tab.id === 1)?.groupId).toBe(-1);
-    expect(tabs.find((tab) => tab.id === tabId)?.url).toBe('https://after.example');
     expect(tabs.find((tab) => tab.id === tabId)?.groupId).toBe(-1);
     expect(groups).toEqual([]);
   });
@@ -1824,14 +1933,23 @@ describe('background tab isolation', () => {
     expect(chrome.tabGroups.update).not.toHaveBeenCalled();
   });
 
-  it('does not reuse a user http tab from an adapter-owned window without an owned lease signal', async () => {
+  it('prefers an exact warm target in a restored adapter container', async () => {
     const { chrome, tabs } = createChromeMock();
+    tabs.push({
+      id: 77,
+      windowId: 1,
+      url: 'https://after.example',
+      title: 'warm target',
+      active: false,
+      status: 'complete',
+      groupId: -1,
+    });
     vi.stubGlobal('chrome', chrome);
     await chrome.storage.session.set({
       opencli_target_lease_registry_v2: {
         version: 2,
         contextId: 'user-default',
-        ownedContainers: { interactive: { windowId: null }, automation: { windowId: 1, groupId: 99 } },
+        ownedContainers: { interactive: { windowId: null }, automation: { windowId: 1 } },
         leases: {},
       },
     });
@@ -1839,14 +1957,16 @@ describe('background tab isolation', () => {
     const mod = await import('./background');
     await mod.__test__.reconcileTargetLeaseRegistry();
     chrome.windows.create.mockClear();
+    chrome.tabs.update.mockClear();
 
     const tabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'), 'https://after.example');
 
-    expect(tabId).not.toBe(1);
+    expect(tabId).toBe(77);
     expect(chrome.windows.create).not.toHaveBeenCalled();
+    expect(chrome.tabs.update).not.toHaveBeenCalled();
     expect(tabs.find((tab) => tab.id === 1)?.url).toBe('https://automation.example');
-    expect(tabs.find((tab) => tab.id === tabId)?.url).toBe('https://after.example');
-    expect(tabs.find((tab) => tab.id === tabId)?.groupId).toBe(-1);
+    expect(tabs.find((tab) => tab.id === 77)?.url).toBe('https://after.example');
+    expect(tabs.find((tab) => tab.id === 77)?.groupId).toBe(-1);
   });
 
   it('does not group borrowed user tabs for bound sessions', async () => {
@@ -2381,8 +2501,10 @@ describe('background tab isolation', () => {
     // the canonical group is re-found in memory via the title layer instead.
     expect(finalRegistry.ownedContainers.interactive.groupId).toBeUndefined();
     expect(mod.__test__.getInteractiveContainer().groupId).toBe(200);
-    // The lease was released down the proper owned-placeholder path, not wiped.
-    expect(chrome.tabs.update).toHaveBeenCalledWith(1, { url: 'about:blank', active: true });
+    // The recovered ephemeral lease was released normally and its warm tab
+    // remained untouched instead of the registry being blindly wiped.
+    expect(chrome.tabs.update).not.toHaveBeenCalled();
+    expect(chrome.tabs.remove).not.toHaveBeenCalled();
     expect(mod.__test__.getSession(adapterKey('twitter'))).toBeNull();
   });
 

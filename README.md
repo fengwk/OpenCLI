@@ -171,7 +171,7 @@ When the site you need is not yet covered, use the `opencli-adapter-author` skil
 |----------|---------|-------------|
 | `OPENCLI_PROFILE` | — | Browser Bridge profile alias/contextId to use when multiple Chrome profiles are connected |
 | `OPENCLI_WINDOW` | command default | Set to `foreground` or `background` to override Browser Bridge window placement. Browser-backed commands also accept `--window <foreground\|background>`. |
-| `OPENCLI_SITE_SESSION` | adapter default | Set to `ephemeral` or `persistent` to override `siteSession` metadata for browser-backed adapter commands. `ephemeral` closes the one-shot automation window when the command finishes; `persistent` reuses the site's session. Per-command `--site-session` takes precedence. |
+| `OPENCLI_SITE_SESSION` | adapter default | Set to `ephemeral` or `persistent` to override `siteSession` metadata for browser-backed adapter commands. `ephemeral` releases the command's isolated tab lease when it finishes; the extension may retain that idle tab as a warm reusable page. `persistent` reuses the site's logical session. Per-command `--site-session` takes precedence. |
 | `OPENCLI_BROWSER_CONNECT_TIMEOUT` | `45` | Seconds to wait for browser connection |
 | `OPENCLI_BROWSER_COMMAND_TIMEOUT` | `60` | Seconds to wait for a single browser command |
 | `OPENCLI_CDP_ENDPOINT` | — | Chrome DevTools Protocol endpoint for remote browser or Electron apps |
@@ -179,7 +179,7 @@ When the site you need is not yet covered, use the `opencli-adapter-author` skil
 | `OPENCLI_VERBOSE` | `false` | Enable verbose logging (`-v` flag also works) |
 | `DEBUG_SNAPSHOT` | — | Set to `1` for DOM snapshot debug output |
 
-`opencli browser *` requires an explicit `<session>` positional, uses a foreground browser window by default, and keeps that session's tab lease until `opencli browser <session> close` or idle cleanup. Browser-backed adapters use a background adapter window and release one-shot tab leases by default. Interactive adapters can declare `siteSession: 'persistent'` to keep a stable site tab for continuity; pass `--site-session ephemeral` for a one-shot tab.
+`opencli browser *` requires an explicit `<session>` positional, uses a foreground browser window by default, and keeps that session's tab lease until `opencli browser <session> close` or idle cleanup. Browser-backed adapters use a background adapter window and release their logical tab leases by default; released ephemeral tabs can be retained at their current URL and reused by later commands, but are never shared while leased. Interactive adapters can declare `siteSession: 'persistent'` to keep a stable logical site session for continuity; pass `--site-session ephemeral` for an isolated one-shot lease.
 
 ## Built-in Commands
 
