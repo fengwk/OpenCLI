@@ -49,6 +49,7 @@ function isStalePageIdentityError(err: unknown): boolean {
  */
 export class Page extends CDPBasePage {
   private readonly _idleTimeout: number | undefined;
+  private readonly _warmTabTtl: number | undefined;
 
   constructor(
     private readonly session: string,
@@ -59,9 +60,11 @@ export class Page extends CDPBasePage {
     private readonly siteSession?: 'ephemeral' | 'persistent',
     /** Soft profile preference (config default) — daemon arbitrates; see profileRouteParams. */
     public readonly preferredContextId?: string,
+    warmTabTtl?: number,
   ) {
     super();
     this._idleTimeout = idleTimeout;
+    this._warmTabTtl = warmTabTtl;
   }
 
   /** Active page identity (targetId), set after navigate and used in all subsequent commands */
@@ -72,7 +75,7 @@ export class Page extends CDPBasePage {
   private _wsCaptureWarned = false;
 
   /** Helper: spread session into command params */
-  private _sessionOpts(): { session: string; surface: 'browser' | 'adapter'; idleTimeout?: number; contextId?: string; preferredContextId?: string; windowMode?: 'foreground' | 'background'; siteSession?: 'ephemeral' | 'persistent' } {
+  private _sessionOpts(): { session: string; surface: 'browser' | 'adapter'; idleTimeout?: number; contextId?: string; preferredContextId?: string; windowMode?: 'foreground' | 'background'; siteSession?: 'ephemeral' | 'persistent'; warmTabTtl?: number } {
     return {
       session: this.session,
       surface: this.surface,
@@ -81,6 +84,7 @@ export class Page extends CDPBasePage {
       ...(this._idleTimeout != null && { idleTimeout: this._idleTimeout }),
       ...(this.windowMode && { windowMode: this.windowMode }),
       ...(this.siteSession && { siteSession: this.siteSession }),
+      ...(this._warmTabTtl != null && { warmTabTtl: this._warmTabTtl }),
     };
   }
 
@@ -95,6 +99,7 @@ export class Page extends CDPBasePage {
       ...(this._idleTimeout != null && { idleTimeout: this._idleTimeout }),
       ...(this.windowMode && { windowMode: this.windowMode }),
       ...(this.siteSession && { siteSession: this.siteSession }),
+      ...(this._warmTabTtl != null && { warmTabTtl: this._warmTabTtl }),
     };
   }
 

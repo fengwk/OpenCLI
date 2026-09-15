@@ -73,6 +73,11 @@ const BROWSER_COMMON_OPTIONS = [
     help: 'Keep the browser tab lease after the command finishes',
     choices: ['true', 'false'],
   },
+  {
+    flags: '--warm-tab-ttl <seconds>',
+    name: 'warm-tab-ttl',
+    help: 'Warm tab reclamation TTL in seconds after release (-1 disables, default 1800; distinct from active lease idle timeout)',
+  },
 ] as const;
 
 function normalizeStructuredHelpFormat(value: string | undefined): StructuredHelpFormat | undefined {

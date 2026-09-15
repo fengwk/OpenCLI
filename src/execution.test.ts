@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import type { CliCommand } from './registry.js';
-import { coerceAndValidateArgs, executeCommand, prepareCommandArgs } from './execution.js';
+import { coerceAndValidateArgs, DEFAULT_WARM_TAB_TTL_SECONDS, executeCommand, MAX_WARM_TAB_TTL_SECONDS, MIN_WARM_TAB_TTL_SECONDS, prepareCommandArgs, resolveWarmTabTtl } from './execution.js';
 import { ArgumentError, TimeoutError, toEnvelope } from './errors.js';
 import { cli, Strategy } from './registry.js';
 import { withTimeoutMs } from './runtime.js';
@@ -620,6 +620,121 @@ describe('executeCommand — non-browser timeout', () => {
 
     expect(sessionOpts[0]).toMatchObject({ windowMode: 'foreground' });
     vi.restoreAllMocks();
+  });
+
+  describe('warm-tab-ttl resolution and propagation', () => {
+    it('resolves default and valid custom warmTabTtl values', () => {
+      expect(resolveWarmTabTtl(undefined)).toBe(DEFAULT_WARM_TAB_TTL_SECONDS);
+      expect(resolveWarmTabTtl(null)).toBe(1800);
+      expect(resolveWarmTabTtl('')).toBe(1800);
+      expect(resolveWarmTabTtl(1800)).toBe(1800);
+      expect(resolveWarmTabTtl('1800')).toBe(1800);
+      expect(resolveWarmTabTtl(60)).toBe(60);
+      expect(resolveWarmTabTtl('60')).toBe(60);
+      expect(resolveWarmTabTtl(0)).toBe(0);
+      expect(resolveWarmTabTtl('0')).toBe(0);
+      expect(resolveWarmTabTtl(-1)).toBe(-1);
+      expect(resolveWarmTabTtl('-1')).toBe(-1);
+      expect(resolveWarmTabTtl(MAX_WARM_TAB_TTL_SECONDS)).toBe(2147483647);
+      expect(resolveWarmTabTtl(String(MAX_WARM_TAB_TTL_SECONDS))).toBe(2147483647);
+    });
+
+    it('rejects invalid warmTabTtl values', () => {
+      expect(() => resolveWarmTabTtl(-2)).toThrow(ArgumentError);
+      expect(() => resolveWarmTabTtl('-2')).toThrow(ArgumentError);
+      expect(() => resolveWarmTabTtl(1.5)).toThrow(ArgumentError);
+      expect(() => resolveWarmTabTtl('1.5')).toThrow(ArgumentError);
+      expect(() => resolveWarmTabTtl(-0.5)).toThrow(ArgumentError);
+      expect(() => resolveWarmTabTtl(MAX_WARM_TAB_TTL_SECONDS + 1)).toThrow(ArgumentError);
+      expect(() => resolveWarmTabTtl(String(MAX_WARM_TAB_TTL_SECONDS + 1))).toThrow(ArgumentError);
+      expect(() => resolveWarmTabTtl('abc')).toThrow(ArgumentError);
+      expect(() => resolveWarmTabTtl(true)).toThrow(ArgumentError);
+      expect(() => resolveWarmTabTtl(false)).toThrow(ArgumentError);
+      expect(() => resolveWarmTabTtl(NaN)).toThrow(ArgumentError);
+    });
+
+    it('propagates default 1800 warmTabTtl to browserSession when omitted', async () => {
+      const sessionOpts: Array<{ warmTabTtl?: number }> = [];
+      vi.spyOn(capRouting, 'shouldUseBrowserSession').mockReturnValue(true);
+      vi.spyOn(runtime, 'browserSession').mockImplementation(async (_Factory, fn, opts) => {
+        sessionOpts.push(opts ?? {});
+        return fn({ closeWindow: vi.fn().mockResolvedValue(undefined) } as any);
+      });
+
+      const cmd = cli({
+        site: 'test-execution',
+        name: 'browser-default-warm-ttl', access: 'read',
+        description: 'test default warmTabTtl propagation',
+        browser: true,
+        strategy: Strategy.PUBLIC,
+        func: async () => [{ ok: true }],
+      });
+
+      await executeCommand(cmd, {});
+
+      expect(sessionOpts[0]?.warmTabTtl).toBe(1800);
+    });
+
+    it('propagates custom warmTabTtl values to browserSession', async () => {
+      const sessionOpts: Array<{ warmTabTtl?: number }> = [];
+      vi.spyOn(capRouting, 'shouldUseBrowserSession').mockReturnValue(true);
+      vi.spyOn(runtime, 'browserSession').mockImplementation(async (_Factory, fn, opts) => {
+        sessionOpts.push(opts ?? {});
+        return fn({ closeWindow: vi.fn().mockResolvedValue(undefined) } as any);
+      });
+
+      const cmd = cli({
+        site: 'test-execution',
+        name: 'browser-custom-warm-ttl', access: 'read',
+        description: 'test custom warmTabTtl propagation',
+        browser: true,
+        strategy: Strategy.PUBLIC,
+        func: async () => [{ ok: true }],
+      });
+
+      await executeCommand(cmd, {}, false, { warmTabTtl: '60' });
+      expect(sessionOpts[0]?.warmTabTtl).toBe(60);
+
+      await executeCommand(cmd, {}, false, { warmTabTtl: -1 });
+      expect(sessionOpts[1]?.warmTabTtl).toBe(-1);
+
+      await executeCommand(cmd, {}, false, { warmTabTtl: 0 });
+      expect(sessionOpts[2]?.warmTabTtl).toBe(0);
+    });
+
+    it('rejects invalid warmTabTtl before browser side effects', async () => {
+      const browserSessionSpy = vi.spyOn(runtime, 'browserSession');
+      vi.spyOn(capRouting, 'shouldUseBrowserSession').mockReturnValue(true);
+
+      const cmd = cli({
+        site: 'test-execution',
+        name: 'browser-invalid-warm-ttl', access: 'read',
+        description: 'test invalid warmTabTtl validation timing',
+        browser: true,
+        strategy: Strategy.PUBLIC,
+        func: async () => [{ ok: true }],
+      });
+
+      await expect(executeCommand(cmd, {}, false, { warmTabTtl: '-2' })).rejects.toThrow(ArgumentError);
+      await expect(executeCommand(cmd, {}, false, { warmTabTtl: '1.5' })).rejects.toThrow(ArgumentError);
+      expect(browserSessionSpy).not.toHaveBeenCalled();
+    });
+
+    it('rejects invalid warmTabTtl for browser commands that do not need a browser session', async () => {
+      const command = vi.fn();
+      vi.spyOn(capRouting, 'shouldUseBrowserSession').mockReturnValue(false);
+      const cmd = cli({
+        site: 'test-execution',
+        name: 'browser-http-only-invalid-warm-ttl', access: 'read',
+        description: 'test browser option validation without a browser session',
+        browser: true,
+        strategy: Strategy.PUBLIC,
+        func: command,
+      });
+
+      await expect(executeCommand(cmd, {}, false, { warmTabTtl: '-2' })).rejects.toThrow(ArgumentError);
+      expect(command).not.toHaveBeenCalled();
+    });
   });
 
   it('does not re-run custom validation when args are already prepared', async () => {

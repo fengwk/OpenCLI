@@ -72,6 +72,35 @@ describe('Page.getCurrentUrl', () => {
       page: 'page-1',
     }));
   });
+
+  it('passes warmTabTtl through daemon commands (navigate, exec, closeWindow)', async () => {
+    sendCommandFullMock.mockResolvedValueOnce({ page: 'page-warm', data: { url: 'https://example.com/' } });
+    sendCommandMock.mockResolvedValueOnce(null);
+    sendCommandMock.mockResolvedValueOnce({ closed: true });
+
+    const page = new Page('site:example', undefined, undefined, undefined, 'adapter', 'ephemeral', undefined, 120);
+
+    await page.goto('https://example.com/', { waitUntil: 'none' });
+    await page.evaluate('document.title');
+    await page.closeWindow();
+
+    expect(sendCommandFullMock).toHaveBeenCalledWith('navigate', expect.objectContaining({
+      session: 'site:example',
+      surface: 'adapter',
+      warmTabTtl: 120,
+    }));
+    expect(sendCommandMock).toHaveBeenCalledWith('exec', expect.objectContaining({
+      session: 'site:example',
+      surface: 'adapter',
+      warmTabTtl: 120,
+      page: 'page-warm',
+    }));
+    expect(sendCommandMock).toHaveBeenCalledWith('close-window', expect.objectContaining({
+      session: 'site:example',
+      surface: 'adapter',
+      warmTabTtl: 120,
+    }));
+  });
 });
 
 describe('Page.evaluate', () => {

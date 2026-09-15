@@ -73,7 +73,8 @@ export function registerCommandToProgram(siteCmd: Command, cmd: CliCommand): voi
     subCmd
       .option('--window <mode>', 'Browser window mode: foreground or background')
       .option('--site-session <mode>', 'Adapter site session lifecycle: ephemeral or persistent')
-      .option('--keep-tab <bool>', 'Keep the browser tab lease after the command finishes');
+      .option('--keep-tab <bool>', 'Keep the browser tab lease after the command finishes')
+      .option('--warm-tab-ttl <seconds>', 'Warm tab reclamation TTL in seconds after release (-1 disables, default 1800; distinct from active lease idle timeout)');
   }
 
   const originalHelpInformation = subCmd.helpInformation.bind(subCmd);
@@ -129,6 +130,7 @@ export function registerCommandToProgram(siteCmd: Command, cmd: CliCommand): voi
         ...(cmd.browser && typeof optionsRecord.window === 'string' ? { windowMode: optionsRecord.window } : {}),
         ...(cmd.browser && typeof optionsRecord.siteSession === 'string' ? { siteSession: optionsRecord.siteSession } : {}),
         ...(cmd.browser && typeof optionsRecord.keepTab === 'string' ? { keepTab: optionsRecord.keepTab } : {}),
+        ...(cmd.browser && optionsRecord.warmTabTtl !== undefined ? { warmTabTtl: optionsRecord.warmTabTtl as string } : {}),
       });
       if (result === null || result === undefined) {
         return;

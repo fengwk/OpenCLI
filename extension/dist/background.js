@@ -1376,8 +1376,12 @@ const automationSessions = /* @__PURE__ */ new Map();
 const IDLE_TIMEOUT_DEFAULT = 3e4;
 const IDLE_TIMEOUT_INTERACTIVE = 6e5;
 const IDLE_TIMEOUT_NONE = -1;
+const WARM_TAB_TTL_DEFAULT_SECONDS = 1800;
+const MIN_WARM_TAB_TTL_SECONDS = -1;
+const MAX_WARM_TAB_TTL_SECONDS = 2147483647;
 const REGISTRY_KEY = "opencli_target_lease_registry_v2";
 const LEASE_IDLE_ALARM_PREFIX = "opencli:lease-idle:";
+const WARM_TAB_ALARM_PREFIX = "opencli:warm-tab:";
 const CONTAINER_TAB_GROUP_TITLE = {
   interactive: "OpenCLI Browser",
   // Retained for registry/type compatibility. Adapter automation no longer
@@ -1402,6 +1406,12 @@ class CommandFailure extends Error {
 const sessionOverrides = /* @__PURE__ */ new Map();
 function setSessionOverride(key, patch) {
   sessionOverrides.set(key, { ...sessionOverrides.get(key), ...patch });
+}
+function getWarmTabTtlSeconds(key) {
+  return sessionOverrides.get(key)?.warmTabTtlSeconds ?? WARM_TAB_TTL_DEFAULT_SECONDS;
+}
+function isValidWarmTabTtlSeconds(value) {
+  return typeof value === "number" && Number.isInteger(value) && value >= MIN_WARM_TAB_TTL_SECONDS && value <= MAX_WARM_TAB_TTL_SECONDS;
 }
 const activeCommandCounts = /* @__PURE__ */ new Map();
 const LEASE_KEY_SEPARATOR = "\0";
@@ -1465,6 +1475,30 @@ function leaseKeyFromAlarmName(name) {
     return decodeURIComponent(name.slice(LEASE_IDLE_ALARM_PREFIX.length));
   } catch {
     return null;
+  }
+}
+function makeWarmTabAlarmName(tabId) {
+  return `${WARM_TAB_ALARM_PREFIX}${tabId}`;
+}
+function tabIdFromWarmTabAlarmName(name) {
+  if (!name.startsWith(WARM_TAB_ALARM_PREFIX)) return null;
+  const raw = name.slice(WARM_TAB_ALARM_PREFIX.length);
+  if (!/^(0|[1-9]\d*)$/.test(raw)) return null;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+function scheduleWarmTabAlarm(tabId, seconds) {
+  const alarmName = makeWarmTabAlarmName(tabId);
+  try {
+    chrome.alarms?.create?.(alarmName, { when: Date.now() + seconds * 1e3 });
+  } catch {
+  }
+}
+function clearWarmTabAlarm(tabId) {
+  const alarmName = makeWarmTabAlarmName(tabId);
+  try {
+    chrome.alarms?.clear?.(alarmName);
+  } catch {
   }
 }
 function withLeaseMutation(fn) {
@@ -1543,7 +1577,8 @@ async function persistRuntimeState() {
       lifecycle: session.lifecycle,
       windowRole: session.windowRole,
       idleDeadlineAt: session.idleDeadlineAt,
-      updatedAt: Date.now()
+      updatedAt: Date.now(),
+      warmTabTtlSeconds: getWarmTabTtlSeconds(leaseKey)
     };
   }
   await writeRegistry({
@@ -2063,6 +2098,7 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
 });
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   await workerReady;
+  clearWarmTabAlarm(tabId);
   evictTab(tabId);
   for (const [leaseKey, session] of automationSessions.entries()) {
     if (session.preferredTabId === tabId) {
@@ -2112,7 +2148,15 @@ chrome.runtime.onStartup.addListener(() => {
 initialize();
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   await workerReady;
-  if (alarm.name === "keepalive") void connect();
+  if (alarm.name === "keepalive") {
+    void connect();
+    return;
+  }
+  const warmTabId = tabIdFromWarmTabAlarmName(alarm.name);
+  if (warmTabId !== null) {
+    await expireWarmTab(warmTabId);
+    return;
+  }
   const leaseKey = leaseKeyFromAlarmName(alarm.name);
   if (!leaseKey) return;
   if ((activeCommandCounts.get(leaseKey) ?? 0) > 0) {
@@ -2155,9 +2199,22 @@ async function fetchDaemonVersion() {
   }
 }
 async function handleCommand(cmd) {
+  if (cmd.warmTabTtl !== void 0) {
+    if (!isValidWarmTabTtlSeconds(cmd.warmTabTtl)) {
+      return {
+        id: cmd.id,
+        ok: false,
+        errorCode: "invalid_warm_tab_ttl",
+        error: `warmTabTtl must be an integer between ${MIN_WARM_TAB_TTL_SECONDS} and ${MAX_WARM_TAB_TTL_SECONDS}. Received: ${String(cmd.warmTabTtl)}`
+      };
+    }
+  }
   const session = getSessionName(cmd.session);
   const surface = getCommandSurface(cmd);
   const leaseKey = getLeaseKey(session, surface);
+  if (cmd.warmTabTtl !== void 0) {
+    setSessionOverride(leaseKey, { warmTabTtlSeconds: cmd.warmTabTtl });
+  }
   if (cmd.windowMode === "foreground" || cmd.windowMode === "background") {
     setSessionOverride(leaseKey, { windowMode: cmd.windowMode });
   }
@@ -2284,6 +2341,9 @@ function enumerateCrossOriginFrames(tree) {
 function setLeaseSession(leaseKey, session) {
   const existing = automationSessions.get(leaseKey);
   if (existing?.idleTimer) clearTimeout(existing.idleTimer);
+  if (session.preferredTabId !== null) {
+    clearWarmTabAlarm(session.preferredTabId);
+  }
   const timeout = getIdleTimeout(leaseKey);
   automationSessions.set(leaseKey, {
     ...makeSession(leaseKey, session),
@@ -2885,6 +2945,44 @@ async function handleWaitDownload(cmd, leaseKey) {
 async function releaseLease(leaseKey, reason = "released") {
   return withLeaseMutation(() => releaseLeaseUnlocked(leaseKey, reason));
 }
+async function expireWarmTab(tabId) {
+  return withLeaseMutation(() => expireWarmTabUnlocked(tabId));
+}
+async function expireWarmTabUnlocked(tabId) {
+  clearWarmTabAlarm(tabId);
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    return;
+  }
+  if (!initialTabIsAvailable(tabId)) {
+    return;
+  }
+  const automationWindowId = ownedContainers.automation.windowId;
+  if (automationWindowId === null || tab.windowId !== automationWindowId) {
+    return;
+  }
+  try {
+    const tabs = await chrome.tabs.query({ windowId: automationWindowId });
+    if (!tabs.some((candidate) => candidate.id === tabId)) {
+      return;
+    }
+    if (tabs.length > 1) {
+      await safeDetach(tabId);
+      evictTab(tabId);
+      await chrome.tabs.remove(tabId).catch(() => {
+      });
+      console.log(`[opencli] Warm tab ${tabId} expired and closed (${tabs.length - 1} remaining in automation window)`);
+    } else if (tabs.length === 1) {
+      if (tab.url !== BLANK_PAGE) {
+        await chrome.tabs.update(tabId, { url: BLANK_PAGE });
+      }
+      console.log(`[opencli] Warm tab ${tabId} expired and reset to ${BLANK_PAGE} (last tab in automation window)`);
+    }
+  } catch {
+  }
+}
 async function releaseLeaseUnlocked(leaseKey, reason) {
   const session = automationSessions.get(leaseKey);
   if (!session) {
@@ -2895,13 +2993,23 @@ async function releaseLeaseUnlocked(leaseKey, reason) {
   }
   if (session.idleTimer) clearTimeout(session.idleTimer);
   scheduleIdleAlarm(leaseKey, IDLE_TIMEOUT_NONE);
+  let warmTabExpiryToRun = null;
   if (session.owned) {
     const tabId = session.preferredTabId;
     if (tabId !== null) {
       await safeDetach(tabId);
       evictTab(tabId);
       if (session.surface === "adapter" && session.lifecycle === "ephemeral") {
-        console.log(`[opencli] Released ephemeral adapter tab lease ${tabId} as a warm reusable tab (session=${session.session}, ${reason})`);
+        const warmTtl = getWarmTabTtlSeconds(leaseKey);
+        console.log(`[opencli] Released ephemeral adapter tab lease ${tabId} as a warm reusable tab (session=${session.session}, ttl=${warmTtl}s, ${reason})`);
+        if (warmTtl === -1) {
+          clearWarmTabAlarm(tabId);
+        } else if (warmTtl === 0) {
+          clearWarmTabAlarm(tabId);
+          warmTabExpiryToRun = tabId;
+        } else if (warmTtl > 0) {
+          scheduleWarmTabAlarm(tabId, warmTtl);
+        }
       } else {
         const hasOtherOwnedLease = [...automationSessions.entries()].some(
           ([otherLease, otherSession]) => otherLease !== leaseKey && otherSession.owned && otherSession.windowId === session.windowId && otherSession.preferredTabId !== null
@@ -2933,6 +3041,9 @@ async function releaseLeaseUnlocked(leaseKey, reason) {
   automationSessions.delete(leaseKey);
   sessionOverrides.delete(leaseKey);
   await persistRuntimeState();
+  if (warmTabExpiryToRun !== null) {
+    await expireWarmTabUnlocked(warmTabExpiryToRun);
+  }
 }
 async function reconcileTargetLeaseRegistry() {
   const registry = await readRegistry();
@@ -2958,6 +3069,9 @@ async function reconcileTargetLeaseRegistry() {
       if (!isDebuggableUrl(tab.url)) continue;
       if (stored.lifecycle === "ephemeral" || stored.lifecycle === "persistent" || stored.lifecycle === "pinned") {
         setSessionOverride(leaseKey, { lifecycle: stored.lifecycle });
+      }
+      if (isValidWarmTabTtlSeconds(stored.warmTabTtlSeconds)) {
+        setSessionOverride(leaseKey, { warmTabTtlSeconds: stored.warmTabTtlSeconds });
       }
       const session = makeSession(leaseKey, {
         session: typeof stored.session === "string" ? stored.session : getSessionFromKey(leaseKey),

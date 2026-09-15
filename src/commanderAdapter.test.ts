@@ -99,6 +99,29 @@ describe('commanderAdapter arg passing', () => {
     );
   });
 
+  it('passes --warm-tab-ttl option through to executeCommand for browser commands', async () => {
+    const browserCmd: CliCommand = {
+      site: 'paperreview',
+      name: 'browse', access: 'read',
+      description: 'Browse papers',
+      browser: true,
+      args: [],
+      func: vi.fn(),
+    };
+    const program = new Command();
+    const siteCmd = program.command('paperreview');
+    registerCommandToProgram(siteCmd, browserCmd);
+
+    await program.parseAsync(['node', 'opencli', 'paperreview', 'browse', '--warm-tab-ttl', '120']);
+
+    expect(mockExecuteCommand).toHaveBeenCalledWith(
+      expect.objectContaining({ site: 'paperreview', name: 'browse' }),
+      expect.any(Object),
+      false,
+      expect.objectContaining({ warmTabTtl: '120' }),
+    );
+  });
+
   it('rejects invalid bool values before calling executeCommand', async () => {
     const program = new Command();
     const siteCmd = program.command('paperreview');

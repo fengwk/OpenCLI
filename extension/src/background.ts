@@ -308,8 +308,12 @@ const automationSessions = new Map<string, TargetLease>();
 const IDLE_TIMEOUT_DEFAULT = 30_000;      // 30s — adapter-driven automation
 const IDLE_TIMEOUT_INTERACTIVE = 600_000; // 10min — human-paced browser:* / operate:*
 const IDLE_TIMEOUT_NONE = -1;             // borrowed bound tabs stay bound until unbound/closed
+const WARM_TAB_TTL_DEFAULT_SECONDS = 1800; // 30min — default warm tab reclamation TTL
+const MIN_WARM_TAB_TTL_SECONDS = -1;
+const MAX_WARM_TAB_TTL_SECONDS = 2147483647;
 const REGISTRY_KEY = 'opencli_target_lease_registry_v2';
 const LEASE_IDLE_ALARM_PREFIX = 'opencli:lease-idle:';
+const WARM_TAB_ALARM_PREFIX = 'opencli:warm-tab:';
 const CONTAINER_TAB_GROUP_TITLE: Record<OwnedWindowRole, string> = {
   interactive: 'OpenCLI Browser',
   // Retained for registry/type compatibility. Adapter automation no longer
@@ -340,6 +344,8 @@ const interactiveGroupLedger = new Set<number>();
 type StoredLease = Omit<TargetLease, 'idleTimer' | 'idleDeadlineAt'> & {
   idleDeadlineAt: number;
   updatedAt: number;
+  // Active-lease policy only. Released warm tabs remain represented solely by alarms.
+  warmTabTtlSeconds?: number;
 };
 
 // The registry lives in chrome.storage.session, never chrome.storage.local:
@@ -373,18 +379,30 @@ class CommandFailure extends Error {
 
 /**
  * Per-session overrides set via command fields (idleTimeout / windowMode /
- * siteSession). One record per lease key — a single map so create/clear
+ * siteSession / warmTabTtl). One record per lease key — a single map so create/clear
  * stay in lockstep.
  */
 type SessionOverrides = {
   idleTimeoutMs?: number;
   windowMode?: WindowMode;
   lifecycle?: LeaseLifecycle;
+  warmTabTtlSeconds?: number;
 };
 const sessionOverrides = new Map<string, SessionOverrides>();
 
 function setSessionOverride(key: string, patch: SessionOverrides): void {
   sessionOverrides.set(key, { ...sessionOverrides.get(key), ...patch });
+}
+
+function getWarmTabTtlSeconds(key: string): number {
+  return sessionOverrides.get(key)?.warmTabTtlSeconds ?? WARM_TAB_TTL_DEFAULT_SECONDS;
+}
+
+function isValidWarmTabTtlSeconds(value: unknown): value is number {
+  return typeof value === 'number'
+    && Number.isInteger(value)
+    && value >= MIN_WARM_TAB_TTL_SECONDS
+    && value <= MAX_WARM_TAB_TTL_SECONDS;
 }
 
 /** Commands currently executing per lease — idle release is deferred while > 0. */
@@ -464,6 +482,36 @@ function leaseKeyFromAlarmName(name: string): string | null {
     return decodeURIComponent(name.slice(LEASE_IDLE_ALARM_PREFIX.length));
   } catch {
     return null;
+  }
+}
+
+function makeWarmTabAlarmName(tabId: number): string {
+  return `${WARM_TAB_ALARM_PREFIX}${tabId}`;
+}
+
+function tabIdFromWarmTabAlarmName(name: string): number | null {
+  if (!name.startsWith(WARM_TAB_ALARM_PREFIX)) return null;
+  const raw = name.slice(WARM_TAB_ALARM_PREFIX.length);
+  if (!/^(0|[1-9]\d*)$/.test(raw)) return null;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+function scheduleWarmTabAlarm(tabId: number, seconds: number): void {
+  const alarmName = makeWarmTabAlarmName(tabId);
+  try {
+    chrome.alarms?.create?.(alarmName, { when: Date.now() + seconds * 1000 });
+  } catch {
+    // Best-effort scheduling.
+  }
+}
+
+function clearWarmTabAlarm(tabId: number): void {
+  const alarmName = makeWarmTabAlarmName(tabId);
+  try {
+    chrome.alarms?.clear?.(alarmName);
+  } catch {
+    // Best-effort cleanup.
   }
 }
 
@@ -557,6 +605,7 @@ async function persistRuntimeState(): Promise<void> {
       windowRole: session.windowRole,
       idleDeadlineAt: session.idleDeadlineAt,
       updatedAt: Date.now(),
+      warmTabTtlSeconds: getWarmTabTtlSeconds(leaseKey),
     };
   }
   await writeRegistry({
@@ -1333,6 +1382,7 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   // Same wake-before-recovery hazard as windows.onRemoved.
   await workerReady;
+  clearWarmTabAlarm(tabId);
   identity.evictTab(tabId);
   for (const [leaseKey, session] of automationSessions.entries()) {
     if (session.preferredTabId === tabId) {
@@ -1407,7 +1457,15 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   // Idle-lease alarms and keepalive can both fire in a freshly woken worker;
   // gate on recovery so releaseLease never persists an empty snapshot.
   await workerReady;
-  if (alarm.name === 'keepalive') void connect();
+  if (alarm.name === 'keepalive') {
+    void connect();
+    return;
+  }
+  const warmTabId = tabIdFromWarmTabAlarmName(alarm.name);
+  if (warmTabId !== null) {
+    await expireWarmTab(warmTabId);
+    return;
+  }
   const leaseKey = leaseKeyFromAlarmName(alarm.name);
   if (!leaseKey) return;
   if ((activeCommandCounts.get(leaseKey) ?? 0) > 0) {
@@ -1464,9 +1522,23 @@ async function fetchDaemonVersion(): Promise<string | null> {
 // ─── Command dispatcher ─────────────────────────────────────────────
 
 async function handleCommand(cmd: Command): Promise<Result> {
+  if (cmd.warmTabTtl !== undefined) {
+    if (!isValidWarmTabTtlSeconds(cmd.warmTabTtl)) {
+      return {
+        id: cmd.id,
+        ok: false,
+        errorCode: 'invalid_warm_tab_ttl',
+        error: `warmTabTtl must be an integer between ${MIN_WARM_TAB_TTL_SECONDS} and ${MAX_WARM_TAB_TTL_SECONDS}. Received: ${String(cmd.warmTabTtl)}`,
+      };
+    }
+  }
+
   const session = getSessionName(cmd.session);
   const surface = getCommandSurface(cmd);
   const leaseKey = getLeaseKey(session, surface);
+  if (cmd.warmTabTtl !== undefined) {
+    setSessionOverride(leaseKey, { warmTabTtlSeconds: cmd.warmTabTtl });
+  }
   if (cmd.windowMode === 'foreground' || cmd.windowMode === 'background') {
     setSessionOverride(leaseKey, { windowMode: cmd.windowMode });
   }
@@ -1632,6 +1704,9 @@ function setLeaseSession(
 ): void {
   const existing = automationSessions.get(leaseKey);
   if (existing?.idleTimer) clearTimeout(existing.idleTimer);
+  if (session.preferredTabId !== null) {
+    clearWarmTabAlarm(session.preferredTabId);
+  }
   const timeout = getIdleTimeout(leaseKey);
   automationSessions.set(leaseKey, {
     ...makeSession(leaseKey, session),
@@ -2345,6 +2420,50 @@ async function releaseLease(leaseKey: string, reason: string = 'released'): Prom
   return withLeaseMutation(() => releaseLeaseUnlocked(leaseKey, reason));
 }
 
+async function expireWarmTab(tabId: number): Promise<void> {
+  return withLeaseMutation(() => expireWarmTabUnlocked(tabId));
+}
+
+async function expireWarmTabUnlocked(tabId: number): Promise<void> {
+  clearWarmTabAlarm(tabId);
+  let tab: chrome.tabs.Tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    // Missing tab is a no-op
+    return;
+  }
+  if (!initialTabIsAvailable(tabId)) {
+    // Leased tab is a no-op (stale warm alarm does not reclaim active lease)
+    return;
+  }
+  const automationWindowId = ownedContainers.automation.windowId;
+  if (automationWindowId === null || tab.windowId !== automationWindowId) {
+    // Stale/moved tab is a no-op
+    return;
+  }
+  try {
+    const tabs = await chrome.tabs.query({ windowId: automationWindowId });
+    if (!tabs.some((candidate) => candidate.id === tabId)) {
+      // The tab moved after the initial ownership check.
+      return;
+    }
+    if (tabs.length > 1) {
+      await safeDetach(tabId);
+      identity.evictTab(tabId);
+      await chrome.tabs.remove(tabId).catch(() => {});
+      console.log(`[opencli] Warm tab ${tabId} expired and closed (${tabs.length - 1} remaining in automation window)`);
+    } else if (tabs.length === 1) {
+      if (tab.url !== BLANK_PAGE) {
+        await chrome.tabs.update(tabId, { url: BLANK_PAGE });
+      }
+      console.log(`[opencli] Warm tab ${tabId} expired and reset to ${BLANK_PAGE} (last tab in automation window)`);
+    }
+  } catch {
+    // Tab or window closed concurrently
+  }
+}
+
 async function releaseLeaseUnlocked(leaseKey: string, reason: string): Promise<void> {
   const session = automationSessions.get(leaseKey);
   if (!session) {
@@ -2357,13 +2476,24 @@ async function releaseLeaseUnlocked(leaseKey: string, reason: string): Promise<v
   if (session.idleTimer) clearTimeout(session.idleTimer);
   scheduleIdleAlarm(leaseKey, IDLE_TIMEOUT_NONE);
 
+  let warmTabExpiryToRun: number | null = null;
+
   if (session.owned) {
     const tabId = session.preferredTabId;
     if (tabId !== null) {
       await safeDetach(tabId);
       identity.evictTab(tabId);
       if (session.surface === 'adapter' && session.lifecycle === 'ephemeral') {
-        console.log(`[opencli] Released ephemeral adapter tab lease ${tabId} as a warm reusable tab (session=${session.session}, ${reason})`);
+        const warmTtl = getWarmTabTtlSeconds(leaseKey);
+        console.log(`[opencli] Released ephemeral adapter tab lease ${tabId} as a warm reusable tab (session=${session.session}, ttl=${warmTtl}s, ${reason})`);
+        if (warmTtl === -1) {
+          clearWarmTabAlarm(tabId);
+        } else if (warmTtl === 0) {
+          clearWarmTabAlarm(tabId);
+          warmTabExpiryToRun = tabId;
+        } else if (warmTtl > 0) {
+          scheduleWarmTabAlarm(tabId, warmTtl);
+        }
       } else {
         const hasOtherOwnedLease = [...automationSessions.entries()].some(([otherLease, otherSession]) =>
           otherLease !== leaseKey &&
@@ -2398,6 +2528,10 @@ async function releaseLeaseUnlocked(leaseKey: string, reason: string): Promise<v
   sessionOverrides.delete(leaseKey);
 
   await persistRuntimeState();
+
+  if (warmTabExpiryToRun !== null) {
+    await expireWarmTabUnlocked(warmTabExpiryToRun);
+  }
 }
 
 async function reconcileTargetLeaseRegistry(): Promise<void> {
@@ -2430,6 +2564,9 @@ async function reconcileTargetLeaseRegistry(): Promise<void> {
       if (!isDebuggableUrl(tab.url)) continue;
       if (stored.lifecycle === 'ephemeral' || stored.lifecycle === 'persistent' || stored.lifecycle === 'pinned') {
         setSessionOverride(leaseKey, { lifecycle: stored.lifecycle });
+      }
+      if (isValidWarmTabTtlSeconds(stored.warmTabTtlSeconds)) {
+        setSessionOverride(leaseKey, { warmTabTtlSeconds: stored.warmTabTtlSeconds });
       }
       const session = makeSession(leaseKey, {
         session: typeof stored.session === 'string' ? stored.session : getSessionFromKey(leaseKey),
@@ -2587,4 +2724,15 @@ export const __test__ = {
       ...session,
     });
   },
+  WARM_TAB_TTL_DEFAULT_SECONDS,
+  MIN_WARM_TAB_TTL_SECONDS,
+  MAX_WARM_TAB_TTL_SECONDS,
+  WARM_TAB_ALARM_PREFIX,
+  getWarmTabTtlSeconds,
+  makeWarmTabAlarmName,
+  tabIdFromWarmTabAlarmName,
+  scheduleWarmTabAlarm,
+  clearWarmTabAlarm,
+  expireWarmTab,
+  expireWarmTabUnlocked,
 };

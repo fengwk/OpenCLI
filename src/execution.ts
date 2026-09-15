@@ -219,6 +219,7 @@ export async function executeCommand(
     keepTab?: string;
     windowMode?: string;
     siteSession?: string;
+    warmTabTtl?: number | string;
     onTraceExport?: (trace: ObservationExportResult) => void;
   } = {},
 ): Promise<unknown> {
@@ -228,6 +229,9 @@ export async function executeCommand(
   const siteSession = shouldUseBrowserSession(cmd)
     ? resolveSiteSession(cmd, opts.siteSession)
     : null;
+  const warmTabTtl = cmd.browser
+    ? resolveWarmTabTtl(opts.warmTabTtl)
+    : undefined;
 
   let kwargs: CommandArgs;
   try {
@@ -497,7 +501,7 @@ export async function executeCommand(
           if (!keepTab && !needsRecovery) await page.closeWindow?.().catch(() => {});
           throw surfacedError;
         }
-      }, { session, cdpEndpoint, ...profileRouting, windowMode, surface: 'adapter', siteSession });
+      }, { session, cdpEndpoint, ...profileRouting, windowMode, surface: 'adapter', siteSession, warmTabTtl });
       } catch (err) {
         browserRunError = err;
         throw err;
@@ -688,6 +692,28 @@ function resolveBrowserWindowMode(defaultMode: BrowserWindowMode = 'background',
   return normalizeWindowMode('--window', rawOption)
     ?? normalizeWindowMode('OPENCLI_WINDOW', process.env.OPENCLI_WINDOW)
     ?? defaultMode;
+}
+
+export const DEFAULT_WARM_TAB_TTL_SECONDS = 1800;
+export const MIN_WARM_TAB_TTL_SECONDS = -1;
+export const MAX_WARM_TAB_TTL_SECONDS = 2147483647;
+
+export function resolveWarmTabTtl(rawOption?: unknown): number {
+  if (rawOption === undefined || rawOption === null || rawOption === '') {
+    return DEFAULT_WARM_TAB_TTL_SECONDS;
+  }
+  if (typeof rawOption === 'boolean') {
+    throw new ArgumentError(
+      `--warm-tab-ttl must be an integer between ${MIN_WARM_TAB_TTL_SECONDS} and ${MAX_WARM_TAB_TTL_SECONDS}. Received: "${String(rawOption)}"`,
+    );
+  }
+  const parsed = typeof rawOption === 'number' ? rawOption : Number(rawOption);
+  if (!Number.isInteger(parsed) || parsed < MIN_WARM_TAB_TTL_SECONDS || parsed > MAX_WARM_TAB_TTL_SECONDS) {
+    throw new ArgumentError(
+      `--warm-tab-ttl must be an integer between ${MIN_WARM_TAB_TTL_SECONDS} and ${MAX_WARM_TAB_TTL_SECONDS}. Received: "${String(rawOption)}"`,
+    );
+  }
+  return parsed;
 }
 
 /**

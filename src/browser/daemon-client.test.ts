@@ -379,6 +379,18 @@ describe('daemon-client', () => {
     expect(body.access).toBeUndefined();
   });
 
+  it('propagates warmTabTtl field in the request body', async () => {
+    vi.mocked(fetch).mockResolvedValue({
+      status: 200,
+      json: () => Promise.resolve({ id: 'server', ok: true, data: 'ok' }),
+    } as Response);
+
+    await sendCommand('close-window', { surface: 'adapter', session: 'site:example', warmTabTtl: 120 });
+
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0][1]?.body)) as { warmTabTtl?: number };
+    expect(body.warmTabTtl).toBe(120);
+  });
+
   it('throws a terminal SessionBusyError on a session_busy response without retrying', async () => {
     vi.mocked(fetch).mockResolvedValue({
       status: 409,

@@ -1576,7 +1576,9 @@ describe('background tab isolation', () => {
 
   it('restores owned and borrowed leases from the registry', async () => {
     const { chrome } = createChromeMock();
-    const deadline = Date.now() + 30_000;
+    const now = 1700000000000;
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    const deadline = now + 30_000;
     vi.stubGlobal('chrome', chrome);
     await chrome.storage.session.set({
       opencli_target_lease_registry_v2: {
@@ -1593,7 +1595,8 @@ describe('background tab isolation', () => {
             lifecycle: 'ephemeral',
             windowRole: 'automation',
             idleDeadlineAt: deadline,
-            updatedAt: Date.now(),
+            updatedAt: now,
+            warmTabTtlSeconds: 77,
           },
           [browserKey('default')]: {
             windowId: 2,
@@ -1604,7 +1607,7 @@ describe('background tab isolation', () => {
             lifecycle: 'pinned',
             windowRole: 'borrowed-user',
             idleDeadlineAt: 0,
-            updatedAt: Date.now(),
+            updatedAt: now,
           },
         },
       },
@@ -1634,6 +1637,17 @@ describe('background tab isolation', () => {
       expect.objectContaining({ when: expect.any(Number) }),
     );
     expect(chrome.windows.remove).not.toHaveBeenCalled();
+
+    chrome.alarms.create.mockClear();
+    await mod.__test__.handleCommand({
+      id: 'release-restored',
+      action: 'close-window',
+      session: 'twitter',
+      surface: 'adapter',
+    });
+    expect(chrome.alarms.create).toHaveBeenCalledWith('opencli:warm-tab:1', {
+      when: now + 77_000,
+    });
   });
 
   it('honors the persisted remaining idle lifetime on reconcile instead of granting a fresh full timeout', async () => {
@@ -2779,5 +2793,425 @@ describe('background tab isolation', () => {
     expect(chrome.storage.local.remove).toHaveBeenCalledWith(REGISTRY_KEY);
     const leftover = (await chrome.storage.local.get(REGISTRY_KEY) as any)[REGISTRY_KEY];
     expect(leftover).toBeUndefined();
+  });
+
+  describe('warm-tab-ttl lifecycle and expiry', () => {
+    it('defensively validates warmTabTtl parameter on commands without modifying lease state', async () => {
+      const { chrome } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+
+      // Valid values in [-1, 2147483647]
+      const res60 = await mod.__test__.handleCommand({ id: 'c1', action: 'close-window', session: 'val-test', surface: 'adapter', warmTabTtl: 60 });
+      expect(res60.ok).toBe(true);
+
+      const res0 = await mod.__test__.handleCommand({ id: 'c2', action: 'close-window', session: 'val-test', surface: 'adapter', warmTabTtl: 0 });
+      expect(res0.ok).toBe(true);
+
+      const resNeg1 = await mod.__test__.handleCommand({ id: 'c3', action: 'close-window', session: 'val-test', surface: 'adapter', warmTabTtl: -1 });
+      expect(resNeg1.ok).toBe(true);
+
+      const resMax = await mod.__test__.handleCommand({ id: 'c4', action: 'close-window', session: 'val-test', surface: 'adapter', warmTabTtl: mod.__test__.MAX_WARM_TAB_TTL_SECONDS });
+      expect(resMax.ok).toBe(true);
+
+      // Invalid values reject and do not modify lease state
+      const badSession = 'invalid-state-check';
+      const badKey = adapterKey(badSession);
+
+      const resNeg2 = await mod.__test__.handleCommand({ id: 'c5', action: 'close-window', session: badSession, surface: 'adapter', warmTabTtl: -2 });
+      expect(resNeg2.ok).toBe(false);
+      expect(resNeg2.errorCode).toBe('invalid_warm_tab_ttl');
+      expect(resNeg2.error).toContain('warmTabTtl must be an integer between -1 and 2147483647');
+      expect(mod.__test__.getWarmTabTtlSeconds(badKey)).toBe(1800);
+
+      const resOverflow = await mod.__test__.handleCommand({ id: 'c6', action: 'close-window', session: badSession, surface: 'adapter', warmTabTtl: mod.__test__.MAX_WARM_TAB_TTL_SECONDS + 1 });
+      expect(resOverflow.ok).toBe(false);
+      expect(resOverflow.errorCode).toBe('invalid_warm_tab_ttl');
+
+      const resFrac = await mod.__test__.handleCommand({ id: 'c7', action: 'close-window', session: badSession, surface: 'adapter', warmTabTtl: 1.5 });
+      expect(resFrac.ok).toBe(false);
+      expect(resFrac.errorCode).toBe('invalid_warm_tab_ttl');
+
+      const resStr = await mod.__test__.handleCommand({ id: 'c8', action: 'close-window', session: badSession, surface: 'adapter', warmTabTtl: 'bad' as any });
+      expect(resStr.ok).toBe(false);
+      expect(resStr.errorCode).toBe('invalid_warm_tab_ttl');
+    });
+
+    it('parses only canonical non-negative decimal physical tab ids from alarm names', async () => {
+      const { chrome } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+
+      expect(mod.__test__.tabIdFromWarmTabAlarmName('opencli:warm-tab:123')).toBe(123);
+      expect(mod.__test__.tabIdFromWarmTabAlarmName('opencli:warm-tab:0')).toBe(0);
+      expect(mod.__test__.tabIdFromWarmTabAlarmName('opencli:warm-tab:')).toBeNull();
+      expect(mod.__test__.tabIdFromWarmTabAlarmName('opencli:warm-tab:-1')).toBeNull();
+      expect(mod.__test__.tabIdFromWarmTabAlarmName('opencli:warm-tab:1.5')).toBeNull();
+      expect(mod.__test__.tabIdFromWarmTabAlarmName('opencli:warm-tab:123abc')).toBeNull();
+      expect(mod.__test__.tabIdFromWarmTabAlarmName('opencli:warm-tab: 123')).toBeNull();
+      expect(mod.__test__.tabIdFromWarmTabAlarmName('opencli:warm-tab:001')).toBeNull();
+      expect(mod.__test__.tabIdFromWarmTabAlarmName('keepalive')).toBeNull();
+      expect(mod.__test__.tabIdFromWarmTabAlarmName('opencli:lease-idle:foo')).toBeNull();
+    });
+
+    it('schedules default 1800s warm-tab alarm on ephemeral release when TTL omitted', async () => {
+      const { chrome } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+
+      const now = 1700000000000;
+      vi.spyOn(Date, 'now').mockReturnValue(now);
+
+      await mod.__test__.handleCommand({
+        id: 'ephemeral-nav',
+        action: 'navigate',
+        session: 'ephemeral-default',
+        surface: 'adapter',
+        siteSession: 'ephemeral',
+        url: 'https://example.com/',
+      });
+      const tabId = mod.__test__.getSession(adapterKey('ephemeral-default'))?.preferredTabId;
+      expect(tabId).toBeDefined();
+
+      chrome.alarms.create.mockClear();
+
+      await mod.__test__.handleCommand({
+        id: 'ephemeral-close',
+        action: 'close-window',
+        session: 'ephemeral-default',
+        surface: 'adapter',
+      });
+
+      const expectedAlarmName = `opencli:warm-tab:${tabId}`;
+      expect(chrome.alarms.create).toHaveBeenCalledWith(expectedAlarmName, {
+        when: now + 1800 * 1000,
+      });
+      expect(mod.__test__.getSession(adapterKey('ephemeral-default'))).toBeNull();
+    });
+
+    it('expires an alarm-owned warm tab after service-worker recovery without a lease cache', async () => {
+      const { chrome, tabs, update } = createChromeMock();
+      tabs.splice(1);
+      vi.stubGlobal('chrome', chrome);
+      await chrome.storage.session.set({
+        opencli_target_lease_registry_v2: {
+          version: 2,
+          contextId: 'user-default',
+          ownedContainers: { interactive: { windowId: null, groupIds: [] }, automation: { windowId: 1 } },
+          leases: {},
+        },
+      });
+      await import('./background');
+
+      const onAlarmListener = chrome.alarms.onAlarm.addListener.mock.calls[0][0];
+      await onAlarmListener({ name: 'opencli:warm-tab:1' });
+
+      expect(update).toHaveBeenCalledWith(1, { url: 'about:blank' });
+    });
+
+    it('schedules custom TTL warm-tab alarm with last-release-wins across session reuse', async () => {
+      const { chrome } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+
+      const now = 1700000000000;
+      vi.spyOn(Date, 'now').mockReturnValue(now);
+
+      // Session A opens ephemeral adapter lease with 300s TTL
+      await mod.__test__.handleCommand({
+        id: 'nav-a',
+        action: 'navigate',
+        session: 'session-a',
+        surface: 'adapter',
+        siteSession: 'ephemeral',
+        url: 'https://a.example/',
+        warmTabTtl: 300,
+      });
+      const tabId = mod.__test__.getSession(adapterKey('session-a'))?.preferredTabId;
+      expect(tabId).toBeDefined();
+      await vi.waitFor(async () => {
+        const stored = await chrome.storage.session.get('opencli_target_lease_registry_v2') as Record<string, any>;
+        expect(stored.opencli_target_lease_registry_v2.leases[adapterKey('session-a')].warmTabTtlSeconds).toBe(300);
+      });
+
+      chrome.alarms.create.mockClear();
+      chrome.alarms.clear.mockClear();
+
+      // Session A releases tab, scheduling alarm at now + 300s
+      await mod.__test__.handleCommand({
+        id: 'close-a',
+        action: 'close-window',
+        session: 'session-a',
+        surface: 'adapter',
+      });
+
+      const expectedAlarmName = `opencli:warm-tab:${tabId}`;
+      expect(chrome.alarms.create).toHaveBeenCalledWith(expectedAlarmName, {
+        when: now + 300 * 1000,
+      });
+      expect(mod.__test__.getSession(adapterKey('session-a'))).toBeNull();
+
+      chrome.alarms.create.mockClear();
+      chrome.alarms.clear.mockClear();
+
+      // Session B claims the reusable tab, clearing Session A's warm alarm
+      await mod.__test__.handleCommand({
+        id: 'nav-b',
+        action: 'navigate',
+        session: 'session-b',
+        surface: 'adapter',
+        siteSession: 'ephemeral',
+        url: 'https://b.example/',
+        warmTabTtl: 60,
+      });
+
+      expect(chrome.alarms.clear).toHaveBeenCalledWith(expectedAlarmName);
+      expect(mod.__test__.getSession(adapterKey('session-b'))?.preferredTabId).toBe(tabId);
+
+      chrome.alarms.create.mockClear();
+
+      // Session B releases the tab with 60s TTL; new alarm scheduled at later + 60s
+      const later = now + 10000;
+      vi.spyOn(Date, 'now').mockReturnValue(later);
+
+      await mod.__test__.handleCommand({
+        id: 'close-b',
+        action: 'close-window',
+        session: 'session-b',
+        surface: 'adapter',
+      });
+
+      expect(chrome.alarms.create).toHaveBeenCalledWith(expectedAlarmName, {
+        when: later + 60 * 1000,
+      });
+    });
+
+    it('clears warm alarm and does not schedule when TTL is -1', async () => {
+      const { chrome } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+
+      await mod.__test__.handleCommand({
+        id: 'nav-neg1',
+        action: 'navigate',
+        session: 'ephemeral-neg1',
+        surface: 'adapter',
+        siteSession: 'ephemeral',
+        url: 'https://example.com/',
+      });
+      const tabId = mod.__test__.getSession(adapterKey('ephemeral-neg1'))?.preferredTabId;
+
+      chrome.alarms.create.mockClear();
+      chrome.alarms.clear.mockClear();
+
+      await mod.__test__.handleCommand({
+        id: 'close-neg1',
+        action: 'close-window',
+        session: 'ephemeral-neg1',
+        surface: 'adapter',
+        warmTabTtl: -1,
+      });
+
+      expect(chrome.alarms.clear).toHaveBeenCalledWith(`opencli:warm-tab:${tabId}`);
+      const warmAlarmCalls = chrome.alarms.create.mock.calls.filter((c: any[]) =>
+        typeof c[0] === 'string' && c[0].startsWith('opencli:warm-tab:'),
+      );
+      expect(warmAlarmCalls).toHaveLength(0);
+    });
+
+    it('immediately expires warm tab without deadlock when TTL is 0', async () => {
+      const { chrome, tabs } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+
+      await mod.__test__.handleCommand({
+        id: 'nav-first',
+        action: 'navigate',
+        session: 'first',
+        surface: 'adapter',
+        siteSession: 'ephemeral',
+        url: 'https://example.com/1',
+      });
+      const firstTabId = mod.__test__.getSession(adapterKey('first'))?.preferredTabId;
+
+      // Add a second tab to automation window so firstTabId is not the last tab
+      await chrome.tabs.create({ windowId: 1, url: 'https://example.com/2', active: true });
+
+      chrome.tabs.remove.mockClear();
+      chrome.alarms.clear.mockClear();
+
+      await mod.__test__.handleCommand({
+        id: 'close-zero',
+        action: 'close-window',
+        session: 'first',
+        surface: 'adapter',
+        warmTabTtl: 0,
+      });
+
+      expect(chrome.alarms.clear).toHaveBeenCalledWith(`opencli:warm-tab:${firstTabId}`);
+      expect(chrome.tabs.remove).toHaveBeenCalledWith(firstTabId);
+    });
+
+    it('cancels stale warm alarm when physical tab is claimed in setLeaseSession', async () => {
+      const { chrome } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+
+      await mod.__test__.handleCommand({
+        id: 'nav-reuse',
+        action: 'navigate',
+        session: 'reuse-1',
+        surface: 'adapter',
+        siteSession: 'ephemeral',
+        url: 'https://example.com/',
+        warmTabTtl: 100,
+      });
+      const tabId = mod.__test__.getSession(adapterKey('reuse-1'))?.preferredTabId;
+
+      await mod.__test__.handleCommand({
+        id: 'close-reuse',
+        action: 'close-window',
+        session: 'reuse-1',
+        surface: 'adapter',
+      });
+
+      chrome.alarms.clear.mockClear();
+
+      // Another session claims the tabId directly
+      mod.__test__.setSession(adapterKey('reuse-2'), {
+        windowId: 1,
+        owned: true,
+        preferredTabId: tabId!,
+      });
+
+      expect(chrome.alarms.clear).toHaveBeenCalledWith(`opencli:warm-tab:${tabId}`);
+    });
+
+    it('ensures active and new leases survive stale warm alarms', async () => {
+      const { chrome, update } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+
+      await mod.__test__.handleCommand({
+        id: 'nav-survive',
+        action: 'navigate',
+        session: 'active-session',
+        surface: 'adapter',
+        siteSession: 'ephemeral',
+        url: 'https://active.example/',
+      });
+      const activeTabId = mod.__test__.getSession(adapterKey('active-session'))?.preferredTabId!;
+
+      chrome.tabs.remove.mockClear();
+      update.mockClear();
+
+      // Trigger warm alarm for the active tab
+      const onAlarmListener = chrome.alarms.onAlarm.addListener.mock.calls[0][0];
+      await onAlarmListener({ name: `opencli:warm-tab:${activeTabId}` });
+
+      expect(chrome.tabs.remove).not.toHaveBeenCalled();
+      expect(update).not.toHaveBeenCalled();
+      expect(mod.__test__.getSession(adapterKey('active-session'))).not.toBeNull();
+    });
+
+    it('converges multiple expired warm tabs to one about:blank placeholder', async () => {
+      const { chrome, tabs, update } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+
+      await mod.__test__.resolveTabId(undefined, adapterKey('init'));
+      await mod.__test__.handleCommand({ id: 'c', action: 'close-window', session: 'init', surface: 'adapter' });
+
+      // Construct three unleased warm tabs in the container
+      tabs.length = 0;
+      tabs.push(
+        { id: 10, windowId: 1, url: 'https://site1.example', active: false, status: 'complete', groupId: -1 },
+        { id: 20, windowId: 1, url: 'https://site2.example', active: false, status: 'complete', groupId: -1 },
+        { id: 30, windowId: 1, url: 'https://site3.example', active: true, status: 'complete', groupId: -1 },
+      );
+      chrome.tabs.remove.mockImplementation(async (removeTabId: number) => {
+        const idx = tabs.findIndex((t) => t.id === removeTabId);
+        if (idx !== -1) tabs.splice(idx, 1);
+      });
+
+      const onAlarmListener = chrome.alarms.onAlarm.addListener.mock.calls[0][0];
+
+      await onAlarmListener({ name: 'opencli:warm-tab:10' });
+      await onAlarmListener({ name: 'opencli:warm-tab:20' });
+      await onAlarmListener({ name: 'opencli:warm-tab:30' });
+
+      expect(tabs.length).toBe(1);
+      expect(tabs[0].id).toBe(30);
+      expect(update).toHaveBeenCalledWith(30, { url: 'about:blank' });
+    });
+
+    it('clears physical tab warm alarm on chrome.tabs.onRemoved', async () => {
+      const { chrome } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      await import('./background');
+
+      chrome.alarms.clear.mockClear();
+
+      const onRemovedListener = chrome.tabs.onRemoved.addListener.mock.calls[0][0];
+      await onRemovedListener(42);
+
+      expect(chrome.alarms.clear).toHaveBeenCalledWith('opencli:warm-tab:42');
+    });
+
+    it('treats missing or moved tabs as no-ops during warm tab expiry', async () => {
+      const { chrome, tabs, query, update } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      await import('./background');
+
+      const onAlarmListener = chrome.alarms.onAlarm.addListener.mock.calls[0][0];
+
+      // Missing tab (id 999 not in tabs)
+      await onAlarmListener({ name: 'opencli:warm-tab:999' });
+      expect(chrome.tabs.remove).not.toHaveBeenCalled();
+      expect(update).not.toHaveBeenCalled();
+
+      // Tab moved out of automation container (windowId 2 !== automationWindow 1)
+      await onAlarmListener({ name: 'opencli:warm-tab:2' });
+      expect(chrome.tabs.remove).not.toHaveBeenCalled();
+      expect(update).not.toHaveBeenCalled();
+
+      // Tab 1 moves after tabs.get() validates it but before the window query returns.
+      query.mockImplementation(async (queryInfo: { windowId?: number } = {}) => {
+        const target = tabs.find((tab) => tab.id === 1);
+        if (queryInfo.windowId === 1 && target) target.windowId = 2;
+        return tabs.filter((tab) => queryInfo.windowId === undefined || tab.windowId === queryInfo.windowId);
+      });
+      await onAlarmListener({ name: 'opencli:warm-tab:1' });
+      expect(chrome.tabs.remove).not.toHaveBeenCalled();
+      expect(update).not.toHaveBeenCalled();
+    });
+
+    it('does not schedule warm-tab alarm on persistent adapter release', async () => {
+      const { chrome } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+
+      await mod.__test__.handleCommand({
+        id: 'pers-nav',
+        action: 'navigate',
+        session: 'pers-sess',
+        surface: 'adapter',
+        siteSession: 'persistent',
+        url: 'https://chatgpt.com/',
+      });
+      chrome.alarms.create.mockClear();
+
+      await mod.__test__.handleCommand({
+        id: 'pers-close',
+        action: 'close-window',
+        session: 'pers-sess',
+        surface: 'adapter',
+      });
+
+      const warmAlarmCalls = chrome.alarms.create.mock.calls.filter((c: any[]) =>
+        typeof c[0] === 'string' && c[0].startsWith('opencli:warm-tab:'),
+      );
+      expect(warmAlarmCalls).toHaveLength(0);
+    });
   });
 });

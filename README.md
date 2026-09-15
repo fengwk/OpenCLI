@@ -179,7 +179,7 @@ When the site you need is not yet covered, use the `opencli-adapter-author` skil
 | `OPENCLI_VERBOSE` | `false` | Enable verbose logging (`-v` flag also works) |
 | `DEBUG_SNAPSHOT` | — | Set to `1` for DOM snapshot debug output |
 
-`opencli browser *` requires an explicit `<session>` positional, uses a foreground browser window by default, and keeps that session's tab lease until `opencli browser <session> close` or idle cleanup. Browser-backed adapters use a background adapter window and release their logical tab leases by default; released ephemeral tabs can be retained at their current URL and reused by later commands, but are never shared while leased. Interactive adapters can declare `siteSession: 'persistent'` to keep a stable logical site session for continuity; pass `--site-session ephemeral` for an isolated one-shot lease.
+`opencli browser *` requires an explicit `<session>` positional immediately after `browser`, uses a foreground browser window by default, and keeps that session's tab lease until `opencli browser <session> close` or idle cleanup. Browser-backed adapters use a background adapter window and release their logical tab leases by default; released ephemeral tabs can be retained at their current URL and reused by later commands, but are never shared while leased. They are reclaimed after 1800 seconds by default; browser-backed adapter commands accept `--warm-tab-ttl <seconds>` to override this (`-1` never reclaims, `0` reclaims immediately). Interactive adapters can declare `siteSession: 'persistent'` to keep a stable logical site session for continuity; pass `--site-session ephemeral` for an isolated one-shot lease.
 
 ## Built-in Commands
 

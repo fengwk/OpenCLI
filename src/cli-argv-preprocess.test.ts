@@ -276,8 +276,14 @@ describe('escapeLeadingDashPositional', () => {
   });
 
   it('keeps adapter and browser options parseable when they follow the positional', () => {
-    expect(escapeLeadingDashPositional(['boss', 'detail', '-xyz', '--retry', '2', '--window', 'foreground'], manifest))
-      .toEqual(['boss', 'detail', '--retry', '2', '--window', 'foreground', '--', '-xyz']);
+    expect(escapeLeadingDashPositional([
+      'boss', 'detail', '-xyz',
+      '--retry', '2', '--window', 'foreground', '--warm-tab-ttl', '-1',
+    ], manifest)).toEqual([
+      'boss', 'detail',
+      '--retry', '2', '--window', 'foreground', '--warm-tab-ttl', '-1',
+      '--', '-xyz',
+    ]);
   });
 
   it('protects negative numeric positionals too', () => {

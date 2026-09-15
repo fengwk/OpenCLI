@@ -192,6 +192,7 @@ function knownCommandOptions(cmd: DashPositionalManifestEntry): Map<string, Opti
     options.set('--window', 'required');
     options.set('--site-session', 'required');
     options.set('--keep-tab', 'required');
+    options.set('--warm-tab-ttl', 'required');
   }
   for (const arg of cmd.args ?? []) {
     if (arg.positional) continue;
