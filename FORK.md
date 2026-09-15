@@ -21,6 +21,17 @@ Use it when merging back to mainline or rebasing onto upstream.
 
 ## Changelog (fork)
 
+### 2026-09-15
+
+#### Configurable warm-tab reclamation
+
+Released as CLI `1.8.7-fengwk.12` with paired extension `1.0.33`.
+
+| Area | Change | Paths |
+|------|--------|-------|
+| warm-tab TTL | Browser-backed adapter commands accept `--warm-tab-ttl <seconds>` with `-1` (never reclaim), `0` (immediate reclaim), and positive-second semantics; the default is 1800 seconds. | `src/commanderAdapter.ts`, `src/execution.ts`, `src/browser/` |
+| MV3 reclamation | Released ephemeral adapter tabs use one-shot Chrome alarms keyed by physical tab ID. Expiry closes surplus tabs or resets the last automation tab to `about:blank`; active leases and persistent sessions are protected. | `extension/src/background.ts`, `extension/src/protocol.ts` |
+
 ### 2026-09-02
 
 #### Ephemeral warm-tab reuse
@@ -105,8 +116,8 @@ CLI `1.8.7-fengwk.9` and extension `1.0.30`.
 
 | Component | Version |
 |-----------|---------|
-| CLI (`@jackwener/opencli`) | `1.8.7-fengwk.11` |
-| Extension | `1.0.32` (`compatRange`: `>=1.8.7`) |
+| CLI (`@jackwener/opencli`) | `1.8.7-fengwk.12` |
+| Extension | `1.0.33` (`compatRange`: `>=1.8.7`) |
 
 ### Auto-update policy (fork)
 
@@ -160,15 +171,15 @@ npm ci
 
 Artifacts (version-based names, no timestamps):
 
-- `jackwener-opencli-1.8.7-fengwk.11.tgz`
-- `opencli-extension-v1.0.32.zip`
+- `jackwener-opencli-1.8.7-fengwk.12.tgz`
+- `opencli-extension-v1.0.33.zip`
 - `SHA256SUMS`
 - `build-info.json`
 
 ```bash
 # install CLI from the tarball (not npm publish)
-npm install -g ./artifacts/jackwener-opencli-1.8.7-fengwk.11.tgz
-opencli --version   # → 1.8.7-fengwk.11
+npm install -g ./artifacts/jackwener-opencli-1.8.7-fengwk.12.tgz
+opencli --version   # → 1.8.7-fengwk.12
 
 # plugin
 opencli plugin install ~/proj/my-opencli/packages/chatgpt-agent
