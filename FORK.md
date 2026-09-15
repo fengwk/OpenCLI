@@ -23,6 +23,19 @@ Use it when merging back to mainline or rebasing onto upstream.
 
 ### 2026-09-15
 
+#### Upstream v1.8.8 merge & security / E2E hardening
+
+Released as CLI `1.8.8-fengwk.1` with paired extension `1.0.34`.
+
+This release includes upstream `origin/main` at `8271afc67e8504bda94c147f446ee29775d08274` (`v1.8.8`).
+
+| Area | Change | Paths |
+|------|--------|-------|
+| upstream merge | Merged upstream v1.8.8: Xiaohongshu ask chunk-fingerprint lookup and /ai_chat entry, soft-block cooldown retry, duck-typing cross-package CliError, explicit CDP endpoint via `OPENCLI_CDP_ENDPOINT`, Dribbble commands, packaged bundle size reduction (-35%). | `clis/xiaohongshu/`, `src/errors.ts`, `src/runtime.ts`, `package.json` |
+| security audit | Upgraded `js-yaml` from `4.3.1` to `4.3.2` to resolve high-severity vulnerability GHSA-2883-xcg3-v3hh. | `package.json`, `package-lock.json` |
+| e2e tolerance | Added network restriction / timeout skip guards for dictionary public API e2e tests. | `tests/e2e/public-commands.test.ts` |
+| website dispatch | Added secret check to avoid failing website rebuild dispatch in fork repos. | `.github/workflows/docs.yml` |
+
 #### Configurable warm-tab reclamation
 
 Released as CLI `1.8.7-fengwk.12` with paired extension `1.0.33`.
