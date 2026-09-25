@@ -200,7 +200,10 @@ describe('chatgpt conversation navigation', () => {
         await expect(openChatGPTConversation(page, 'https://chatgpt.com/c/abc_123-def?model=gpt-5'))
             .resolves.toBe('abc_123-def');
         expect(page.goto).toHaveBeenCalledWith('https://chatgpt.com/c/abc_123-def', { settleMs: 2000 });
-        expect(page.wait).toHaveBeenCalledWith({ selector: '#prompt-textarea, [data-testid="prompt-textarea"]', timeout: 8 });
+        expect(page.wait).toHaveBeenCalledWith({
+            selector: '#prompt-textarea, [data-testid="prompt-textarea"], form[data-chatgpt-composer] [contenteditable="true"][role="textbox"]',
+            timeout: 8,
+        });
     });
 });
 
@@ -1211,6 +1214,17 @@ describe('chatgpt generation state', () => {
               <div data-message-author-role="assistant">partial answer</div>
               <div>Thinking</div>
             </article>
+        `);
+
+        await expect(isGenerating(page)).resolves.toBe(true);
+    });
+
+    it('detects the current composer Stop button without a test id', async () => {
+        const page = createDomEvaluatePage(`
+            <form data-chatgpt-composer>
+              <div role="textbox" aria-label="Ask ChatGPT"></div>
+              <button aria-label="Stop"></button>
+            </form>
         `);
 
         await expect(isGenerating(page)).resolves.toBe(true);

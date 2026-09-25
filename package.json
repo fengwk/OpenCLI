@@ -1,6 +1,6 @@
 {
   "name": "@jackwener/opencli",
-  "version": "1.8.8-fengwk.1",
+  "version": "1.8.8-fengwk.2",
   "publishConfig": {
     "access": "public"
   },

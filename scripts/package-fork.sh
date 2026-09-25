@@ -69,11 +69,15 @@ BUILD_INFO_PATH="${OUTPUT_DIR}/build-info.json"
 SHRINKWRAP_PATH="${ROOT}/npm-shrinkwrap.json"
 STAGE_EXT_DIR="${ROOT}/extension-package"
 CREATED_SHRINKWRAP=0
+CLI_PACK_STAGE=""
 
 cleanup() {
   # Only remove a shrinkwrap that this packaging run created.
   if [[ "${CREATED_SHRINKWRAP}" -eq 1 ]]; then
     rm -f "${SHRINKWRAP_PATH}"
+  fi
+  if [[ -n "${CLI_PACK_STAGE}" ]]; then
+    rm -rf "${CLI_PACK_STAGE}"
   fi
 }
 trap cleanup EXIT
@@ -113,9 +117,23 @@ if [[ ! -f "${CLI_TGZ_PATH}" ]]; then
   ls -la "${OUTPUT_DIR}" >&2 || true
   exit 1
 fi
+# Some npm-compatible pack implementations omit shrinkwrap files even when
+# explicitly listed in package.json. Restore the lock inside the tarball before
+# verification so installing this fork still pins its production dependency tree.
+TAR_LIST="$(tar -tzf "${CLI_TGZ_PATH}")"
+if ! grep -xF 'package/npm-shrinkwrap.json' <<<"${TAR_LIST}" >/dev/null; then
+  CLI_PACK_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/opencli-pack-XXXXXXXX")"
+  tar -xzf "${CLI_TGZ_PATH}" -C "${CLI_PACK_STAGE}"
+  cp "${SHRINKWRAP_PATH}" "${CLI_PACK_STAGE}/package/npm-shrinkwrap.json"
+  tar -czf "${CLI_TGZ_PATH}" -C "${CLI_PACK_STAGE}" package
+fi
 # Remove the temporary shrinkwrap promptly; EXIT trap is a safety net.
 rm -f "${SHRINKWRAP_PATH}"
 CREATED_SHRINKWRAP=0
+if [[ -n "${CLI_PACK_STAGE}" ]]; then
+  rm -rf "${CLI_PACK_STAGE}"
+  CLI_PACK_STAGE=""
+fi
 
 echo "==> [4/6] Zip extension-package → ${EXT_ZIP_NAME}"
 (
@@ -159,7 +177,7 @@ fi
 
 # Extension zip: pure-CDP file-input fallback markers + manifest version.
 PACKED_BG_JS="$(unzip -p "${EXT_ZIP_PATH}" dist/background.js)"
-for required_marker in 'DOM.getDocument' 'DOM.querySelector' 'DOM.setFileInputFiles'; do
+for required_marker in 'DOM.getDocument' 'DOM.querySelector' 'DOM.setFileInputFiles' 'Network.streamResourceContent'; do
   if [[ "${PACKED_BG_JS}" != *"${required_marker}"* ]]; then
     echo "ERROR: packaged background.js missing ${required_marker}" >&2
     exit 1

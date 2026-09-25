@@ -25,13 +25,15 @@ Use it when merging back to mainline or rebasing onto upstream.
 
 #### HTTP SSE stream capture
 
-Unreleased on top of CLI `1.8.8-fengwk.1` / extension `1.0.34`. Shipping this needs a paired
-extension build and version bump (new protocol actions).
+CLI `1.8.8-fengwk.2` / extension `1.0.35` are paired in `fork-v1.8.8-fengwk.2`;
+both must be installed together for the new protocol actions.
 
 | Area | Change | Paths |
 |------|--------|-------|
 | SSE capture | `startSseCapture` / `readSseCapture` / `stopSseCapture`: incremental capture of `text/event-stream` response bodies via `Network.streamResourceContent` (buffered prefix first, then `Network.dataReceived` chunks in wire order), bounded by an aggregate count + byte budget with oldest-first eviction reported through `dropped`, per-chunk 1 MiB cap flagged via `payloadTruncated`, `sse-error` entries for a failed arm and for `Network.loadingFailed` abnormal termination instead of a silently empty stream, no page fetch/XHR patching and no `Network.*` additions to the `cdp` allowlist. | `extension/src/cdp.ts`, `extension/src/protocol.ts`, `extension/src/background.ts`, `src/browser/page.ts`, `src/browser/cdp.ts`, `src/browser/daemon-client.ts`, `src/types.ts` |
 | SSE design note | Capture semantics, ordering, limits, lifecycle | `docs/design/sse-stream-capture.md` |
+| direct CDP network drain | Clear stale in-flight request indexes after draining ordinary HTTP capture so late responses cannot throw or corrupt a newer entry. | `src/browser/cdp.ts`, `src/browser/cdp.test.ts` |
+| upstream sync | Merged `origin/main` at `24136945847afbfad266c6c46a8cd335377f9112`: removed site sitemaps and the external CLI hub; the fork's browser and plugin features do not depend on either. | `src/cli.ts`, `src/external.ts`, `sitemaps/`, `docs/` |
 
 ### 2026-09-15
 
@@ -141,8 +143,8 @@ CLI `1.8.7-fengwk.9` and extension `1.0.30`.
 
 | Component | Version |
 |-----------|---------|
-| CLI (`@jackwener/opencli`) | `1.8.7-fengwk.12` |
-| Extension | `1.0.33` (`compatRange`: `>=1.8.7`) |
+| CLI (`@jackwener/opencli`) | `1.8.8-fengwk.2` |
+| Extension | `1.0.35` (`compatRange`: `>=1.8.7`) |
 
 ### Auto-update policy (fork)
 

@@ -590,6 +590,8 @@ class CDPPage extends CDPBasePage {
     }
     const entries = [...this._networkEntries];
     this._networkEntries = [];
+    // Entries already returned cannot be updated by later response events.
+    this._pendingRequests.clear();
     return entries;
   }
 

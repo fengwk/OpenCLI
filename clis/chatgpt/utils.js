@@ -291,7 +291,7 @@ export async function isOnChatGPT(page) {
 // wait succeeds as soon as any composer flavour mounts (querySelectorAll
 // matches all of them). Tracks the most stable subset of COMPOSER_SELECTORS;
 // we only need to know "the composer is ready", not which variant rendered.
-const COMPOSER_WAIT_SELECTOR = '#prompt-textarea, [data-testid="prompt-textarea"]';
+const COMPOSER_WAIT_SELECTOR = '#prompt-textarea, [data-testid="prompt-textarea"], form[data-chatgpt-composer] [contenteditable="true"][role="textbox"]';
 const CONVERSATION_LINK_SELECTOR = 'a[href*="/c/"]';
 const PROJECT_LINK_SELECTOR = 'a[href*="/g/g-p-"]';
 // Selector used by detail.js to wait for at least one rendered message bubble
@@ -2482,7 +2482,7 @@ export async function isGenerating(page) {
     // textContent (no reflow) scan scoped to the composer + last turn.
     return requireBooleanEvaluateResult(unwrapEvaluateResult(await page.evaluate(`
         (() => {
-            if (document.querySelector('[data-testid="stop-button"]')) return true;
+            if (document.querySelector('[data-testid="stop-button"], button[aria-label="Stop"], button[aria-label="Stop streaming"], button[aria-label="停止生成"], button[aria-label="停止"]')) return true;
             // No bare 'Thinking' here: the model picker renders 'Thinking' as
             // an idle model label (see CHATGPT_MODEL_TARGETS.advanced), and an
             // English streaming state always comes with the stop button above.
@@ -2506,7 +2506,7 @@ export async function isGenerating(page) {
             const turns = document.querySelectorAll('article[data-testid*="conversation-turn"]');
             const messages = turns.length ? turns : document.querySelectorAll('[data-message-author-role]');
             if (messages.length) scopes.push([messages[messages.length - 1], /正在思考|停止生成|Thinking/]);
-            const composer = document.querySelector('#prompt-textarea, [aria-label="Chat with ChatGPT"]');
+            const composer = document.querySelector('#prompt-textarea, [aria-label="Chat with ChatGPT"], [aria-label="Ask ChatGPT"], form[data-chatgpt-composer] [role="textbox"]');
             if (composer) {
                 let root = composer;
                 for (let i = 0; i < 4 && root.parentElement; i += 1) root = root.parentElement;

@@ -136,6 +136,40 @@ describe('CDPBridge cookies', () => {
     });
     expect(String(entries[0].requestBodyPreview)).toHaveLength(CDP_REQUEST_BODY_CAPTURE_LIMIT);
   });
+
+  // Draining an in-flight request must not attach its late response to a new entry.
+  it('drops stale request indexes after reading an in-flight network capture', async () => {
+    vi.stubEnv('OPENCLI_CDP_ENDPOINT', 'ws://127.0.0.1:9222/devtools/page/1');
+    const bridge = new CDPBridge();
+    vi.spyOn(bridge, 'send').mockResolvedValue({});
+    const page = await bridge.connect();
+    await page.startNetworkCapture?.();
+
+    const emit = (method: string, params: object) => MockWebSocket.lastInstance?.emit(
+      'message', Buffer.from(JSON.stringify({ method, params })),
+    );
+    emit('Network.requestWillBeSent', {
+      requestId: 'old',
+      request: { method: 'GET', url: 'https://example.test/slow' },
+    });
+    expect(await page.readNetworkCapture?.()).toHaveLength(1);
+    emit('Network.requestWillBeSent', {
+      requestId: 'new',
+      request: { method: 'GET', url: 'https://example.test/fast' },
+    });
+
+    expect(() => emit('Network.responseReceived', {
+      requestId: 'old',
+      response: { status: 404, mimeType: 'text/plain' },
+    })).not.toThrow();
+    emit('Network.responseReceived', {
+      requestId: 'new',
+      response: { status: 200, mimeType: 'application/json' },
+    });
+    expect(await page.readNetworkCapture?.()).toMatchObject([
+      { url: 'https://example.test/fast', responseStatus: 200 },
+    ]);
+  });
 });
 
 describe('CDPBridge SSE stream capture', () => {
