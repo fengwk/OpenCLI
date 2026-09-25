@@ -15,6 +15,7 @@ const CDP_WS_FRAME_PAYLOAD_LIMIT = 1 * 1024 * 1024;
 const CDP_WS_FRAME_BUFFER_LIMIT = 1e4;
 const CDP_SSE_CHUNK_PAYLOAD_LIMIT = 1 * 1024 * 1024;
 const CDP_SSE_CHUNK_BUFFER_LIMIT = 1e4;
+const CDP_SSE_CAPTURE_BYTE_BUDGET = 16 * 1024 * 1024;
 const CDP_SSE_ARM_TIMEOUT_MS = 1e4;
 const SSE_CAPTURE_EVENTS = /* @__PURE__ */ new Set([
   "Network.responseReceived",
@@ -869,6 +870,8 @@ async function startSseCapture(tabId, pattern) {
     patterns: normalizeCapturePatterns(pattern),
     entries: [],
     requests: /* @__PURE__ */ new Map(),
+    retainedCount: 0,
+    retainedBytes: 0,
     dropped: 0
   });
   await sendDebuggerCommand({ tabId }, "Network.enable");
@@ -876,12 +879,11 @@ async function startSseCapture(tabId, pattern) {
 async function readSseCapture(tabId) {
   const state = sseCaptures.get(tabId);
   if (!state) return { chunks: [], dropped: 0 };
-  const chunks = state.entries.slice();
+  const chunks = drainSseEntries(state);
   const dropped = state.dropped;
-  state.entries = [];
   state.dropped = 0;
   if (dropped > 0) {
-    console.warn(`[opencli] sse-capture dropped ${dropped} chunk(s) on tab ${tabId} (ring full)`);
+    console.warn(`[opencli] sse-capture dropped ${dropped} chunk(s) on tab ${tabId} (capture budget exceeded)`);
   }
   return { chunks, dropped };
 }
@@ -980,14 +982,66 @@ function encodeSseChunk(url, requestId, data) {
     payloadTruncated: truncated
   };
 }
-function pushBoundedSseChunk(target, chunk) {
-  let dropped = 0;
-  if (target.length >= CDP_SSE_CHUNK_BUFFER_LIMIT) {
-    dropped = target.length - CDP_SSE_CHUNK_BUFFER_LIMIT + 1;
-    target.splice(0, dropped);
+function sseErrorChunk(url, requestId, error) {
+  return { kind: "sse-error", url, requestId, timestamp: Date.now(), error };
+}
+function sseChunkBytes(chunk) {
+  return chunk.kind === "sse-chunk" ? chunk.payload.length : 0;
+}
+function oldestSsePrefixToDrop(list, countNeeded, bytesNeeded) {
+  let count = 0;
+  let bytes = 0;
+  while (count < list.length && (countNeeded > count || bytesNeeded > bytes)) {
+    bytes += sseChunkBytes(list[count]);
+    count += 1;
   }
-  target.push(chunk);
-  return dropped;
+  return { count, bytes };
+}
+function trimSseCapture(state, incomingBytes) {
+  let countNeeded = state.retainedCount + 1 - CDP_SSE_CHUNK_BUFFER_LIMIT;
+  let bytesNeeded = state.retainedBytes + incomingBytes - CDP_SSE_CAPTURE_BYTE_BUDGET;
+  if (countNeeded <= 0 && bytesNeeded <= 0) return;
+  const dropOldest = (list) => {
+    if (countNeeded <= 0 && bytesNeeded <= 0) return;
+    const prefix = oldestSsePrefixToDrop(list, countNeeded, bytesNeeded);
+    if (prefix.count <= 0) return;
+    list.splice(0, prefix.count);
+    state.retainedCount -= prefix.count;
+    state.retainedBytes -= prefix.bytes;
+    state.dropped += prefix.count;
+    countNeeded -= prefix.count;
+    bytesNeeded -= prefix.bytes;
+  };
+  dropOldest(state.entries);
+  for (const request of state.requests.values()) dropOldest(request.queued);
+}
+function storeSseChunk(state, chunk, target) {
+  const bytes = sseChunkBytes(chunk);
+  trimSseCapture(state, bytes);
+  if (target === "entries") state.entries.push(chunk);
+  else target.queued.push(chunk);
+  state.retainedCount += 1;
+  state.retainedBytes += bytes;
+}
+function releaseSseChunks(state, chunks) {
+  state.retainedCount -= chunks.length;
+  for (const chunk of chunks) state.retainedBytes -= sseChunkBytes(chunk);
+  return chunks;
+}
+function releaseSseQueue(state, request) {
+  const queued = request.queued;
+  request.queued = [];
+  return releaseSseChunks(state, queued);
+}
+function drainSseEntries(state) {
+  const drained = state.entries;
+  state.entries = [];
+  return releaseSseChunks(state, drained);
+}
+function sseFailureReason(eventParams) {
+  const errorText = String(eventParams?.errorText || "").replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, "<url>").slice(0, 200);
+  if (errorText) return `stream failed: ${errorText}`;
+  return eventParams?.canceled ? "stream canceled" : "stream failed";
 }
 function armSseStream(tabId, state, requestId, request) {
   return sendDebuggerCommand(
@@ -1004,27 +1058,33 @@ function armSseStream(tabId, state, requestId, request) {
       encodeSseChunk(request.url, requestId, result?.bufferedData)
     );
   }).catch((err) => {
-    flushSseStream(tabId, state, requestId, request, {
-      kind: "sse-error",
-      url: request.url,
+    flushSseStream(
+      tabId,
+      state,
       requestId,
-      timestamp: Date.now(),
-      error: err instanceof Error ? err.message : String(err)
-    });
+      request,
+      sseErrorChunk(request.url, requestId, err instanceof Error ? err.message : String(err))
+    );
   });
 }
 function flushSseStream(tabId, state, requestId, request, leading) {
   if (sseCaptures.get(tabId) !== state) return;
-  if (leading) state.dropped += pushBoundedSseChunk(state.entries, leading);
-  for (const queued of request.queued) {
-    state.dropped += pushBoundedSseChunk(state.entries, queued);
+  if (leading) storeSseChunk(state, leading, "entries");
+  for (const queued of releaseSseQueue(state, request)) {
+    storeSseChunk(state, queued, "entries");
   }
-  request.queued = [];
+  const failure = request.failure;
+  request.failure = void 0;
   if (leading?.kind === "sse-error") {
     state.requests.delete(requestId);
     return;
   }
   request.live = true;
+  if (failure) {
+    storeSseChunk(state, sseErrorChunk(request.url, requestId, failure), "entries");
+    state.requests.delete(requestId);
+    return;
+  }
   if (request.finished) state.requests.delete(requestId);
 }
 function handleSseCaptureEvent(tabId, method, eventParams) {
@@ -1047,19 +1107,18 @@ function handleSseCaptureEvent(tabId, method, eventParams) {
   if (method === "Network.dataReceived") {
     const chunk = encodeSseChunk(request.url, requestId, eventParams?.data);
     if (!chunk) return;
-    if (request.live) {
-      state.dropped += pushBoundedSseChunk(state.entries, chunk);
-      return;
-    }
-    state.dropped += pushBoundedSseChunk(request.queued, chunk);
+    storeSseChunk(state, chunk, request.live ? "entries" : request);
     return;
   }
   if (method === "Network.loadingFinished" || method === "Network.loadingFailed") {
+    const failure = method === "Network.loadingFailed" ? sseFailureReason(eventParams) : void 0;
     if (request.live) {
+      if (failure) storeSseChunk(state, sseErrorChunk(request.url, requestId, failure), "entries");
       state.requests.delete(requestId);
       return;
     }
     request.finished = true;
+    request.failure = failure;
   }
 }
 function clearFrameTargetsForTab(tabId) {

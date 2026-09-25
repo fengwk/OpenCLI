@@ -50,10 +50,12 @@ export const CDP_RESPONSE_BODY_CAPTURE_LIMIT = 8 * 1024 * 1024;
 const CDP_WS_FRAME_PAYLOAD_LIMIT = 1 * 1024 * 1024;
 const CDP_WS_FRAME_BUFFER_LIMIT = 10_000;
 // SSE chunk limits, kept in sync with extension/src/cdp.ts: one streamed body
-// slice per chunk, ring-buffered by count, oversized chunks stored truncated and
-// flagged so consumers never trust a silently shortened stream.
+// slice per chunk, oversized chunks stored truncated and flagged so consumers
+// never trust a silently shortened stream. Count and byte budgets are aggregate
+// (drained ring + every pending arm queue).
 export const CDP_SSE_CHUNK_PAYLOAD_LIMIT = 1 * 1024 * 1024;
 export const CDP_SSE_CHUNK_BUFFER_LIMIT = 10_000;
+export const CDP_SSE_CAPTURE_BYTE_BUDGET = 16 * 1024 * 1024;
 const CDP_SSE_ARM_TIMEOUT_MS = 10_000;
 export const CDP_REQUEST_BODY_CAPTURE_LIMIT = 1 * 1024 * 1024;
 
@@ -62,6 +64,8 @@ type SseStreamState = {
   url: string;
   live: boolean;
   finished: boolean;
+  /** loadingFailed reason observed at end of stream (flushed as sse-error). */
+  failure?: string;
   queued: SseCaptureChunk[];
 };
 
@@ -69,6 +73,11 @@ type SseCaptureState = {
   patterns: string[];
   entries: SseCaptureChunk[];
   requests: Map<string, SseStreamState>;
+  /** Chunks retained across `entries` + every pending queue. */
+  retainedCount: number;
+  /** Stored payload characters retained across `entries` + every pending queue. */
+  retainedBytes: number;
+  /** Chunks evicted by the count or byte budget (oldest-evicted count). */
   dropped: number;
 };
 
@@ -91,15 +100,115 @@ function encodeSseChunk(url: string, requestId: string, data: unknown): SseCaptu
   };
 }
 
-/** Push into a bounded buffer; returns the number of oldest entries evicted. */
-function pushBoundedSseChunk(target: SseCaptureChunk[], chunk: SseCaptureChunk): number {
-  let dropped = 0;
-  if (target.length >= CDP_SSE_CHUNK_BUFFER_LIMIT) {
-    dropped = target.length - CDP_SSE_CHUNK_BUFFER_LIMIT + 1;
-    target.splice(0, dropped);
+/** One failure entry for a stream that could not be captured end to end. */
+function sseErrorChunk(url: string, requestId: string, error: string): SseCaptureChunk {
+  return { kind: 'sse-error', url, requestId, timestamp: Date.now(), error };
+}
+
+/** Stored payload characters of one chunk — the unit of the byte budget. */
+function sseChunkBytes(chunk: SseCaptureChunk): number {
+  return chunk.kind === 'sse-chunk' ? chunk.payload.length : 0;
+}
+
+/**
+ * How many of the oldest chunks in `list` must go so that dropping them
+ * satisfies the remaining count and byte deficit.
+ */
+function oldestSsePrefixToDrop(
+  list: SseCaptureChunk[],
+  countNeeded: number,
+  bytesNeeded: number,
+): { count: number; bytes: number } {
+  let count = 0;
+  let bytes = 0;
+  while (count < list.length && (countNeeded > count || bytesNeeded > bytes)) {
+    bytes += sseChunkBytes(list[count]);
+    count += 1;
   }
-  target.push(chunk);
-  return dropped;
+  return { count, bytes };
+}
+
+/**
+ * Make room for one more retained chunk.
+ *
+ * A page keeps at most CDP_SSE_CHUNK_BUFFER_LIMIT chunks *and*
+ * CDP_SSE_CAPTURE_BYTE_BUDGET stored base64 payload characters in total, across
+ * the drained ring and every pending arm queue, so a burst of large chunks
+ * cannot pin gigabytes in the host process. Drained entries hold the oldest data
+ * and pending queues follow in stream age order, so eviction is oldest-first.
+ * Every eviction increments `dropped`: a short buffer is always reported, never
+ * silent.
+ */
+function trimSseCapture(state: SseCaptureState, incomingBytes: number): void {
+  let countNeeded = state.retainedCount + 1 - CDP_SSE_CHUNK_BUFFER_LIMIT;
+  let bytesNeeded = state.retainedBytes + incomingBytes - CDP_SSE_CAPTURE_BYTE_BUDGET;
+  if (countNeeded <= 0 && bytesNeeded <= 0) return;
+
+  const dropOldest = (list: SseCaptureChunk[]): void => {
+    if (countNeeded <= 0 && bytesNeeded <= 0) return;
+    const prefix = oldestSsePrefixToDrop(list, countNeeded, bytesNeeded);
+    if (prefix.count <= 0) return;
+    list.splice(0, prefix.count);
+    state.retainedCount -= prefix.count;
+    state.retainedBytes -= prefix.bytes;
+    state.dropped += prefix.count;
+    countNeeded -= prefix.count;
+    bytesNeeded -= prefix.bytes;
+  };
+
+  dropOldest(state.entries);
+  for (const request of state.requests.values()) dropOldest(request.queued);
+}
+
+/** Retain `chunk` for `target` after trimming the capture budget. */
+function storeSseChunk(
+  state: SseCaptureState,
+  chunk: SseCaptureChunk,
+  target: 'entries' | SseStreamState,
+): void {
+  const bytes = sseChunkBytes(chunk);
+  trimSseCapture(state, bytes);
+  if (target === 'entries') state.entries.push(chunk);
+  else target.queued.push(chunk);
+  state.retainedCount += 1;
+  state.retainedBytes += bytes;
+}
+
+/** Release `chunks` from the capture budget while someone else takes them. */
+function releaseSseChunks(state: SseCaptureState, chunks: SseCaptureChunk[]): SseCaptureChunk[] {
+  state.retainedCount -= chunks.length;
+  for (const chunk of chunks) state.retainedBytes -= sseChunkBytes(chunk);
+  return chunks;
+}
+
+/**
+ * Detach a stream's pending chunks so they can be re-stored in order, releasing
+ * their share of the budget first (`storeSseChunk` counts them again).
+ */
+function releaseSseQueue(state: SseCaptureState, request: SseStreamState): SseCaptureChunk[] {
+  const queued = request.queued;
+  request.queued = [];
+  return releaseSseChunks(state, queued);
+}
+
+/** Drain the buffered ring, releasing its share of the budget. */
+function drainSseEntries(state: SseCaptureState): SseCaptureChunk[] {
+  const drained = state.entries;
+  state.entries = [];
+  return releaseSseChunks(state, drained);
+}
+
+/**
+ * Non-sensitive description of `Network.loadingFailed`: Chrome's network error
+ * enum only. URL-looking text is replaced defensively, so a failure entry can
+ * never echo the stream URL, headers or body.
+ */
+function sseFailureReason(eventParams: Record<string, any> | undefined): string {
+  const errorText = String(eventParams?.errorText || '')
+    .replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, '<url>')
+    .slice(0, 200);
+  if (errorText) return `stream failed: ${errorText}`;
+  return eventParams?.canceled ? 'stream canceled' : 'stream failed';
 }
 
 export class CDPBridge implements IBrowserFactory {
@@ -576,6 +685,8 @@ class CDPPage extends CDPBasePage {
         .filter(Boolean),
       entries: [],
       requests: new Map(),
+      retainedCount: 0,
+      retainedBytes: 0,
       dropped: 0,
     };
     this._bindSseCaptureListeners();
@@ -586,9 +697,8 @@ class CDPPage extends CDPBasePage {
   async readSseCapture(): Promise<SseCaptureReadResult> {
     const state = this._sseCapture;
     if (!state) return { chunks: [], dropped: 0 };
-    const chunks = state.entries.slice();
+    const chunks = drainSseEntries(state);
     const dropped = state.dropped;
-    state.entries = [];
     state.dropped = 0;
     return { chunks, dropped };
   }
@@ -625,26 +735,30 @@ class CDPPage extends CDPBasePage {
       if (!request) return;
       const chunk = encodeSseChunk(request.url, requestId, p.data);
       if (!chunk) return;
-      if (request.live) {
-        state.dropped += pushBoundedSseChunk(state.entries, chunk);
-        return;
-      }
-      state.dropped += pushBoundedSseChunk(request.queued, chunk);
+      storeSseChunk(state, chunk, request.live ? 'entries' : request);
     });
     for (const method of ['Network.loadingFinished', 'Network.loadingFailed'] as const) {
       this.bridge.on(method, (params: unknown) => {
         const state = this._sseCapture;
         if (!state) return;
-        const requestId = String((params as { requestId?: string }).requestId || '');
+        const eventParams = params as { requestId?: string } | undefined;
+        const requestId = String(eventParams?.requestId || '');
         const request = state.requests.get(requestId);
         if (!request) return;
+        // An aborted or errored stream never completes its protocol, so the
+        // consumer must be told instead of waiting for silence (its parser would
+        // otherwise block until its own deadline). The reason is Chrome's network
+        // error enum only — never the URL, headers or body.
+        const failure = method === 'Network.loadingFailed' ? sseFailureReason(eventParams) : undefined;
         if (request.live) {
+          if (failure) storeSseChunk(state, sseErrorChunk(request.url, requestId, failure), 'entries');
           state.requests.delete(requestId);
           return;
         }
         // Ended while arming: keep the request until the arm resolves so the
         // buffered prefix and queued chunks are still flushed, then drop it.
         request.finished = true;
+        request.failure = failure;
       });
     }
   }
@@ -672,13 +786,12 @@ class CDPPage extends CDPBasePage {
       // longer streamable) must not degrade into silent empty output: surface one
       // sse-error chunk so the consumer fails loudly instead of trusting a
       // truncated stream. Chunks already streamed to us are still delivered.
-      this._flushSseStream(state, requestId, request, {
-        kind: 'sse-error',
-        url: request.url,
+      this._flushSseStream(
+        state,
         requestId,
-        timestamp: Date.now(),
-        error: err instanceof Error ? err.message : String(err),
-      });
+        request,
+        sseErrorChunk(request.url, requestId, err instanceof Error ? err.message : String(err)),
+      );
     }
   }
 
@@ -691,17 +804,25 @@ class CDPPage extends CDPBasePage {
     // A stop (or re-arm) may have replaced this state while the arm command was
     // in flight — never resurrect a disarmed capture.
     if (this._sseCapture !== state) return;
-    if (leading) state.dropped += pushBoundedSseChunk(state.entries, leading);
-    for (const queued of request.queued) {
-      state.dropped += pushBoundedSseChunk(state.entries, queued);
+    if (leading) storeSseChunk(state, leading, 'entries');
+    for (const queued of releaseSseQueue(state, request)) {
+      storeSseChunk(state, queued, 'entries');
     }
-    request.queued = [];
+    const failure = request.failure;
+    request.failure = undefined;
     if (leading?.kind === 'sse-error') {
       // Streaming never started, so later dataReceived events carry no body.
       state.requests.delete(requestId);
       return;
     }
     request.live = true;
+    if (failure) {
+      // The stream died while we were arming: report it after the bytes that did
+      // arrive instead of letting the consumer wait for silence.
+      storeSseChunk(state, sseErrorChunk(request.url, requestId, failure), 'entries');
+      state.requests.delete(requestId);
+      return;
+    }
     if (request.finished) state.requests.delete(requestId);
   }
 

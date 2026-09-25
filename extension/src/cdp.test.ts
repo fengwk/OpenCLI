@@ -1778,6 +1778,166 @@ describe('cdp sse stream capture', () => {
     const { chunks } = await mod.readSseCapture(1);
     expect(decodeChunks(chunks)).toBe('data: head\ndata: resumed\n');
   });
+
+  /**
+   * Base64 stream payload sized so one chunk stays under the per-chunk cap (its
+   * marker then survives into the stored payload) while a handful of them still
+   * exceed the aggregate byte budget: three quarters of the cap in raw bytes is
+   * the largest text whose base64 form still fits the cap.
+   */
+  const largeChunkData = (chunkLimit: number, marker: number): string =>
+    b64(`${'A'.repeat(Math.floor(chunkLimit * 0.75) - 8)}#${marker}\n`);
+  const markersOf = (chunks: SseCaptureChunk[]): number[] =>
+    [...decodeChunks(chunks).matchAll(/#(\d+)\n/g)].map((match) => Number(match[1]));
+  const retainedBytesOf = (chunks: SseCaptureChunk[]): number =>
+    chunks.reduce((sum, chunk) => sum + (chunk.kind === 'sse-chunk' ? chunk.payload.length : 0), 0);
+  const largeChunkCount = (byteBudget: number, chunkLimit: number): number =>
+    Math.ceil(byteBudget / chunkLimit) + 4;
+
+  // Few large chunks (well under the count limit) must still hit the aggregate
+  // byte budget: otherwise 10k × 1 MiB chunks could pin gigabytes in the worker.
+  it('evicts oldest chunks when a few large chunks exceed the byte budget', async () => {
+    const mock = createSseMock({ streamResourceContent: async () => ({ bufferedData: b64('data: head\n') }) });
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+
+    await mod.startSseCapture(1, 'chatgpt.com');
+    await mock.fire('Network.responseReceived', responseReceived('sse1', SSE_URL, 'text/event-stream'));
+    const total = largeChunkCount(mod.CDP_SSE_CAPTURE_BYTE_BUDGET, mod.CDP_SSE_CHUNK_PAYLOAD_LIMIT);
+    for (let i = 0; i < total; i += 1) {
+      await mock.fire('Network.dataReceived', {
+        requestId: 'sse1',
+        data: largeChunkData(mod.CDP_SSE_CHUNK_PAYLOAD_LIMIT, i),
+      });
+    }
+
+    const result = await mod.readSseCapture(1);
+    const markers = markersOf(result.chunks);
+    expect(retainedBytesOf(result.chunks)).toBeLessThanOrEqual(mod.CDP_SSE_CAPTURE_BYTE_BUDGET);
+    expect(result.dropped).toBeGreaterThan(0);
+    // Newest bytes stay readable, the oldest are the ones evicted, order holds.
+    expect(markers[0]).toBeGreaterThan(0);
+    expect(markers[markers.length - 1]).toBe(total - 1);
+    expect(markers).toEqual([...markers].sort((a, b) => a - b));
+  });
+
+  // The pending arm queue is bounded by the same budget: a burst that arrives
+  // while the arm command is in flight cannot grow without limit either.
+  it('bounds the pending arm queue by the same byte budget', async () => {
+    const arm = deferred<{ bufferedData: string }>();
+    const mock = createSseMock({ streamResourceContent: () => arm.promise });
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+
+    await mod.startSseCapture(1, 'chatgpt.com');
+    const arming = mock.fire('Network.responseReceived', responseReceived('sse1', SSE_URL, 'text/event-stream'));
+    const total = largeChunkCount(mod.CDP_SSE_CAPTURE_BYTE_BUDGET, mod.CDP_SSE_CHUNK_PAYLOAD_LIMIT);
+    for (let i = 0; i < total; i += 1) {
+      await mock.fire('Network.dataReceived', {
+        requestId: 'sse1',
+        data: largeChunkData(mod.CDP_SSE_CHUNK_PAYLOAD_LIMIT, i),
+      });
+    }
+    arm.resolve({ bufferedData: b64('data: head\n') });
+    await arming;
+
+    const result = await mod.readSseCapture(1);
+    const markers = markersOf(result.chunks);
+    expect(retainedBytesOf(result.chunks)).toBeLessThanOrEqual(mod.CDP_SSE_CAPTURE_BYTE_BUDGET);
+    expect(result.dropped).toBeGreaterThan(0);
+    expect(markers[markers.length - 1]).toBe(total - 1);
+    expect(markers[0]).toBeGreaterThan(0);
+  });
+
+  // A drain hands bytes to the caller; they must also leave the capture budget,
+  // otherwise an equally sized next batch would look like an overflow.
+  it('keeps the byte budget honest across drains', async () => {
+    const mock = createSseMock({ streamResourceContent: async () => ({ bufferedData: b64('data: head\n') }) });
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+
+    await mod.startSseCapture(1, 'chatgpt.com');
+    await mock.fire('Network.responseReceived', responseReceived('sse1', SSE_URL, 'text/event-stream'));
+    // A batch that fits the budget on its own, so every read can be drop-free.
+    const storedBytes = 'base64:'.length + Math.ceil((Math.floor(mod.CDP_SSE_CHUNK_PAYLOAD_LIMIT * 0.75) - 4) / 3) * 4;
+    const perBatch = Math.floor(mod.CDP_SSE_CAPTURE_BYTE_BUDGET / storedBytes * 0.75);
+    for (let batch = 0; batch < 2; batch += 1) {
+      for (let i = 0; i < perBatch; i += 1) {
+        await mock.fire('Network.dataReceived', {
+          requestId: 'sse1',
+          data: largeChunkData(mod.CDP_SSE_CHUNK_PAYLOAD_LIMIT, i),
+        });
+      }
+      const result = await mod.readSseCapture(1);
+      expect(result.dropped).toBe(0);
+      expect(markersOf(result.chunks)).toEqual([...Array(perBatch).keys()]);
+    }
+  });
+
+  // An abnormally ended stream never completes its protocol: the consumer gets
+  // the bytes that arrived plus one failure entry, instead of waiting for its
+  // own deadline. Only Chrome's error enum may surface — never URL/headers/body.
+  it('reports an abnormally ended stream without echoing request data', async () => {
+    const mock = createSseMock({ streamResourceContent: async () => ({ bufferedData: b64('data: head\n') }) });
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+
+    await mod.startSseCapture(1, 'chatgpt.com');
+    await mock.fire('Network.responseReceived', responseReceived('sse1', SSE_URL, 'text/event-stream'));
+    await mock.fire('Network.dataReceived', { requestId: 'sse1', data: b64('data: one\n') });
+    await mock.fire('Network.loadingFailed', {
+      requestId: 'sse1',
+      // Chrome reports a network error enum; even if a build ever appended the
+      // URL to it, the failure entry must not echo it.
+      errorText: `net::ERR_ABORTED ${SSE_URL}?token=secret-token`,
+      canceled: true,
+      // Chrome may attach response metadata to the event; none of it may reach
+      // the failure entry.
+      response: { url: SSE_URL, headers: { Authorization: 'Bearer secret-token' } },
+      body: 'sensitive body',
+    });
+
+    const { chunks } = await mod.readSseCapture(1);
+    expect(chunks.map((chunk) => chunk.kind)).toEqual(['sse-chunk', 'sse-chunk', 'sse-error']);
+    expect(decodeChunks(chunks.slice(0, -1))).toBe('data: head\ndata: one\n');
+    const failure = chunks[chunks.length - 1];
+    if (failure.kind !== 'sse-error') throw new Error('expected an sse-error chunk');
+    expect(failure.error).toContain('net::ERR_ABORTED');
+    expect(failure.error).toContain('<url>');
+    expect(failure.error).not.toContain(SSE_URL);
+    expect(failure.error).not.toContain('secret-token');
+    expect(failure.error).not.toContain('sensitive body');
+
+    // A failed stream is closed: later events for it must not accumulate.
+    await mock.fire('Network.dataReceived', { requestId: 'sse1', data: b64('data: late\n') });
+    expect((await mod.readSseCapture(1)).chunks).toEqual([]);
+  });
+
+  it('reports an in-arm stream failure after the bytes that arrived', async () => {
+    const arm = deferred<{ bufferedData: string }>();
+    const mock = createSseMock({ streamResourceContent: () => arm.promise });
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+
+    await mod.startSseCapture(1, 'chatgpt.com');
+    const arming = mock.fire('Network.responseReceived', responseReceived('sse1', SSE_URL, 'text/event-stream'));
+    await mock.fire('Network.dataReceived', { requestId: 'sse1', data: b64('data: raced\n\n') });
+    await mock.fire('Network.loadingFailed', { requestId: 'sse1', errorText: 'net::ERR_CONNECTION_CLOSED' });
+    arm.resolve({ bufferedData: b64('data: head\n') });
+    await arming;
+
+    const { chunks } = await mod.readSseCapture(1);
+    expect(chunks.map((chunk) => chunk.kind)).toEqual(['sse-chunk', 'sse-chunk', 'sse-error']);
+    expect(decodeChunks(chunks.slice(0, -1))).toBe('data: head\ndata: raced\n\n');
+    const failure = chunks[2];
+    if (failure.kind !== 'sse-error') throw new Error('expected an sse-error chunk');
+    expect(failure.error).toContain('net::ERR_CONNECTION_CLOSED');
+  });
 });
 
 describe('cdp evaluateInFrame stale context fallback', () => {

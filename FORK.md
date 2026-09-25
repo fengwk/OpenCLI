@@ -30,7 +30,7 @@ extension build and version bump (new protocol actions).
 
 | Area | Change | Paths |
 |------|--------|-------|
-| SSE capture | `startSseCapture` / `readSseCapture` / `stopSseCapture`: incremental capture of `text/event-stream` response bodies via `Network.streamResourceContent` (buffered prefix first, then `Network.dataReceived` chunks in wire order), bounded ring with `dropped`, per-chunk 1 MiB cap flagged via `payloadTruncated`, `sse-error` entry instead of a silently empty stream, no page fetch/XHR patching and no `Network.*` additions to the `cdp` allowlist. | `extension/src/cdp.ts`, `extension/src/protocol.ts`, `extension/src/background.ts`, `src/browser/page.ts`, `src/browser/cdp.ts`, `src/browser/daemon-client.ts`, `src/types.ts` |
+| SSE capture | `startSseCapture` / `readSseCapture` / `stopSseCapture`: incremental capture of `text/event-stream` response bodies via `Network.streamResourceContent` (buffered prefix first, then `Network.dataReceived` chunks in wire order), bounded by an aggregate count + byte budget with oldest-first eviction reported through `dropped`, per-chunk 1 MiB cap flagged via `payloadTruncated`, `sse-error` entries for a failed arm and for `Network.loadingFailed` abnormal termination instead of a silently empty stream, no page fetch/XHR patching and no `Network.*` additions to the `cdp` allowlist. | `extension/src/cdp.ts`, `extension/src/protocol.ts`, `extension/src/background.ts`, `src/browser/page.ts`, `src/browser/cdp.ts`, `src/browser/daemon-client.ts`, `src/types.ts` |
 | SSE design note | Capture semantics, ordering, limits, lifecycle | `docs/design/sse-stream-capture.md` |
 
 ### 2026-09-15

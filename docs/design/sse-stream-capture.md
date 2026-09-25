@@ -34,10 +34,10 @@ Each drained entry is one of two shapes:
 | `timestamp` | capture time (ms) |
 | `payload` | `sse-chunk` only: `base64:<base64-bytes>` stream slice |
 | `payloadTruncated` | `sse-chunk` only: the slice hit the 1 MiB per-chunk cap |
-| `error` | `sse-error` only: CDP failure message (e.g. unsupported method) |
+| `error` | `sse-error` only: non-sensitive reason — the CDP failure message (e.g. unsupported method) or Chrome's network error enum for an aborted stream |
 
-`dropped` (on the read result) counts chunks the bounded ring buffer evicted since the
-previous read.
+`dropped` (on the read result) counts chunks the capture budgets evicted since the previous
+read.
 
 `pattern` is a URL substring filter; use `|` for OR (same as HTTP/WS capture). An empty
 pattern matches every URL, but only responses whose MIME type is `text/event-stream` are
@@ -71,13 +71,22 @@ stream, so it produces no chunk and no `sse-error`.
   ignored. A consumer must treat `sse-error` (and `payloadTruncated`, and `dropped > 0`) as
   "this view of the stream is incomplete" and fail or retry rather than parse a partial
   turn.
+- **Abnormal termination is reported**: `Network.loadingFailed` (aborted or errored stream)
+  drains one `sse-error` **after** the bytes that did arrive, so the consumer learns why the
+  protocol stopped instead of blocking until its own deadline. The reason is Chrome's
+  network error enum only (`stream failed: net::ERR_ABORTED`, `stream canceled`), with
+  URL-looking text stripped defensively — never the stream URL, headers or body.
 - **Drain-on-read**: `readSseCapture` returns and clears the buffer, and resets `dropped`.
   Per-request state is kept so an in-flight stream still resolves its URL and ordering
   after a drain.
-- **Limits**: per-chunk payload cap 1 MiB (stored truncated **and** flagged); ring buffer
-  max 10_000 chunks (oldest dropped, reported through `dropped`). Keep
-  `CDP_SSE_CHUNK_PAYLOAD_LIMIT` / `CDP_SSE_CHUNK_BUFFER_LIMIT` in sync between
-  `extension/src/cdp.ts` and `src/browser/cdp.ts`.
+- **Limits**: per-chunk payload cap 1 MiB (stored truncated **and** flagged). A tab retains
+  at most 10_000 chunks *and* 16 MiB of stored payload characters in total — counting the
+  drained ring and every queue of a stream still arming — so a handful of large chunks
+  cannot pin gigabytes in the worker or the host process. Eviction is oldest-first and every
+  evicted chunk increments `dropped`: a shortened buffer is always reported, never silent.
+  Keep `CDP_SSE_CHUNK_PAYLOAD_LIMIT` / `CDP_SSE_CHUNK_BUFFER_LIMIT` /
+  `CDP_SSE_CAPTURE_BYTE_BUDGET` in sync between `extension/src/cdp.ts` and
+  `src/browser/cdp.ts`.
 - **Narrow arming**: only `responseReceived` events whose URL passes the filter and whose
   MIME type contains `text/event-stream` are armed; ordinary JSON/HTML responses never
   cost a CDP round trip.
@@ -96,7 +105,8 @@ stream, so it produces no chunk and no `sse-error`.
 | `sse-capture-read` | Drain chunks + `dropped`; keep per-request stream state |
 | `sse-capture-stop` | **Delete** per-tab capture state (ring + per-request maps) |
 | `responseReceived` (matching) | Track the stream and arm `Network.streamResourceContent` once |
-| `loadingFinished` / `loadingFailed` | Drop that stream's state; events arriving after it are ignored |
+| `loadingFinished` | Drop that stream's state; events arriving after it are ignored |
+| `loadingFailed` | Same, after draining one `sse-error` (reported after the bytes that arrived) |
 | tab closed / debugger detach / non-debuggable URL | Capture state removed |
 
 Adapters should call `page.stopSseCapture()` in a `finally` after each turn so persistent
