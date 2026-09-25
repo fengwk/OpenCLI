@@ -80,6 +80,40 @@ export interface WsCaptureFrame {
   payloadTruncated: boolean;
 }
 
+/**
+ * One drained HTTP SSE (text/event-stream) body slice, or the failure that
+ * prevented incremental capture of one stream, from
+ * page.startSseCapture / readSseCapture.
+ *
+ * `payload` is always `base64:<base64-bytes>`: Chrome reports stream bytes
+ * base64-encoded, so consumers must decode before parsing SSE framing. A chunk
+ * slice is never silently shortened — `payloadTruncated` (and `dropped` on the
+ * read result) tell the consumer its view of the stream is incomplete.
+ */
+export type SseCaptureChunk =
+  | {
+    kind: 'sse-chunk';
+    url: string;
+    requestId: string;
+    timestamp: number;
+    payload: string;
+    payloadTruncated: boolean;
+  }
+  | {
+    kind: 'sse-error';
+    url: string;
+    requestId: string;
+    timestamp: number;
+    error: string;
+  };
+
+export interface SseCaptureReadResult {
+  /** Chunks in stream order (buffered prefix first, then streamed chunks). */
+  chunks: SseCaptureChunk[];
+  /** Chunks evicted from the bounded ring buffer since the previous read. */
+  dropped: number;
+}
+
 export type BrowserEvaluateFunction<Args extends unknown[] = unknown[], Result = unknown> = (...args: Args) => Result | Promise<Result>;
 
 export interface IPage {
@@ -144,6 +178,17 @@ export interface IPage {
   startWsCapture?(pattern?: string): Promise<boolean>;
   /** Drain buffered WebSocket frames since the last read (or start). */
   readWsCapture?(): Promise<WsCaptureFrame[]>;
+  /**
+   * Arm CDP HTTP SSE (`text/event-stream`) body capture for the current page.
+   * Only bytes observed after this call are buffered (no replay of the stream
+   * prefix the page already consumed).
+   * @param pattern URL substring filter; empty matches all URLs. Use `|` for OR.
+   */
+  startSseCapture?(pattern?: string): Promise<boolean>;
+  /** Drain buffered SSE chunks since the last read (or start). */
+  readSseCapture?(): Promise<SseCaptureReadResult>;
+  /** Disarm SSE capture and free the extension-side ring buffer for this tab. */
+  stopSseCapture?(): Promise<void>;
   /**
    * Set local file paths on a file input element via CDP DOM.setFileInputFiles.
    * Chrome reads the files directly — no base64 encoding or payload size limits.

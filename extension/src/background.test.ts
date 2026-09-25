@@ -529,6 +529,83 @@ describe('background tab isolation', () => {
     expect(waitForDownload).toHaveBeenCalledWith('receipt', 1234, 1);
   });
 
+  // SSE capture is a dedicated action family (not part of the 'cdp' allowlist):
+  // each action must route to its executor counterpart with the resolved tab.
+  it('routes sse-capture actions to the CDP executor for the resolved tab', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const startSseCapture = vi.fn(async () => {});
+    const readSseCapture = vi.fn(async () => ({
+      chunks: [
+        {
+          kind: 'sse-chunk',
+          url: 'https://chatgpt.com/backend-api/conversation',
+          requestId: 'sse1',
+          timestamp: 1,
+          payload: 'base64:ZGF0YTogb25lCg==',
+          payloadTruncated: false,
+        },
+      ],
+      dropped: 3,
+    }));
+    const stopSseCapture = vi.fn();
+    vi.doMock('./cdp', () => ({
+      registerListeners: vi.fn(),
+      registerFrameTracking: vi.fn(),
+      hasActiveNetworkCapture: vi.fn(() => false),
+      detach: vi.fn(async () => {}),
+      startSseCapture,
+      readSseCapture,
+      stopSseCapture,
+    }));
+
+    const mod = await import('./background');
+    mod.__test__.setAutomationWindowId(adapterKey('chatgpt'), 1);
+
+    const started = await mod.__test__.handleCommand({
+      id: 'sse-start',
+      action: 'sse-capture-start',
+      pattern: 'chatgpt.com',
+      session: 'chatgpt',
+      surface: 'adapter',
+    });
+    expect(started.ok).toBe(true);
+    expect(started.data).toEqual({ started: true });
+    expect(startSseCapture).toHaveBeenCalledWith(1, 'chatgpt.com');
+
+    const read = await mod.__test__.handleCommand({
+      id: 'sse-read',
+      action: 'sse-capture-read',
+      session: 'chatgpt',
+      surface: 'adapter',
+    });
+    expect(read.ok).toBe(true);
+    expect(read.data).toEqual({
+      chunks: [
+        {
+          kind: 'sse-chunk',
+          url: 'https://chatgpt.com/backend-api/conversation',
+          requestId: 'sse1',
+          timestamp: 1,
+          payload: 'base64:ZGF0YTogb25lCg==',
+          payloadTruncated: false,
+        },
+      ],
+      dropped: 3,
+    });
+    expect(readSseCapture).toHaveBeenCalledWith(1);
+
+    const stopped = await mod.__test__.handleCommand({
+      id: 'sse-stop',
+      action: 'sse-capture-stop',
+      session: 'chatgpt',
+      surface: 'adapter',
+    });
+    expect(stopped.ok).toBe(true);
+    expect(stopped.data).toEqual({ stopped: true });
+    expect(stopSseCapture).toHaveBeenCalledWith(1);
+  });
+
   it('routes exec frameIndex through the same cross-origin frame ordering as handleFrames', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);

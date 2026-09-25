@@ -11,7 +11,7 @@
 import { WebSocket, type RawData } from 'ws';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
-import type { BrowserCookie, BrowserEvaluateFunction, IPage, ScreenshotOptions, WsCaptureFrame } from '../types.js';
+import type { BrowserCookie, BrowserEvaluateFunction, IPage, ScreenshotOptions, SseCaptureChunk, SseCaptureReadResult, WsCaptureFrame } from '../types.js';
 import type { IBrowserFactory } from '../runtime.js';
 import { buildEvaluateExpression } from './utils.js';
 import { generateStealthJs } from './stealth.js';
@@ -49,7 +49,58 @@ export const CDP_RESPONSE_BODY_CAPTURE_LIMIT = 8 * 1024 * 1024;
 // Keep in sync with extension/src/cdp.ts WS frame limits.
 const CDP_WS_FRAME_PAYLOAD_LIMIT = 1 * 1024 * 1024;
 const CDP_WS_FRAME_BUFFER_LIMIT = 10_000;
+// SSE chunk limits, kept in sync with extension/src/cdp.ts: one streamed body
+// slice per chunk, ring-buffered by count, oversized chunks stored truncated and
+// flagged so consumers never trust a silently shortened stream.
+export const CDP_SSE_CHUNK_PAYLOAD_LIMIT = 1 * 1024 * 1024;
+export const CDP_SSE_CHUNK_BUFFER_LIMIT = 10_000;
+const CDP_SSE_ARM_TIMEOUT_MS = 10_000;
 export const CDP_REQUEST_BODY_CAPTURE_LIMIT = 1 * 1024 * 1024;
+
+/** Per-request state for one armed direct-CDP SSE stream. */
+type SseStreamState = {
+  url: string;
+  live: boolean;
+  finished: boolean;
+  queued: SseCaptureChunk[];
+};
+
+type SseCaptureState = {
+  patterns: string[];
+  entries: SseCaptureChunk[];
+  requests: Map<string, SseStreamState>;
+  dropped: number;
+};
+
+/** Chrome reports SSE bytes as base64 in both buffered and streamed payloads. */
+function encodeSseChunk(url: string, requestId: string, data: unknown): SseCaptureChunk | null {
+  const raw = String(data ?? '');
+  // Before streaming is enabled Chrome reports dataReceived without any body
+  // data; there is nothing to capture for those events. The same applies to the
+  // arm response: responseReceived fires on response headers, so an absent or
+  // empty bufferedData means "no bytes buffered yet", never a silent loss.
+  if (!raw) return null;
+  const truncated = raw.length > CDP_SSE_CHUNK_PAYLOAD_LIMIT;
+  return {
+    kind: 'sse-chunk',
+    url,
+    requestId,
+    timestamp: Date.now(),
+    payload: `base64:${truncated ? raw.slice(0, CDP_SSE_CHUNK_PAYLOAD_LIMIT) : raw}`,
+    payloadTruncated: truncated,
+  };
+}
+
+/** Push into a bounded buffer; returns the number of oldest entries evicted. */
+function pushBoundedSseChunk(target: SseCaptureChunk[], chunk: SseCaptureChunk): number {
+  let dropped = 0;
+  if (target.length >= CDP_SSE_CHUNK_BUFFER_LIMIT) {
+    dropped = target.length - CDP_SSE_CHUNK_BUFFER_LIMIT + 1;
+    target.splice(0, dropped);
+  }
+  target.push(chunk);
+  return dropped;
+}
 
 export class CDPBridge implements IBrowserFactory {
   private _ws: WebSocket | null = null;
@@ -214,6 +265,9 @@ class CDPPage extends CDPBasePage {
   private _wsEntries: WsCaptureFrame[] = [];
   private _wsRequestIdToUrl = new Map<string, string>();
   private _wsListenersBound = false;
+  // HTTP SSE stream capture (mirrors extension/src/cdp.ts SseCaptureChunk shape)
+  private _sseCapture: SseCaptureState | null = null;
+  private _sseListenersBound = false;
   private _consoleMessages: Array<{ type: string; text: string; timestamp: number }> = [];
   private _consoleCapturing = false;
 
@@ -507,6 +561,148 @@ class CDPPage extends CDPBasePage {
     this._wsEntries = [];
     this._wsRequestIdToUrl.clear();
     this._wsCapturePatterns = [];
+  }
+
+  /**
+   * Arm HTTP SSE (`text/event-stream`) capture via Network.streamResourceContent.
+   * Only bytes observed after this call are buffered. Arm before the action that
+   * triggers the stream (e.g. send prompt).
+   */
+  async startSseCapture(pattern: string = ''): Promise<boolean> {
+    this._sseCapture = {
+      patterns: String(pattern || '')
+        .split('|')
+        .map((part) => part.trim())
+        .filter(Boolean),
+      entries: [],
+      requests: new Map(),
+      dropped: 0,
+    };
+    this._bindSseCaptureListeners();
+    await this.bridge.send('Network.enable');
+    return true;
+  }
+
+  async readSseCapture(): Promise<SseCaptureReadResult> {
+    const state = this._sseCapture;
+    if (!state) return { chunks: [], dropped: 0 };
+    const chunks = state.entries.slice();
+    const dropped = state.dropped;
+    state.entries = [];
+    state.dropped = 0;
+    return { chunks, dropped };
+  }
+
+  async stopSseCapture(): Promise<void> {
+    // Dropping the state object invalidates any arm command still in flight.
+    this._sseCapture = null;
+  }
+
+  private _bindSseCaptureListeners(): void {
+    if (this._sseListenersBound) return;
+    this._sseListenersBound = true;
+    this.bridge.on('Network.responseReceived', (params: unknown) => {
+      const state = this._sseCapture;
+      if (!state) return;
+      const p = params as { requestId?: string; response?: { url?: string; mimeType?: string } };
+      const requestId = String(p.requestId || '');
+      // Only real SSE streams are armed: an ordinary JSON/HTML response would
+      // otherwise cost a pointless CDP round trip and an sse-error chunk.
+      if (!requestId || state.requests.has(requestId)) return;
+      if (!String(p.response?.mimeType || '').toLowerCase().includes('text/event-stream')) return;
+      const url = String(p.response?.url || '');
+      if (state.patterns.length && !state.patterns.some((pattern) => url.includes(pattern))) return;
+      const request: SseStreamState = { url, live: false, finished: false, queued: [] };
+      state.requests.set(requestId, request);
+      void this._armSseStream(state, requestId, request);
+    });
+    this.bridge.on('Network.dataReceived', (params: unknown) => {
+      const state = this._sseCapture;
+      if (!state) return;
+      const p = params as { requestId?: string; data?: string };
+      const requestId = String(p.requestId || '');
+      const request = state.requests.get(requestId);
+      if (!request) return;
+      const chunk = encodeSseChunk(request.url, requestId, p.data);
+      if (!chunk) return;
+      if (request.live) {
+        state.dropped += pushBoundedSseChunk(state.entries, chunk);
+        return;
+      }
+      state.dropped += pushBoundedSseChunk(request.queued, chunk);
+    });
+    for (const method of ['Network.loadingFinished', 'Network.loadingFailed'] as const) {
+      this.bridge.on(method, (params: unknown) => {
+        const state = this._sseCapture;
+        if (!state) return;
+        const requestId = String((params as { requestId?: string }).requestId || '');
+        const request = state.requests.get(requestId);
+        if (!request) return;
+        if (request.live) {
+          state.requests.delete(requestId);
+          return;
+        }
+        // Ended while arming: keep the request until the arm resolves so the
+        // buffered prefix and queued chunks are still flushed, then drop it.
+        request.finished = true;
+      });
+    }
+  }
+
+  /**
+   * Ask Chrome for the bytes it still holds for an armed SSE stream. The response
+   * carries the already-buffered prefix; every later byte reaches the listener
+   * through Network.dataReceived.data, which is why queued chunks are flushed
+   * strictly after this prefix.
+   */
+  private async _armSseStream(
+    state: SseCaptureState,
+    requestId: string,
+    request: SseStreamState,
+  ): Promise<void> {
+    try {
+      const result = await this.bridge.send(
+        'Network.streamResourceContent',
+        { requestId },
+        CDP_SSE_ARM_TIMEOUT_MS,
+      ) as { bufferedData?: string };
+      this._flushSseStream(state, requestId, request, encodeSseChunk(request.url, requestId, result?.bufferedData));
+    } catch (err) {
+      // An older Chrome without streamResourceContent (or a request that is no
+      // longer streamable) must not degrade into silent empty output: surface one
+      // sse-error chunk so the consumer fails loudly instead of trusting a
+      // truncated stream. Chunks already streamed to us are still delivered.
+      this._flushSseStream(state, requestId, request, {
+        kind: 'sse-error',
+        url: request.url,
+        requestId,
+        timestamp: Date.now(),
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private _flushSseStream(
+    state: SseCaptureState,
+    requestId: string,
+    request: SseStreamState,
+    leading: SseCaptureChunk | null,
+  ): void {
+    // A stop (or re-arm) may have replaced this state while the arm command was
+    // in flight — never resurrect a disarmed capture.
+    if (this._sseCapture !== state) return;
+    if (leading) state.dropped += pushBoundedSseChunk(state.entries, leading);
+    for (const queued of request.queued) {
+      state.dropped += pushBoundedSseChunk(state.entries, queued);
+    }
+    request.queued = [];
+    if (leading?.kind === 'sse-error') {
+      // Streaming never started, so later dataReceived events carry no body.
+      state.requests.delete(requestId);
+      return;
+    }
+    request.live = true;
+    if (request.finished) state.requests.delete(requestId);
   }
 
   async consoleMessages(level: string = 'all'): Promise<Array<{ type: string; text: string; timestamp: number }>> {

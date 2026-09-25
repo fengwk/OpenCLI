@@ -13,8 +13,18 @@ const CDP_RESPONSE_BODY_CAPTURE_LIMIT = 8 * 1024 * 1024;
 const CDP_REQUEST_BODY_CAPTURE_LIMIT = 1 * 1024 * 1024;
 const CDP_WS_FRAME_PAYLOAD_LIMIT = 1 * 1024 * 1024;
 const CDP_WS_FRAME_BUFFER_LIMIT = 1e4;
+const CDP_SSE_CHUNK_PAYLOAD_LIMIT = 1 * 1024 * 1024;
+const CDP_SSE_CHUNK_BUFFER_LIMIT = 1e4;
+const CDP_SSE_ARM_TIMEOUT_MS = 1e4;
+const SSE_CAPTURE_EVENTS = /* @__PURE__ */ new Set([
+  "Network.responseReceived",
+  "Network.dataReceived",
+  "Network.loadingFinished",
+  "Network.loadingFailed"
+]);
 const networkCaptures = /* @__PURE__ */ new Map();
 const wsCaptures = /* @__PURE__ */ new Map();
+const sseCaptures = /* @__PURE__ */ new Map();
 const CDP_COMMAND_TIMEOUT_MS = 6e4;
 const CDP_PROBE_TIMEOUT_MS = 2e3;
 async function sendDebuggerCommand(target, method, params, timeoutMs = CDP_COMMAND_TIMEOUT_MS) {
@@ -76,6 +86,7 @@ async function ensureAttachedInternal(tabId, aggressiveRetry) {
   let lastError = "";
   const preservedNetworkCapture = networkCaptures.get(tabId);
   const preservedWsCapture = wsCaptures.get(tabId);
+  const preservedSseCapture = sseCaptures.get(tabId);
   const pausedDownloadWaiters = pauseTabDownloadWaiters(tabId);
   for (let attempt = 1; attempt <= MAX_ATTACH_RETRIES; attempt++) {
     try {
@@ -124,11 +135,12 @@ async function ensureAttachedInternal(tabId, aggressiveRetry) {
   }
   await sendDebuggerCommand({ tabId }, "Page.enable").catch(() => {
   });
-  if (preservedNetworkCapture || preservedWsCapture) {
+  if (preservedNetworkCapture || preservedWsCapture || preservedSseCapture) {
     try {
       await sendDebuggerCommand({ tabId }, "Network.enable");
       if (preservedNetworkCapture) networkCaptures.set(tabId, preservedNetworkCapture);
       if (preservedWsCapture) wsCaptures.set(tabId, preservedWsCapture);
+      if (preservedSseCapture) sseCaptures.set(tabId, preservedSseCapture);
     } catch {
     }
   }
@@ -849,7 +861,32 @@ function stopWsCapture(tabId) {
   wsCaptures.delete(tabId);
 }
 function hasActiveNetworkCapture(tabId) {
-  return networkCaptures.has(tabId) || wsCaptures.has(tabId);
+  return networkCaptures.has(tabId) || wsCaptures.has(tabId) || sseCaptures.has(tabId);
+}
+async function startSseCapture(tabId, pattern) {
+  await ensureAttached(tabId);
+  sseCaptures.set(tabId, {
+    patterns: normalizeCapturePatterns(pattern),
+    entries: [],
+    requests: /* @__PURE__ */ new Map(),
+    dropped: 0
+  });
+  await sendDebuggerCommand({ tabId }, "Network.enable");
+}
+async function readSseCapture(tabId) {
+  const state = sseCaptures.get(tabId);
+  if (!state) return { chunks: [], dropped: 0 };
+  const chunks = state.entries.slice();
+  const dropped = state.dropped;
+  state.entries = [];
+  state.dropped = 0;
+  if (dropped > 0) {
+    console.warn(`[opencli] sse-capture dropped ${dropped} chunk(s) on tab ${tabId} (ring full)`);
+  }
+  return { chunks, dropped };
+}
+function stopSseCapture(tabId) {
+  sseCaptures.delete(tabId);
 }
 function pushWsFrame(state, entry) {
   if (state.entries.length >= CDP_WS_FRAME_BUFFER_LIMIT) {
@@ -930,6 +967,101 @@ function handleWsCaptureEvent(tabId, method, eventParams) {
     }
   }
 }
+function encodeSseChunk(url, requestId, data) {
+  const raw = String(data ?? "");
+  if (!raw) return null;
+  const truncated = raw.length > CDP_SSE_CHUNK_PAYLOAD_LIMIT;
+  return {
+    kind: "sse-chunk",
+    url,
+    requestId,
+    timestamp: Date.now(),
+    payload: `base64:${truncated ? raw.slice(0, CDP_SSE_CHUNK_PAYLOAD_LIMIT) : raw}`,
+    payloadTruncated: truncated
+  };
+}
+function pushBoundedSseChunk(target, chunk) {
+  let dropped = 0;
+  if (target.length >= CDP_SSE_CHUNK_BUFFER_LIMIT) {
+    dropped = target.length - CDP_SSE_CHUNK_BUFFER_LIMIT + 1;
+    target.splice(0, dropped);
+  }
+  target.push(chunk);
+  return dropped;
+}
+function armSseStream(tabId, state, requestId, request) {
+  return sendDebuggerCommand(
+    { tabId },
+    "Network.streamResourceContent",
+    { requestId },
+    CDP_SSE_ARM_TIMEOUT_MS
+  ).then((result) => {
+    flushSseStream(
+      tabId,
+      state,
+      requestId,
+      request,
+      encodeSseChunk(request.url, requestId, result?.bufferedData)
+    );
+  }).catch((err) => {
+    flushSseStream(tabId, state, requestId, request, {
+      kind: "sse-error",
+      url: request.url,
+      requestId,
+      timestamp: Date.now(),
+      error: err instanceof Error ? err.message : String(err)
+    });
+  });
+}
+function flushSseStream(tabId, state, requestId, request, leading) {
+  if (sseCaptures.get(tabId) !== state) return;
+  if (leading) state.dropped += pushBoundedSseChunk(state.entries, leading);
+  for (const queued of request.queued) {
+    state.dropped += pushBoundedSseChunk(state.entries, queued);
+  }
+  request.queued = [];
+  if (leading?.kind === "sse-error") {
+    state.requests.delete(requestId);
+    return;
+  }
+  request.live = true;
+  if (request.finished) state.requests.delete(requestId);
+}
+function handleSseCaptureEvent(tabId, method, eventParams) {
+  const state = sseCaptures.get(tabId);
+  if (!state) return;
+  if (method === "Network.responseReceived") {
+    const requestId2 = String(eventParams?.requestId || "");
+    if (!requestId2 || state.requests.has(requestId2)) return;
+    const response = eventParams?.response;
+    if (!String(response?.mimeType || "").toLowerCase().includes("text/event-stream")) return;
+    const url = String(response?.url || "");
+    if (!shouldCaptureUrl(url, state.patterns)) return;
+    const request2 = { url, live: false, finished: false, queued: [] };
+    state.requests.set(requestId2, request2);
+    return armSseStream(tabId, state, requestId2, request2);
+  }
+  const requestId = String(eventParams?.requestId || "");
+  const request = state.requests.get(requestId);
+  if (!request) return;
+  if (method === "Network.dataReceived") {
+    const chunk = encodeSseChunk(request.url, requestId, eventParams?.data);
+    if (!chunk) return;
+    if (request.live) {
+      state.dropped += pushBoundedSseChunk(state.entries, chunk);
+      return;
+    }
+    state.dropped += pushBoundedSseChunk(request.queued, chunk);
+    return;
+  }
+  if (method === "Network.loadingFinished" || method === "Network.loadingFailed") {
+    if (request.live) {
+      state.requests.delete(requestId);
+      return;
+    }
+    request.finished = true;
+  }
+}
 function clearFrameTargetsForTab(tabId) {
   for (const [key, targetId] of [...frameTargets.entries()]) {
     if (!key.startsWith(`${tabId}:`)) continue;
@@ -945,6 +1077,7 @@ async function detach(tabId) {
   attached.delete(tabId);
   networkCaptures.delete(tabId);
   wsCaptures.delete(tabId);
+  sseCaptures.delete(tabId);
   tabFrameContexts.delete(tabId);
   try {
     await chrome.debugger.detach({ tabId });
@@ -956,6 +1089,7 @@ function registerListeners() {
     attached.delete(tabId);
     networkCaptures.delete(tabId);
     wsCaptures.delete(tabId);
+    sseCaptures.delete(tabId);
     tabFrameContexts.delete(tabId);
     clearFrameTargetsForTab(tabId);
   });
@@ -964,6 +1098,7 @@ function registerListeners() {
       attached.delete(source.tabId);
       networkCaptures.delete(source.tabId);
       wsCaptures.delete(source.tabId);
+      sseCaptures.delete(source.tabId);
       tabFrameContexts.delete(source.tabId);
       clearFrameTargetsForTab(source.tabId);
       return;
@@ -982,6 +1117,9 @@ function registerListeners() {
     if (method.startsWith("Network.webSocket")) {
       handleWsCaptureEvent(tabId, method, eventParams);
       return;
+    }
+    if (SSE_CAPTURE_EVENTS.has(method)) {
+      await handleSseCaptureEvent(tabId, method, eventParams);
     }
     const state = networkCaptures.get(tabId);
     if (!state) return;
@@ -2258,6 +2396,12 @@ async function handleCommand(cmd) {
         return await handleWsCaptureRead(cmd, leaseKey);
       case "ws-capture-stop":
         return await handleWsCaptureStop(cmd, leaseKey);
+      case "sse-capture-start":
+        return await handleSseCaptureStart(cmd, leaseKey);
+      case "sse-capture-read":
+        return await handleSseCaptureRead(cmd, leaseKey);
+      case "sse-capture-stop":
+        return await handleSseCaptureStop(cmd, leaseKey);
       case "wait-download":
         return await handleWaitDownload(cmd, leaseKey);
       case "frames":
@@ -2923,6 +3067,36 @@ async function handleWsCaptureStop(cmd, leaseKey) {
   const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
     stopWsCapture(tabId);
+    return pageScopedResult(cmd.id, tabId, { stopped: true });
+  } catch (err) {
+    return errorResult(cmd.id, err);
+  }
+}
+async function handleSseCaptureStart(cmd, leaseKey) {
+  const cmdTabId = await resolveCommandTabId(cmd);
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
+  try {
+    await startSseCapture(tabId, cmd.pattern);
+    return pageScopedResult(cmd.id, tabId, { started: true });
+  } catch (err) {
+    return errorResult(cmd.id, err);
+  }
+}
+async function handleSseCaptureRead(cmd, leaseKey) {
+  const cmdTabId = await resolveCommandTabId(cmd);
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
+  try {
+    const data = await readSseCapture(tabId);
+    return pageScopedResult(cmd.id, tabId, data);
+  } catch (err) {
+    return errorResult(cmd.id, err);
+  }
+}
+async function handleSseCaptureStop(cmd, leaseKey) {
+  const cmdTabId = await resolveCommandTabId(cmd);
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
+  try {
+    stopSseCapture(tabId);
     return pageScopedResult(cmd.id, tabId, { stopped: true });
   } catch (err) {
     return errorResult(cmd.id, err);

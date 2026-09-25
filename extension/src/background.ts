@@ -1587,6 +1587,12 @@ async function handleCommand(cmd: Command): Promise<Result> {
         return await handleWsCaptureRead(cmd, leaseKey);
       case 'ws-capture-stop':
         return await handleWsCaptureStop(cmd, leaseKey);
+      case 'sse-capture-start':
+        return await handleSseCaptureStart(cmd, leaseKey);
+      case 'sse-capture-read':
+        return await handleSseCaptureRead(cmd, leaseKey);
+      case 'sse-capture-stop':
+        return await handleSseCaptureStop(cmd, leaseKey);
       case 'wait-download':
         return await handleWaitDownload(cmd, leaseKey);
       case 'frames':
@@ -2395,6 +2401,39 @@ async function handleWsCaptureStop(cmd: Command, leaseKey: string): Promise<Resu
   const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
     executor.stopWsCapture(tabId);
+    return pageScopedResult(cmd.id, tabId, { stopped: true });
+  } catch (err) {
+    return errorResult(cmd.id, err);
+  }
+}
+
+async function handleSseCaptureStart(cmd: Command, leaseKey: string): Promise<Result> {
+  const cmdTabId = await resolveCommandTabId(cmd);
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
+  try {
+    await executor.startSseCapture(tabId, cmd.pattern);
+    return pageScopedResult(cmd.id, tabId, { started: true });
+  } catch (err) {
+    return errorResult(cmd.id, err);
+  }
+}
+
+async function handleSseCaptureRead(cmd: Command, leaseKey: string): Promise<Result> {
+  const cmdTabId = await resolveCommandTabId(cmd);
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
+  try {
+    const data = await executor.readSseCapture(tabId);
+    return pageScopedResult(cmd.id, tabId, data);
+  } catch (err) {
+    return errorResult(cmd.id, err);
+  }
+}
+
+async function handleSseCaptureStop(cmd: Command, leaseKey: string): Promise<Result> {
+  const cmdTabId = await resolveCommandTabId(cmd);
+  const tabId = await resolveTabId(cmdTabId, leaseKey);
+  try {
+    executor.stopSseCapture(tabId);
     return pageScopedResult(cmd.id, tabId, { stopped: true });
   } catch (err) {
     return errorResult(cmd.id, err);

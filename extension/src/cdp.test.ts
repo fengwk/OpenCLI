@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { SseCaptureChunk } from './cdp';
 
 function createChromeMock() {
   const debuggerEventListeners: Array<(source: { tabId?: number }, method: string, params: any) => void> = [];
@@ -1457,6 +1458,325 @@ describe('cdp websocket stream capture', () => {
     expect(networkEnableCount).toBeGreaterThan(enablesAfterStart);
     const frames = await mod.readWsCapture(1);
     expect(frames.map((f) => f.payload)).toContain('keep-me');
+  });
+});
+
+describe('cdp sse stream capture', () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const SSE_URL = 'https://chatgpt.com/backend-api/conversation';
+  // Assertion payloads are ASCII, so base64-of-UTF-8-bytes is exactly btoa/atob here
+  // (the extension worker has no Buffer; its tsconfig excludes @types/node).
+  const b64 = (text: string): string => btoa(text);
+  /** Decode drained chunks back to bytes so tests assert stream content, not markers. */
+  const decodeChunks = (chunks: SseCaptureChunk[]): string =>
+    chunks.map((chunk) => (
+      chunk.kind === 'sse-chunk'
+        ? atob(chunk.payload.replace(/^base64:/, ''))
+        : ''
+    )).join('');
+
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+    return { promise, resolve, reject };
+  }
+
+  function createSseMock(options: { streamResourceContent?: (params: any) => Promise<any> } = {}) {
+    const onEventListeners: Array<(source: { tabId?: number }, method: string, params: any) => void | Promise<void>> = [];
+    const sendCommand = vi.fn(async (_target: unknown, method: string, params?: any) => {
+      if (method === 'Runtime.evaluate' && params?.expression === '1') return { result: { value: '1' } };
+      if (method === 'Network.streamResourceContent' && options.streamResourceContent) {
+        return options.streamResourceContent(params);
+      }
+      return {};
+    });
+    const debuggerApi = {
+      attach: vi.fn(async () => {}),
+      detach: vi.fn(async () => {}),
+      sendCommand,
+      onDetach: { addListener: vi.fn() },
+      onEvent: { addListener: vi.fn((fn) => { onEventListeners.push(fn); }) },
+    };
+    const tabs = {
+      get: vi.fn(async () => ({ id: 1, windowId: 1, url: 'https://chatgpt.com/' })),
+      onRemoved: { addListener: vi.fn() },
+      onUpdated: { addListener: vi.fn() },
+    };
+    const fire = async (method: string, params: any) => {
+      for (const fn of onEventListeners) await fn({ tabId: 1 }, method, params);
+    };
+    return {
+      chrome: { tabs, debugger: debuggerApi, scripting: {}, runtime: { id: 'opencli-test' } },
+      fire,
+      sendCommand,
+    };
+  }
+
+  const responseReceived = (requestId: string, url: string, mimeType: string) => (
+    { requestId, response: { url, mimeType } }
+  );
+  /** The one CDP call SSE capture makes: ask Chrome for the buffered prefix. */
+  const armCalls = (sendCommand: ReturnType<typeof createSseMock>['sendCommand']) =>
+    sendCommand.mock.calls.filter((call) => call[1] === 'Network.streamResourceContent');
+
+  // Incremental SSE capture exists to give adapters the turn stream while it is
+  // still open, so byte order across the buffered prefix and streamed chunks is
+  // the contract under test.
+  it('emits the buffered prefix before chunks that raced the arm command', async () => {
+    const arm = deferred<{ bufferedData: string }>();
+    const mock = createSseMock({ streamResourceContent: () => arm.promise });
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+
+    await mod.startSseCapture(1, 'chatgpt.com');
+    const arming = mock.fire('Network.responseReceived', responseReceived('sse1', SSE_URL, 'text/event-stream'));
+    // Chrome can start streaming inside the arm round trip: this chunk carries
+    // bytes that are strictly later than the buffered prefix.
+    await mock.fire('Network.dataReceived', { requestId: 'sse1', data: b64('data: second\n\n') });
+    arm.resolve({ bufferedData: b64('data: first\n\n') });
+    await arming;
+
+    const result = await mod.readSseCapture(1);
+    expect(result.dropped).toBe(0);
+    expect(result.chunks.map((chunk) => chunk.kind)).toEqual(['sse-chunk', 'sse-chunk']);
+    expect(decodeChunks(result.chunks)).toBe('data: first\n\ndata: second\n\n');
+    expect(result.chunks[0]).toMatchObject({ url: SSE_URL, requestId: 'sse1', payloadTruncated: false });
+  });
+
+  // Only text/event-stream responses may be armed: a JSON response on a matching
+  // URL must not cost a CDP round trip (and must not surface an sse-error).
+  it('arms only matching text/event-stream responses and splits chunks in order', async () => {
+    const mock = createSseMock({ streamResourceContent: async () => ({ bufferedData: b64('data: a\n') }) });
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+
+    await mod.startSseCapture(1, 'chatgpt.com');
+    await mock.fire('Network.responseReceived', responseReceived('json1', SSE_URL, 'application/json'));
+    await mock.fire('Network.responseReceived', responseReceived('other1', 'https://other.example/stream', 'text/event-stream'));
+    expect(armCalls(mock.sendCommand)).toHaveLength(0);
+    expect((await mod.readSseCapture(1)).chunks).toEqual([]);
+
+    await mock.fire('Network.responseReceived', responseReceived('sse1', SSE_URL, 'text/event-stream'));
+    expect(armCalls(mock.sendCommand)).toEqual([[{ tabId: 1 }, 'Network.streamResourceContent', { requestId: 'sse1' }]]);
+
+    for (const text of ['data: b\n\n', 'data: c\n\n']) {
+      await mock.fire('Network.dataReceived', { requestId: 'sse1', data: b64(text) });
+    }
+    // Unrelated requests must never leak into the drained chunks.
+    await mock.fire('Network.dataReceived', { requestId: 'json1', data: b64('{"noise":true}') });
+
+    const { chunks } = await mod.readSseCapture(1);
+    expect(chunks).toHaveLength(3);
+    expect(decodeChunks(chunks)).toBe('data: a\ndata: b\n\ndata: c\n\n');
+    expect(chunks.map((chunk) => chunk.kind)).toEqual(['sse-chunk', 'sse-chunk', 'sse-chunk']);
+  });
+
+  // Missing Network.streamResourceContent (older Chrome) must be reported, never
+  // silently rendered as an empty stream.
+  it('surfaces an sse-error chunk when the CDP arm command fails, keeping streamed bytes', async () => {
+    const arm = deferred<{ bufferedData: string }>();
+    const mock = createSseMock({ streamResourceContent: () => arm.promise });
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+
+    await mod.startSseCapture(1, 'chatgpt.com');
+    const arming = mock.fire('Network.responseReceived', responseReceived('sse1', SSE_URL, 'text/event-stream'));
+    await mock.fire('Network.dataReceived', { requestId: 'sse1', data: b64('data: raced\n\n') });
+    arm.reject(new Error("'Network.streamResourceContent' wasn't found"));
+    await arming;
+
+    const first = await mod.readSseCapture(1);
+    expect(first.chunks[0]).toMatchObject({
+      kind: 'sse-error',
+      url: SSE_URL,
+      requestId: 'sse1',
+      error: expect.stringContaining("wasn't found"),
+    });
+    // Bytes streamed to us before the failure are still delivered after it.
+    expect(decodeChunks(first.chunks.slice(1))).toBe('data: raced\n\n');
+
+    // The stream never started: later events for it must not accumulate noise.
+    await mock.fire('Network.dataReceived', { requestId: 'sse1', data: b64('data: late\n\n') });
+    expect((await mod.readSseCapture(1)).chunks).toEqual([]);
+  });
+
+  // Oversized chunks are stored truncated *and* flagged; consumers must be able
+  // to fail instead of trusting a silently shortened stream.
+  it('flags oversized chunks instead of truncating silently', async () => {
+    const mock = createSseMock({ streamResourceContent: async () => ({ bufferedData: b64('data: head\n') }) });
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+
+    await mod.startSseCapture(1, 'chatgpt.com');
+    await mock.fire('Network.responseReceived', responseReceived('sse1', SSE_URL, 'text/event-stream'));
+    await mock.fire('Network.dataReceived', {
+      requestId: 'sse1',
+      data: 'A'.repeat(mod.CDP_SSE_CHUNK_PAYLOAD_LIMIT + 1),
+    });
+
+    const chunks = (await mod.readSseCapture(1)).chunks.filter((chunk) => chunk.kind === 'sse-chunk');
+    expect(chunks[1]).toMatchObject({ kind: 'sse-chunk', payloadTruncated: true });
+    expect(chunks[1].payload).toHaveLength('base64:'.length + mod.CDP_SSE_CHUNK_PAYLOAD_LIMIT);
+  });
+
+  // A burst longer than the ring must be reported through `dropped` while the
+  // newest chunks stay readable, so a slow reader cannot OOM the worker.
+  it('counts dropped chunks when the ring overflows', async () => {
+    const mock = createSseMock({ streamResourceContent: async () => ({ bufferedData: b64('data: head\n') }) });
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+
+    await mod.startSseCapture(1, 'chatgpt.com');
+    await mock.fire('Network.responseReceived', responseReceived('sse1', SSE_URL, 'text/event-stream'));
+    const overflow = 2;
+    for (let i = 0; i < mod.CDP_SSE_CHUNK_BUFFER_LIMIT + overflow - 1; i += 1) {
+      await mock.fire('Network.dataReceived', { requestId: 'sse1', data: b64(`event ${i}\n`) });
+    }
+
+    const result = await mod.readSseCapture(1);
+    expect(result.chunks).toHaveLength(mod.CDP_SSE_CHUNK_BUFFER_LIMIT);
+    expect(result.dropped).toBe(overflow);
+    // The buffered prefix and the first streamed chunk are the oldest entries.
+    const texts = decodeChunks(result.chunks).split('\n').filter(Boolean);
+    expect(texts[0]).toBe(`event ${overflow - 1}`);
+    expect(texts[texts.length - 1]).toBe(`event ${mod.CDP_SSE_CHUNK_BUFFER_LIMIT + overflow - 2}`);
+    // A read resets the drop counter.
+    await mock.fire('Network.dataReceived', { requestId: 'sse1', data: b64('event tail\n') });
+    const second = await mod.readSseCapture(1);
+    expect(second.dropped).toBe(0);
+    expect(decodeChunks(second.chunks)).toBe('event tail\n');
+  });
+
+  // Reading must drain without losing the live stream's identity; stream end and
+  // stop must release per-request state so late events cannot resurrect it.
+  it('drains on read, ignores events after stream end and after stop', async () => {
+    const mock = createSseMock({ streamResourceContent: async () => ({ bufferedData: b64('data: head\n') }) });
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+
+    await mod.startSseCapture(1, 'chatgpt.com');
+    expect(mod.hasActiveSseCapture(1)).toBe(true);
+    expect(mod.hasActiveNetworkCapture(1)).toBe(true);
+    await mock.fire('Network.responseReceived', responseReceived('sse1', SSE_URL, 'text/event-stream'));
+    await mock.fire('Network.dataReceived', { requestId: 'sse1', data: b64('data: one\n') });
+
+    const first = await mod.readSseCapture(1);
+    expect(decodeChunks(first.chunks)).toBe('data: head\ndata: one\n');
+    // Drain keeps request state so later chunks still resolve the stream URL.
+    await mock.fire('Network.dataReceived', { requestId: 'sse1', data: b64('data: two\n') });
+    const second = await mod.readSseCapture(1);
+    expect(decodeChunks(second.chunks)).toBe('data: two\n');
+    expect(second.chunks[0].url).toBe(SSE_URL);
+
+    await mock.fire('Network.loadingFinished', { requestId: 'sse1' });
+    await mock.fire('Network.dataReceived', { requestId: 'sse1', data: b64('data: late\n') });
+    expect((await mod.readSseCapture(1)).chunks).toEqual([]);
+
+    await mock.fire('Network.dataReceived', { requestId: 'sse1', data: b64('data: ignored\n') });
+    mod.stopSseCapture(1);
+    expect(mod.hasActiveSseCapture(1)).toBe(false);
+    expect(mod.hasActiveNetworkCapture(1)).toBe(false);
+    await expect(mod.readSseCapture(1)).resolves.toEqual({ chunks: [], dropped: 0 });
+  });
+
+  // SSE and HTTP capture share four Network events, so arming both must not let
+  // the SSE branch swallow events that HTTP capture still needs.
+  it('keeps HTTP network capture working while sse capture is armed', async () => {
+    const mock = createSseMock({ streamResourceContent: async () => ({ bufferedData: b64('data: head\n') }) });
+    vi.stubGlobal('chrome', mock.chrome);
+    const mod = await import('./cdp');
+    mod.registerListeners();
+
+    await mod.startNetworkCapture(1, 'api.example');
+    await mod.startSseCapture(1, 'chatgpt.com');
+
+    await mock.fire('Network.requestWillBeSent', {
+      requestId: 'http1',
+      request: { url: 'https://api.example/items', method: 'GET' },
+    });
+    await mock.fire('Network.responseReceived', {
+      requestId: 'http1',
+      response: { url: 'https://api.example/items', status: 200, mimeType: 'application/json' },
+    });
+    await mock.fire('Network.responseReceived', responseReceived('sse1', SSE_URL, 'text/event-stream'));
+    await mock.fire('Network.dataReceived', { requestId: 'sse1', data: b64('data: one\n') });
+
+    const entries = await mod.readNetworkCapture(1) as Array<{ url: string; responseStatus?: number }>;
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ url: 'https://api.example/items', responseStatus: 200 });
+
+    const { chunks } = await mod.readSseCapture(1);
+    expect(decodeChunks(chunks)).toBe('data: head\ndata: one\n');
+  });
+
+  // A forced debugger re-attach must not disarm capture: the observer survives
+  // SPA navigation and third-party debugger interference.
+  it('preserves armed sse capture across forced re-attach', async () => {
+    const onDetachListeners: Array<(source: { tabId?: number }) => void> = [];
+    let failNextHealthCheck = false;
+    let networkEnableCount = 0;
+    const onEventListeners: Array<(source: { tabId?: number }, method: string, params: any) => void | Promise<void>> = [];
+    const debuggerApi = {
+      attach: vi.fn(async () => {}),
+      detach: vi.fn(async ({ tabId }: { tabId?: number }) => {
+        for (const fn of onDetachListeners) fn({ tabId });
+      }),
+      sendCommand: vi.fn(async (_target: unknown, method: string, params?: any) => {
+        if (method === 'Runtime.evaluate' && params?.expression === '1') {
+          if (failNextHealthCheck) {
+            failNextHealthCheck = false;
+            throw new Error('Inspected target navigated or closed');
+          }
+          return { result: { value: '1' } };
+        }
+        if (method === 'Network.enable') {
+          networkEnableCount += 1;
+          return {};
+        }
+        if (method === 'Network.streamResourceContent') return { bufferedData: b64('data: head\n') };
+        return {};
+      }),
+      onDetach: { addListener: vi.fn((fn: (s: { tabId?: number }) => void) => { onDetachListeners.push(fn); }) },
+      onEvent: { addListener: vi.fn((fn) => { onEventListeners.push(fn); }) },
+    };
+    const tabs = {
+      get: vi.fn(async () => ({ id: 1, windowId: 1, url: 'https://chatgpt.com/' })),
+      onRemoved: { addListener: vi.fn() },
+      onUpdated: { addListener: vi.fn() },
+    };
+    vi.stubGlobal('chrome', { tabs, debugger: debuggerApi, scripting: {}, runtime: { id: 'opencli-test' } });
+    const mod = await import('./cdp');
+    mod.registerListeners();
+
+    await mod.startSseCapture(1, 'chatgpt.com');
+    const enablesAfterStart = networkEnableCount;
+    const fire = async (method: string, params: any) => {
+      for (const fn of onEventListeners) await fn({ tabId: 1 }, method, params);
+    };
+    await fire('Network.responseReceived', responseReceived('sse1', SSE_URL, 'text/event-stream'));
+
+    failNextHealthCheck = true;
+    await mod.ensureAttached(1);
+
+    expect(mod.hasActiveSseCapture(1)).toBe(true);
+    expect(networkEnableCount).toBeGreaterThan(enablesAfterStart);
+    await fire('Network.dataReceived', { requestId: 'sse1', data: b64('data: resumed\n') });
+    const { chunks } = await mod.readSseCapture(1);
+    expect(decodeChunks(chunks)).toBe('data: head\ndata: resumed\n');
   });
 });
 

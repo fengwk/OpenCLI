@@ -30,6 +30,23 @@ const CDP_REQUEST_BODY_CAPTURE_LIMIT = 1 * 1024 * 1024;
 // frames when the ring is full so a long agent turn cannot OOM the service worker.
 const CDP_WS_FRAME_PAYLOAD_LIMIT = 1 * 1024 * 1024;
 const CDP_WS_FRAME_BUFFER_LIMIT = 10_000;
+// SSE chunks are one streamed body slice each; same bounds as WS frames so a
+// long agent turn cannot OOM the service worker. A chunk larger than the cap is
+// stored truncated *and* flagged (consumers must fail, never silently accept).
+// Keep in sync with src/browser/cdp.ts.
+export const CDP_SSE_CHUNK_PAYLOAD_LIMIT = 1 * 1024 * 1024;
+export const CDP_SSE_CHUNK_BUFFER_LIMIT = 10_000;
+// Deadline for the one-shot Network.streamResourceContent arm. It only asks
+// Chrome for the already-buffered prefix, so a hang here means a wedged target;
+// fail the arm instead of queueing stream chunks indefinitely.
+const CDP_SSE_ARM_TIMEOUT_MS = 10_000;
+/** Network events that drive SSE capture (and are shared with HTTP capture). */
+const SSE_CAPTURE_EVENTS = new Set([
+  'Network.responseReceived',
+  'Network.dataReceived',
+  'Network.loadingFinished',
+  'Network.loadingFailed',
+]);
 
 type NetworkCaptureEntry = {
   kind: 'cdp';
@@ -67,6 +84,35 @@ export type WsCaptureEntry = {
   payloadTruncated: boolean;
 };
 
+/**
+ * One drained HTTP SSE (text/event-stream) body slice, or the failure that
+ * prevented incremental capture for one stream. `payload` is always
+ * `base64:<base64-bytes>` because Chrome reports stream bytes base64-encoded;
+ * consumers must decode before parsing the SSE protocol.
+ */
+export type SseCaptureChunk =
+  | {
+    kind: 'sse-chunk';
+    url: string;
+    requestId: string;
+    timestamp: number;
+    payload: string;
+    payloadTruncated: boolean;
+  }
+  | {
+    kind: 'sse-error';
+    url: string;
+    requestId: string;
+    timestamp: number;
+    error: string;
+  };
+
+export type SseCaptureReadResult = {
+  chunks: SseCaptureChunk[];
+  /** Chunks evicted from the ring buffer since the previous read. */
+  dropped: number;
+};
+
 type WsCaptureState = {
   patterns: string[];
   entries: WsCaptureEntry[];
@@ -75,6 +121,30 @@ type WsCaptureState = {
   /** requestIds whose Created URL failed the filter — never capture their frames */
   rejectedRequestIds: Set<string>;
   /** Frames dropped because the ring buffer was full (oldest-evicted count). */
+  dropped: number;
+};
+
+/** Per-request state for one armed SSE stream. */
+type SseStreamState = {
+  url: string;
+  /** True once the arm command resolved and its buffered prefix was flushed. */
+  live: boolean;
+  /** The stream ended (loadingFinished/loadingFailed) while the arm was in flight. */
+  finished: boolean;
+  /**
+   * Chunks observed before the arm resolved. Chrome only reports bytes through
+   * dataReceived after it starts streaming, so these are strictly later than
+   * the buffered prefix the arm returns — they must be flushed after it.
+   */
+  queued: SseCaptureChunk[];
+};
+
+type SseCaptureState = {
+  patterns: string[];
+  entries: SseCaptureChunk[];
+  /** requestId → stream state, for responses whose MIME is text/event-stream */
+  requests: Map<string, SseStreamState>;
+  /** Chunks dropped because the ring buffer was full (oldest-evicted count). */
   dropped: number;
 };
 
@@ -94,6 +164,7 @@ export type DownloadWaitResult = {
 
 const networkCaptures = new Map<number, NetworkCaptureState>();
 const wsCaptures = new Map<number, WsCaptureState>();
+const sseCaptures = new Map<number, SseCaptureState>();
 
 /**
  * Default deadline for a single chrome.debugger command. chrome.debugger has
@@ -204,9 +275,11 @@ async function ensureAttachedInternal(tabId: number, aggressiveRetry: boolean): 
   // re-attach instead of silently dropping in-flight capture — otherwise any
   // non-navigate command that triggers a re-attach (a stale-attach health-check
   // failure during SPA navigation or third-party debugger interference) leaves
-  // network-capture-read / ws-capture-read returning [] even though traffic fired.
+  // network-capture-read / ws-capture-read / sse-capture-read returning [] even
+  // though traffic fired.
   const preservedNetworkCapture = networkCaptures.get(tabId);
   const preservedWsCapture = wsCaptures.get(tabId);
+  const preservedSseCapture = sseCaptures.get(tabId);
   // Tab-scoped download waiters: the forced detach below fires onDetach, whose
   // handler finishes armed download waiters ("debugger detached"). Pause them
   // here and resume after a successful attach so a routine re-attach cannot
@@ -277,16 +350,17 @@ async function ensureAttachedInternal(tabId: number, aggressiveRetry: boolean): 
   // actually deliver events; a failed enable never fails the command itself.
   await sendDebuggerCommand({ tabId }, 'Page.enable').catch(() => {});
 
-  // Restore network/ws capture that the re-attach (detach + onDetach) tore down.
-  // The detach always disables the CDP Network domain, so re-enable it and put
-  // the accumulated capture state back unconditionally. Done last (after the
+  // Restore network/ws/sse capture that the re-attach (detach + onDetach) tore
+  // down. The detach always disables the CDP Network domain, so re-enable it and
+  // put the accumulated capture state back unconditionally. Done last (after the
   // awaits above) so it wins over the onDetach handler's delete, which fires
   // while those awaits yield to the event loop.
-  if (preservedNetworkCapture || preservedWsCapture) {
+  if (preservedNetworkCapture || preservedWsCapture || preservedSseCapture) {
     try {
       await sendDebuggerCommand({ tabId }, 'Network.enable');
       if (preservedNetworkCapture) networkCaptures.set(tabId, preservedNetworkCapture);
       if (preservedWsCapture) wsCaptures.set(tabId, preservedWsCapture);
+      if (preservedSseCapture) sseCaptures.set(tabId, preservedSseCapture);
     } catch {
       // Leave capture cleared rather than arm a half-attached Network domain;
       // the next start-capture re-arms cleanly.
@@ -1487,9 +1561,67 @@ export function hasActiveWsCapture(tabId: number): boolean {
   return wsCaptures.has(tabId);
 }
 
-/** True when HTTP and/or WebSocket capture is armed (keep debugger attached). */
+export function hasActiveSseCapture(tabId: number): boolean {
+  return sseCaptures.has(tabId);
+}
+
+/**
+ * True when HTTP, WebSocket and/or SSE capture is armed (keep debugger attached
+ * so navigation does not tear an armed observer down).
+ */
 export function hasActiveNetworkCapture(tabId: number): boolean {
-  return networkCaptures.has(tabId) || wsCaptures.has(tabId);
+  return networkCaptures.has(tabId) || wsCaptures.has(tabId) || sseCaptures.has(tabId);
+}
+
+/**
+ * Arm HTTP SSE (`text/event-stream`) body capture for a tab via
+ * `Network.streamResourceContent`.
+ * Only bytes observed after this call are buffered — chunks already consumed by
+ * the page before arming are not replayed. Call before the action that triggers
+ * the stream (e.g. send prompt).
+ * @param pattern URL substring filter; empty matches all URLs. Use `|` for OR.
+ */
+export async function startSseCapture(
+  tabId: number,
+  pattern?: string,
+): Promise<void> {
+  await ensureAttached(tabId);
+  // Arm before Network.enable: a stream already in flight can fire
+  // responseReceived as soon as the domain is enabled.
+  sseCaptures.set(tabId, {
+    patterns: normalizeCapturePatterns(pattern),
+    entries: [],
+    requests: new Map(),
+    dropped: 0,
+  });
+  await sendDebuggerCommand({ tabId }, 'Network.enable');
+}
+
+/**
+ * Drain buffered SSE chunks since the last read (or since start).
+ * Per-request state is kept so an in-flight stream keeps resolving its URL and
+ * ordering after a drain.
+ */
+export async function readSseCapture(tabId: number): Promise<SseCaptureReadResult> {
+  const state = sseCaptures.get(tabId);
+  if (!state) return { chunks: [], dropped: 0 };
+  const chunks = state.entries.slice();
+  const dropped = state.dropped;
+  state.entries = [];
+  state.dropped = 0;
+  if (dropped > 0) {
+    // Adapter should poll more frequently if this appears in extension logs.
+    console.warn(`[opencli] sse-capture dropped ${dropped} chunk(s) on tab ${tabId} (ring full)`);
+  }
+  return { chunks, dropped };
+}
+
+/**
+ * Disarm SSE capture for a tab and free the ring buffer / per-request state.
+ * Safe to call when capture was never started. Does not detach the debugger.
+ */
+export function stopSseCapture(tabId: number): void {
+  sseCaptures.delete(tabId);
 }
 
 function pushWsFrame(state: WsCaptureState, entry: WsCaptureEntry): void {
@@ -1596,6 +1728,153 @@ function handleWsCaptureEvent(
   }
 }
 
+/** Chrome reports SSE bytes as base64 in both buffered and streamed payloads. */
+function encodeSseChunk(
+  url: string,
+  requestId: string,
+  data: unknown,
+): SseCaptureChunk | null {
+  const raw = String(data ?? '');
+  // Before streaming is enabled Chrome reports dataReceived without any body
+  // data; there is nothing to capture for those events. The same applies to the
+  // arm response: responseReceived fires on response headers, so an absent or
+  // empty bufferedData means "no bytes buffered yet", never a silent loss.
+  if (!raw) return null;
+  const truncated = raw.length > CDP_SSE_CHUNK_PAYLOAD_LIMIT;
+  return {
+    kind: 'sse-chunk',
+    url,
+    requestId,
+    timestamp: Date.now(),
+    payload: `base64:${truncated ? raw.slice(0, CDP_SSE_CHUNK_PAYLOAD_LIMIT) : raw}`,
+    payloadTruncated: truncated,
+  };
+}
+
+/** Push into a bounded buffer; returns the number of oldest entries evicted. */
+function pushBoundedSseChunk(target: SseCaptureChunk[], chunk: SseCaptureChunk): number {
+  let dropped = 0;
+  if (target.length >= CDP_SSE_CHUNK_BUFFER_LIMIT) {
+    dropped = target.length - CDP_SSE_CHUNK_BUFFER_LIMIT + 1;
+    target.splice(0, dropped);
+  }
+  target.push(chunk);
+  return dropped;
+}
+
+/**
+ * Ask Chrome for the bytes it still holds for an armed SSE stream. The response
+ * carries the already-buffered prefix; every later byte reaches the caller
+ * through `Network.dataReceived.data`, which is why queued chunks are flushed
+ * strictly after this prefix.
+ */
+function armSseStream(
+  tabId: number,
+  state: SseCaptureState,
+  requestId: string,
+  request: SseStreamState,
+): Promise<void> {
+  return sendDebuggerCommand<{ bufferedData?: string }>(
+    { tabId },
+    'Network.streamResourceContent',
+    { requestId },
+    CDP_SSE_ARM_TIMEOUT_MS,
+  ).then((result) => {
+    flushSseStream(
+      tabId,
+      state,
+      requestId,
+      request,
+      encodeSseChunk(request.url, requestId, result?.bufferedData),
+    );
+  }).catch((err: unknown) => {
+    // An older Chrome without streamResourceContent (or a request that is no
+    // longer streamable) must not degrade into silent empty output: surface one
+    // sse-error chunk so the consumer fails loudly instead of trusting a
+    // truncated stream. Chunks already streamed to us are still delivered.
+    flushSseStream(tabId, state, requestId, request, {
+      kind: 'sse-error',
+      url: request.url,
+      requestId,
+      timestamp: Date.now(),
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
+}
+
+function flushSseStream(
+  tabId: number,
+  state: SseCaptureState,
+  requestId: string,
+  request: SseStreamState,
+  leading: SseCaptureChunk | null,
+): void {
+  // A stop, tab close or re-arm may have replaced this state while the arm
+  // command was in flight — never resurrect a disarmed capture.
+  if (sseCaptures.get(tabId) !== state) return;
+  if (leading) state.dropped += pushBoundedSseChunk(state.entries, leading);
+  for (const queued of request.queued) {
+    state.dropped += pushBoundedSseChunk(state.entries, queued);
+  }
+  request.queued = [];
+  if (leading?.kind === 'sse-error') {
+    // Streaming never started, so later dataReceived events carry no body.
+    state.requests.delete(requestId);
+    return;
+  }
+  request.live = true;
+  // The stream ended while we were arming; the flush above is its last data.
+  if (request.finished) state.requests.delete(requestId);
+}
+
+function handleSseCaptureEvent(
+  tabId: number,
+  method: string,
+  eventParams: Record<string, any> | undefined,
+): Promise<void> | void {
+  const state = sseCaptures.get(tabId);
+  if (!state) return;
+
+  if (method === 'Network.responseReceived') {
+    const requestId = String(eventParams?.requestId || '');
+    if (!requestId || state.requests.has(requestId)) return;
+    const response = eventParams?.response as { url?: string; mimeType?: string } | undefined;
+    // Only real SSE streams are armed: an ordinary JSON/HTML response would
+    // otherwise cost a pointless CDP round trip and an sse-error chunk.
+    if (!String(response?.mimeType || '').toLowerCase().includes('text/event-stream')) return;
+    const url = String(response?.url || '');
+    if (!shouldCaptureUrl(url, state.patterns)) return;
+    const request: SseStreamState = { url, live: false, finished: false, queued: [] };
+    state.requests.set(requestId, request);
+    return armSseStream(tabId, state, requestId, request);
+  }
+
+  const requestId = String(eventParams?.requestId || '');
+  const request = state.requests.get(requestId);
+  if (!request) return;
+
+  if (method === 'Network.dataReceived') {
+    const chunk = encodeSseChunk(request.url, requestId, eventParams?.data);
+    if (!chunk) return;
+    if (request.live) {
+      state.dropped += pushBoundedSseChunk(state.entries, chunk);
+      return;
+    }
+    state.dropped += pushBoundedSseChunk(request.queued, chunk);
+    return;
+  }
+
+  if (method === 'Network.loadingFinished' || method === 'Network.loadingFailed') {
+    if (request.live) {
+      state.requests.delete(requestId);
+      return;
+    }
+    // Ended while arming: keep the request until the arm resolves so the
+    // buffered prefix and queued chunks are still flushed, then drop it.
+    request.finished = true;
+  }
+}
+
 function clearFrameTargetsForTab(tabId: number): void {
   for (const [key, targetId] of [...frameTargets.entries()]) {
     if (!key.startsWith(`${tabId}:`)) continue;
@@ -1611,6 +1890,7 @@ export async function detach(tabId: number): Promise<void> {
   attached.delete(tabId);
   networkCaptures.delete(tabId);
   wsCaptures.delete(tabId);
+  sseCaptures.delete(tabId);
   tabFrameContexts.delete(tabId);
   try { await chrome.debugger.detach({ tabId }); } catch { /* ignore */ }
 }
@@ -1620,6 +1900,7 @@ export function registerListeners(): void {
     attached.delete(tabId);
     networkCaptures.delete(tabId);
     wsCaptures.delete(tabId);
+    sseCaptures.delete(tabId);
     tabFrameContexts.delete(tabId);
     clearFrameTargetsForTab(tabId);
   });
@@ -1628,6 +1909,7 @@ export function registerListeners(): void {
       attached.delete(source.tabId);
       networkCaptures.delete(source.tabId);
       wsCaptures.delete(source.tabId);
+      sseCaptures.delete(source.tabId);
       tabFrameContexts.delete(source.tabId);
       clearFrameTargetsForTab(source.tabId);
       return;
@@ -1649,6 +1931,13 @@ export function registerListeners(): void {
     if (method.startsWith('Network.webSocket')) {
       handleWsCaptureEvent(tabId, method, eventParams);
       return;
+    }
+
+    // SSE capture is independent of HTTP network capture too, but it shares
+    // these four Network events — handle it first, then let HTTP capture (if
+    // armed for this tab) process the same event.
+    if (SSE_CAPTURE_EVENTS.has(method)) {
+      await handleSseCaptureEvent(tabId, method, eventParams);
     }
 
     const state = networkCaptures.get(tabId);

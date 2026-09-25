@@ -21,6 +21,9 @@ export type Action =
   | 'ws-capture-start'
   | 'ws-capture-read'
   | 'ws-capture-stop'
+  | 'sse-capture-start'
+  | 'sse-capture-read'
+  | 'sse-capture-stop'
   | 'wait-download'
   | 'cdp'
   | 'frames';

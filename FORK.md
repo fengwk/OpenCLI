@@ -11,7 +11,7 @@ Use it when merging back to mainline or rebasing onto upstream.
 
 ## Why this fork exists
 
-1. **Long-lived WebSocket capture** for ChatGPT protocol streams (without relying on `webSocketCreated` for already-open sockets).
+1. **Long-lived stream capture** for ChatGPT protocol streams: WebSocket frames (without relying on `webSocketCreated` for already-open sockets) and incremental HTTP SSE bodies while the stream is still open.
 2. **Hardened `setFileInput`** with pure-CDP objectId/backendNodeId and nodeId fallback (no picker interception or in-page click).
 3. **Repeatable CLI flags** (`Arg.repeatable`) for multi `--file a --file b`.
 4. **Tab-scoped download waits** that route Page download events by command tab and narrow final Chrome-download association.
@@ -20,6 +20,18 @@ Use it when merging back to mainline or rebasing onto upstream.
 ---
 
 ## Changelog (fork)
+
+### 2026-09-25
+
+#### HTTP SSE stream capture
+
+Unreleased on top of CLI `1.8.8-fengwk.1` / extension `1.0.34`. Shipping this needs a paired
+extension build and version bump (new protocol actions).
+
+| Area | Change | Paths |
+|------|--------|-------|
+| SSE capture | `startSseCapture` / `readSseCapture` / `stopSseCapture`: incremental capture of `text/event-stream` response bodies via `Network.streamResourceContent` (buffered prefix first, then `Network.dataReceived` chunks in wire order), bounded ring with `dropped`, per-chunk 1 MiB cap flagged via `payloadTruncated`, `sse-error` entry instead of a silently empty stream, no page fetch/XHR patching and no `Network.*` additions to the `cdp` allowlist. | `extension/src/cdp.ts`, `extension/src/protocol.ts`, `extension/src/background.ts`, `src/browser/page.ts`, `src/browser/cdp.ts`, `src/browser/daemon-client.ts`, `src/types.ts` |
+| SSE design note | Capture semantics, ordering, limits, lifecycle | `docs/design/sse-stream-capture.md` |
 
 ### 2026-09-15
 
@@ -145,7 +157,7 @@ Fork builds (`*-fengwk.*` versions) are **not** published to upstream npm and mu
 
 ## Merge checklist (into upstream)
 
-1. **WS capture API** — review for multi-tab lease safety; document extension version bump if protocol actions are new.
+1. **Stream capture APIs (WS + SSE)** — review for multi-tab lease safety; document extension version bump if protocol actions are new.
 2. **setFileInput** — upstream may already have partial chooser work (#2108); rebase carefully on `extension/src/cdp.ts`.
 3. **`Arg.repeatable`** — low risk; useful beyond this fork.
 4. **chatgpt-agent** — prefer shipping as **plugin**, not core `clis/`, unless upstream wants a first-party agent adapter.
@@ -159,6 +171,7 @@ Fork builds (`*-fengwk.*` versions) are **not** published to upstream npm and mu
 | Capability | Source |
 |------------|--------|
 | `page.startWsCapture` / `readWsCapture` | This fork’s extension + CLI |
+| `page.startSseCapture` / `readSseCapture` / `stopSseCapture` | This fork’s extension + CLI |
 | `page.setFileInput` | Extension CDP (reload after package) |
 | `page.waitForDownload` | Fork extension; completion is scoped to the command tab |
 | `clis/chatgpt/utils.js` | Host package (plugin resolves via `host-chatgpt.js`) |

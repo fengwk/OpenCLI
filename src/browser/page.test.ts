@@ -261,6 +261,92 @@ describe('Page websocket capture compatibility', () => {
   });
 });
 
+describe('Page SSE capture', () => {
+  beforeEach(() => {
+    sendCommandMock.mockReset();
+    sendCommandFullMock.mockReset();
+    warnMock.mockReset();
+  });
+
+  // The adapter needs the stream bytes and the drop count from the same call, so
+  // the daemon payload must be normalized instead of passed through blindly.
+  it('forwards sse capture actions and normalizes the drained result', async () => {
+    const chunks = [{
+      kind: 'sse-chunk',
+      url: 'https://chatgpt.com/backend-api/conversation',
+      requestId: 'sse1',
+      timestamp: 1,
+      payload: 'base64:ZGF0YTogb25lCg==',
+      payloadTruncated: false,
+    }];
+    sendCommandMock
+      .mockResolvedValueOnce({ started: true })
+      .mockResolvedValueOnce({ chunks, dropped: 2 })
+      .mockResolvedValueOnce({ stopped: true });
+
+    const page = new Page('chatgpt-agent', undefined, undefined, undefined, 'adapter');
+    page.setActivePage('target-9');
+
+    await expect(page.startSseCapture('chatgpt.com')).resolves.toBe(true);
+    await expect(page.readSseCapture()).resolves.toEqual({ chunks, dropped: 2 });
+    await expect(page.stopSseCapture()).resolves.toBeUndefined();
+
+    expect(sendCommandMock).toHaveBeenCalledWith('sse-capture-start', expect.objectContaining({
+      session: 'chatgpt-agent',
+      surface: 'adapter',
+      page: 'target-9',
+      pattern: 'chatgpt.com',
+    }));
+    expect(sendCommandMock).toHaveBeenCalledWith('sse-capture-read', expect.objectContaining({
+      session: 'chatgpt-agent',
+      surface: 'adapter',
+      page: 'target-9',
+    }));
+    expect(sendCommandMock).toHaveBeenCalledWith('sse-capture-stop', expect.objectContaining({
+      session: 'chatgpt-agent',
+      surface: 'adapter',
+      page: 'target-9',
+    }));
+  });
+
+  it('returns an empty read result when the extension payload is missing or malformed', async () => {
+    sendCommandMock.mockResolvedValueOnce(undefined).mockResolvedValueOnce({ chunks: 'nope', dropped: 'x' });
+
+    const page = new Page('chatgpt-agent', undefined, undefined, undefined, 'adapter');
+
+    await expect(page.readSseCapture()).resolves.toEqual({ chunks: [], dropped: 0 });
+    await expect(page.readSseCapture()).resolves.toEqual({ chunks: [], dropped: 0 });
+  });
+
+  // An extension without the sse-capture actions must degrade to an explicit
+  // unsupported result (and warn once), not to a silent empty stream.
+  it('treats unknown sse-capture actions as unsupported and memoizes the family', async () => {
+    sendCommandMock.mockRejectedValueOnce(new Error('Unknown action: sse-capture-start'));
+
+    const page = new Page('chatgpt-agent', undefined, undefined, undefined, 'adapter');
+
+    await expect(page.startSseCapture('chatgpt.com')).resolves.toBe(false);
+    // The whole family is memoized: no further probes, and never a silent empty
+    // stream that an adapter could mistake for "no output".
+    await expect(page.readSseCapture()).resolves.toEqual({ chunks: [], dropped: 0 });
+    await expect(page.stopSseCapture()).resolves.toBeUndefined();
+    await expect(page.startSseCapture('chatgpt.com')).resolves.toBe(false);
+
+    expect(sendCommandMock).toHaveBeenCalledTimes(1);
+    expect(warnMock).toHaveBeenCalledTimes(1);
+    expect(warnMock).toHaveBeenCalledWith(expect.stringContaining('does not support SSE capture'));
+  });
+
+  it('rethrows unrelated sse capture failures', async () => {
+    sendCommandMock.mockRejectedValueOnce(new Error('Extension disconnected'));
+
+    const page = new Page('chatgpt-agent', undefined, undefined, undefined, 'adapter');
+
+    await expect(page.startSseCapture()).rejects.toThrow('Extension disconnected');
+    expect(warnMock).not.toHaveBeenCalled();
+  });
+});
+
 describe('Page download waits', () => {
   beforeEach(() => {
     sendCommandMock.mockReset();

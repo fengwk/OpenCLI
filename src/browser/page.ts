@@ -9,7 +9,7 @@
  * page-scoped operations target the correct page without guessing.
  */
 
-import type { BrowserCookie, BrowserDownloadWaitResult, BrowserEvaluateFunction, ScreenshotOptions, WsCaptureFrame } from '../types.js';
+import type { BrowserCookie, BrowserDownloadWaitResult, BrowserEvaluateFunction, ScreenshotOptions, SseCaptureReadResult, WsCaptureFrame } from '../types.js';
 import { sendCommand, sendCommandFull } from './daemon-client.js';
 import { buildEvaluateExpression } from './utils.js';
 import { saveBase64ToFile } from '../utils.js';
@@ -32,6 +32,13 @@ function isUnsupportedWsCaptureError(err: unknown): boolean {
   return (normalized.includes('unknown action') && normalized.includes('ws-capture'))
     || (normalized.includes('ws capture') && normalized.includes('not supported'))
     || (normalized.includes('websocket capture') && normalized.includes('not supported'));
+}
+
+function isUnsupportedSseCaptureError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  const normalized = message.toLowerCase();
+  return (normalized.includes('unknown action') && normalized.includes('sse-capture'))
+    || (normalized.includes('sse capture') && normalized.includes('not supported'));
 }
 
 // The extension throws "Page not found: <id> — stale page identity" when our cached
@@ -73,6 +80,8 @@ export class Page extends CDPBasePage {
   private _networkCaptureWarned = false;
   private _wsCaptureUnsupported = false;
   private _wsCaptureWarned = false;
+  private _sseCaptureUnsupported = false;
+  private _sseCaptureWarned = false;
 
   /** Helper: spread session into command params */
   private _sessionOpts(): { session: string; surface: 'browser' | 'adapter'; idleTimeout?: number; contextId?: string; preferredContextId?: string; windowMode?: 'foreground' | 'background'; siteSession?: 'ephemeral' | 'persistent'; warmTabTtl?: number } {
@@ -195,6 +204,16 @@ export class Page extends CDPBasePage {
     );
   }
 
+  private _markUnsupportedSseCapture(): void {
+    this._sseCaptureUnsupported = true;
+    if (this._sseCaptureWarned) return;
+    this._sseCaptureWarned = true;
+    log.warn(
+      'Browser Bridge extension does not support SSE capture; continuing without it. ' +
+      'HTTP-stream adapters need a newer extension (sse-capture-start/read).',
+    );
+  }
+
   async evaluate<T = unknown>(js: string): Promise<T>;
   async evaluate<Args extends unknown[], T>(fn: BrowserEvaluateFunction<Args, T>, ...args: Args): Promise<Awaited<T>>;
   async evaluate(input: string | BrowserEvaluateFunction<unknown[], unknown>, ...args: unknown[]): Promise<unknown> {
@@ -227,6 +246,8 @@ export class Page extends CDPBasePage {
       this._networkCaptureWarned = false;
       this._wsCaptureUnsupported = false;
       this._wsCaptureWarned = false;
+      this._sseCaptureUnsupported = false;
+      this._sseCaptureWarned = false;
     }
   }
 
@@ -358,6 +379,51 @@ export class Page extends CDPBasePage {
     } catch (err) {
       if (!isUnsupportedWsCaptureError(err)) throw err;
       this._markUnsupportedWsCapture();
+    }
+  }
+
+  async startSseCapture(pattern: string = ''): Promise<boolean> {
+    if (this._sseCaptureUnsupported) return false;
+    try {
+      await sendCommand('sse-capture-start', {
+        pattern,
+        ...this._cmdOpts(),
+      });
+      return true;
+    } catch (err) {
+      if (!isUnsupportedSseCaptureError(err)) throw err;
+      this._markUnsupportedSseCapture();
+      return false;
+    }
+  }
+
+  async readSseCapture(): Promise<SseCaptureReadResult> {
+    if (this._sseCaptureUnsupported) return { chunks: [], dropped: 0 };
+    try {
+      const result = await sendCommand('sse-capture-read', {
+        ...this._cmdOpts(),
+      }) as SseCaptureReadResult | null | undefined;
+      return {
+        chunks: Array.isArray(result?.chunks) ? result.chunks : [],
+        dropped: typeof result?.dropped === 'number' ? result.dropped : 0,
+      };
+    } catch (err) {
+      if (!isUnsupportedSseCaptureError(err)) throw err;
+      this._markUnsupportedSseCapture();
+      return { chunks: [], dropped: 0 };
+    }
+  }
+
+  /** Disarm SSE capture and free the extension-side ring buffer for this tab. */
+  async stopSseCapture(): Promise<void> {
+    if (this._sseCaptureUnsupported) return;
+    try {
+      await sendCommand('sse-capture-stop', {
+        ...this._cmdOpts(),
+      });
+    } catch (err) {
+      if (!isUnsupportedSseCaptureError(err)) throw err;
+      this._markUnsupportedSseCapture();
     }
   }
 
