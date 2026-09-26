@@ -149,6 +149,32 @@ function buildComposerLocatorScript() {
     `;
 }
 
+function buildSendButtonLocatorScript() {
+    return `
+      ${buildComposerLocatorScript()}
+      const findSendButton = () => {
+        const composer = findComposer();
+        if (!composer) return null;
+        const root = composer.closest('form') || composer.closest('[data-type="unified-composer"]') || document.body;
+        const isUsable = (button) => button
+          && isVisible(button)
+          && !button.disabled
+          && button.getAttribute('aria-disabled') !== 'true';
+        const primary = root.querySelector(${JSON.stringify(SEND_BUTTON_SELECTOR)})
+          || ${JSON.stringify(SEND_BUTTON_FALLBACK_SELECTORS)}.map(selector => root.querySelector(selector)).find(Boolean);
+        const labels = ${JSON.stringify(SEND_BUTTON_LABELS)};
+        const looksLikeSend = (button) => {
+          const label = button.getAttribute('aria-label') || '';
+          const text = (button.innerText || button.textContent || '').replace(/\\s+/g, ' ').trim();
+          return labels.includes(label) || labels.includes(text) || /send|发送/i.test(label) || /send|发送/i.test(text);
+        };
+        return isUsable(primary)
+          ? primary
+          : Array.from(root.querySelectorAll('button')).find(b => looksLikeSend(b) && isUsable(b)) || null;
+      };
+    `;
+}
+
 export function normalizeBooleanFlag(value, fallback = false) {
     if (typeof value === 'boolean') return value;
     if (value == null || value === '') return fallback;
@@ -1113,32 +1139,8 @@ async function submitChatGPTMessage(page) {
         await page.wait(0.5);
         sent = requireObjectEvaluateResult(unwrapEvaluateResult(await page.evaluate(`
             (() => {
-                const isVisible = (el) => {
-                    if (!(el instanceof HTMLElement)) return false;
-                    const style = window.getComputedStyle(el);
-                    if (style.display === 'none' || style.visibility === 'hidden') return false;
-                    const rect = el.getBoundingClientRect();
-                    return rect.width > 0 && rect.height > 0;
-                };
-                const isUsable = (button) => button
-                    && isVisible(button)
-                    && !button.disabled
-                    && button.getAttribute('aria-disabled') !== 'true';
-                const form = Array.from(document.querySelectorAll('form')).find((node) => node instanceof HTMLElement && isVisible(node));
-                const root = form || document.body;
-                const primary = root.querySelector(${JSON.stringify(SEND_BUTTON_SELECTOR)})
-                    || ${JSON.stringify(SEND_BUTTON_FALLBACK_SELECTORS)}.map(selector => root.querySelector(selector)).find(Boolean);
-                const btns = Array.from(root.querySelectorAll('button'));
-                const labels = ${JSON.stringify(SEND_BUTTON_LABELS)};
-                const looksLikeSend = (button) => {
-                    const label = button.getAttribute('aria-label') || '';
-                    const text = (button.innerText || button.textContent || '').replace(/\\s+/g, ' ').trim();
-                    return labels.includes(label) || labels.includes(text) || /send|发送/i.test(label) || /send|发送/i.test(text);
-                };
-                const sendBtn = isUsable(primary)
-                    ? primary
-                    : btns.find(b => looksLikeSend(b) && isUsable(b));
-                return { sendBtnFound: !!sendBtn };
+                ${buildSendButtonLocatorScript()}
+                return { sendBtnFound: !!findSendButton() };
             })()
         `)), 'chatgpt send button readiness');
         if (sent?.sendBtnFound) break;
@@ -1148,36 +1150,40 @@ async function submitChatGPTMessage(page) {
         return false;
     }
 
-    await page.evaluate(`
+    const clicked = requireObjectEvaluateResult(unwrapEvaluateResult(await page.evaluate(`
         (() => {
-            const isVisible = (el) => {
-                if (!(el instanceof HTMLElement)) return false;
-                const style = window.getComputedStyle(el);
-                if (style.display === 'none' || style.visibility === 'hidden') return false;
-                const rect = el.getBoundingClientRect();
-                return rect.width > 0 && rect.height > 0;
-            };
-            const isUsable = (button) => button
-                && isVisible(button)
-                && !button.disabled
-                && button.getAttribute('aria-disabled') !== 'true';
-            const form = Array.from(document.querySelectorAll('form')).find((node) => node instanceof HTMLElement && isVisible(node));
-            const root = form || document.body;
-            const primary = root.querySelector(${JSON.stringify(SEND_BUTTON_SELECTOR)})
-                || ${JSON.stringify(SEND_BUTTON_FALLBACK_SELECTORS)}.map(selector => root.querySelector(selector)).find(Boolean);
-            const labels = ${JSON.stringify(SEND_BUTTON_LABELS)};
-            const looksLikeSend = (button) => {
-                const label = button.getAttribute('aria-label') || '';
-                const text = (button.innerText || button.textContent || '').replace(/\\s+/g, ' ').trim();
-                return labels.includes(label) || labels.includes(text) || /send|发送/i.test(label) || /send|发送/i.test(text);
-            };
-            const sendBtn = isUsable(primary)
-                ? primary
-                : Array.from(root.querySelectorAll('button')).find(b => looksLikeSend(b) && isUsable(b));
-            if (sendBtn) sendBtn.click();
+            ${buildSendButtonLocatorScript()}
+            const sendBtn = findSendButton();
+            if (!sendBtn) return { clicked: false };
+            sendBtn.click();
+            return { clicked: true };
         })()
-    `);
-    return true;
+    `)), 'chatgpt send button click');
+    return clicked.clicked === true;
+}
+
+/**
+ * Read-only failure snapshot; never return or log the draft's contents.
+ */
+export async function getChatGPTSendFailureState(page) {
+    return requireObjectEvaluateResult(unwrapEvaluateResult(await page.evaluate(`
+        (() => {
+            ${buildComposerLocatorScript()}
+            const composer = findComposer();
+            const form = composer?.closest('form');
+            const root = form || composer?.closest('[data-type="unified-composer"]') || document.body;
+            const button = composer && root.querySelector(
+                'button[data-testid="send-button"], #composer-submit-button'
+            );
+            return {
+                composer: !!composer,
+                draftPresent: !!(composer?.value || composer?.textContent || '').trim(),
+                composerForm: !!form,
+                buttonPresent: !!button,
+                buttonDisabled: !!button && (button.disabled || button.getAttribute('aria-disabled') === 'true'),
+            };
+        })()
+    `)), 'chatgpt send failure state');
 }
 
 /**

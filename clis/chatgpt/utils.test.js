@@ -4,7 +4,7 @@ import path from 'node:path';
 import { JSDOM } from 'jsdom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ArgumentError, AuthRequiredError, CommandExecutionError } from '@jackwener/opencli/errors';
-import { CHATGPT_MODEL_CHOICES, __test__, clearChatGPTDraft, getChatGPTDetailRows, getChatGPTImageAssets, getChatGPTResponsePairCounts, getChatGPTVisibleImageUrls, getCurrentChatGPTModel, getCurrentChatGPTTool, getVisibleMessages, isGenerating, navigateToProject, openChatGPTConversation, prepareChatGPTImagePaths, selectChatGPTModel, selectChatGPTTool, sendChatGPTMessage, uploadChatGPTImages, waitForChatGPTDeepResearchResult, waitForChatGPTDetailRows, waitForChatGPTImages, waitForChatGPTResponse } from './utils.js';
+import { CHATGPT_MODEL_CHOICES, __test__, clearChatGPTDraft, getChatGPTDetailRows, getChatGPTImageAssets, getChatGPTResponsePairCounts, getChatGPTSendFailureState, getChatGPTVisibleImageUrls, getCurrentChatGPTModel, getCurrentChatGPTTool, getVisibleMessages, isGenerating, navigateToProject, openChatGPTConversation, prepareChatGPTImagePaths, selectChatGPTModel, selectChatGPTTool, sendChatGPTMessage, uploadChatGPTImages, waitForChatGPTDeepResearchResult, waitForChatGPTDetailRows, waitForChatGPTImages, waitForChatGPTResponse } from './utils.js';
 
 const tempDirs = [];
 
@@ -1365,6 +1365,106 @@ describe('chatgpt current tool detection', () => {
 });
 
 describe('chatgpt send selectors', () => {
+    // Conversation pages can have a sidebar form before the composer form.
+    // The prompt must be submitted through the form that owns the editor.
+    it('submits only through the composer form when another form comes first', async () => {
+        const page = createDomEvaluatePage(`
+            <form id="sidebar"><button type="button" aria-label="Send">Other form</button></form>
+            <form id="composer">
+              <div id="prompt-textarea" contenteditable="true" role="textbox"></div>
+              <button type="button" data-testid="send-button">Send</button>
+            </form>
+        `);
+        const sidebarClick = vi.fn();
+        const sendClick = vi.fn();
+        page.dom.window.document.querySelector('#sidebar button').addEventListener('click', sidebarClick);
+        page.dom.window.document.querySelector('#composer button').addEventListener('click', sendClick);
+        page.nativeClick = vi.fn().mockResolvedValue(undefined);
+        page.nativeType = vi.fn(async (text) => {
+            page.dom.window.document.querySelector('#prompt-textarea').textContent = text;
+        });
+
+        await expect(sendChatGPTMessage(page, 'Follow-up question')).resolves.toBe(true);
+        expect(page.nativeType).toHaveBeenCalledTimes(1);
+        expect(sendClick).toHaveBeenCalledTimes(1);
+        expect(sidebarClick).not.toHaveBeenCalled();
+    });
+
+    // A matching button in a different form must not make the disabled
+    // composer send button appear ready or receive a stray click.
+    it('fails closed when only an unrelated form has an enabled send button', async () => {
+        const page = createDomEvaluatePage(`
+            <form id="sidebar"><button type="button" aria-label="Send">Other form</button></form>
+            <form id="composer">
+              <div id="prompt-textarea" contenteditable="true" role="textbox"></div>
+              <button type="button" data-testid="send-button" disabled>Send</button>
+            </form>
+        `);
+        const sidebarClick = vi.fn();
+        page.dom.window.document.querySelector('#sidebar button').addEventListener('click', sidebarClick);
+        page.nativeType = vi.fn(async (text) => {
+            page.dom.window.document.querySelector('#prompt-textarea').textContent = text;
+        });
+
+        await expect(sendChatGPTMessage(page, 'Sensitive follow-up')).resolves.toBe(false);
+        expect(sidebarClick).not.toHaveBeenCalled();
+        const state = await getChatGPTSendFailureState(page);
+        expect(state).toEqual({
+            composer: true,
+            draftPresent: true,
+            composerForm: true,
+            buttonPresent: true,
+            buttonDisabled: true,
+        });
+        expect(JSON.stringify(state)).not.toContain('Sensitive follow-up');
+    });
+
+    // A re-render between readiness and click must not be reported as a
+    // successful submission, and must never trigger a second blind click.
+    it('reports failure if the composer button disappears before click', async () => {
+        const page = createDomEvaluatePage(`
+            <form>
+              <div id="prompt-textarea" contenteditable="true" role="textbox"></div>
+              <button type="button" data-testid="send-button">Send</button>
+            </form>
+        `);
+        page.nativeType = vi.fn(async (text) => {
+            page.dom.window.document.querySelector('#prompt-textarea').textContent = text;
+        });
+        const evaluate = page.evaluate;
+        page.evaluate = vi.fn(async (script) => {
+            const result = await evaluate(script);
+            if (script.includes('sendBtnFound') && result.sendBtnFound) {
+                page.dom.window.document.querySelector('[data-testid="send-button"]').remove();
+            }
+            return result;
+        });
+
+        await expect(sendChatGPTMessage(page, 'Follow-up')).resolves.toBe(false);
+        expect(page.evaluate.mock.calls.filter(([script]) => script.includes('sendBtn.click()'))).toHaveLength(1);
+    });
+
+    // Some layouts do not wrap the composer in a form; retain the existing
+    // body-level fallback only when a visible composer was found.
+    it('submits a form-less composer without choosing an unrelated form', async () => {
+        const page = createDomEvaluatePage(`
+            <form id="sidebar"><button type="button" aria-label="Send">Other form</button></form>
+            <div id="prompt-textarea" contenteditable="true" role="textbox"></div>
+            <button type="button" data-testid="send-button">Send</button>
+        `);
+        page.nativeType = vi.fn(async (text) => {
+            page.dom.window.document.querySelector('#prompt-textarea').textContent = text;
+        });
+        const sendClick = vi.fn();
+        const sidebarClick = vi.fn();
+        page.dom.window.document.querySelector('[data-testid="send-button"]').addEventListener('click', sendClick);
+        page.dom.window.document.querySelector('#sidebar button').addEventListener('click', sidebarClick);
+
+        await expect(sendChatGPTMessage(page, 'Follow-up')).resolves.toBe(true);
+        expect(sendClick).toHaveBeenCalledTimes(1);
+        expect(sidebarClick).not.toHaveBeenCalled();
+    });
+
     it('inlines the composer locator without returning before caller code runs', () => {
         const dom = new JSDOM('<!doctype html><div id="prompt-textarea" contenteditable="true"></div>', {
             url: 'https://chatgpt.com/',
@@ -1390,14 +1490,15 @@ describe('chatgpt send selectors', () => {
             nativeClick: vi.fn().mockResolvedValue(undefined),
             nativeType: vi.fn().mockResolvedValue(undefined),
             evaluate: vi.fn((script) => {
-                if (script.includes('findComposer')) return Promise.resolve({ ready: true, x: 12, y: 34 });
                 if (script.includes('sendBtnFound')) {
                     expect(script).toContain('data-testid=\\\"send-button\\\"');
                     return Promise.resolve({ sendBtnFound: true });
                 }
-                if (script.includes('if (sendBtn) sendBtn.click')) {
+                if (script.includes('sendBtn.click()')) {
                     expect(script).toContain('data-testid=\\\"send-button\\\"');
+                    return Promise.resolve({ clicked: true });
                 }
+                if (script.includes('findComposer')) return Promise.resolve({ ready: true, x: 12, y: 34 });
                 return Promise.resolve(undefined);
             }),
         };
@@ -1414,14 +1515,15 @@ describe('chatgpt send selectors', () => {
             wait: vi.fn().mockResolvedValue(undefined),
             nativeType: vi.fn().mockResolvedValue(undefined),
             evaluate: vi.fn((script) => {
-                if (script.includes('findComposer')) return Promise.resolve({ ready: true, x: 12, y: 34 });
                 if (script.includes('sendBtnFound')) {
                     expect(script).toContain('#composer-submit-button:not([disabled])');
                     return Promise.resolve({ sendBtnFound: true });
                 }
-                if (script.includes('if (sendBtn) sendBtn.click')) {
+                if (script.includes('sendBtn.click()')) {
                     expect(script).toContain('#composer-submit-button:not([disabled])');
+                    return Promise.resolve({ clicked: true });
                 }
+                if (script.includes('findComposer')) return Promise.resolve({ ready: true, x: 12, y: 34 });
                 return Promise.resolve(undefined);
             }),
         };
