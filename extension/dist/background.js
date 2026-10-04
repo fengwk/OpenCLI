@@ -1,3 +1,4 @@
+const EXTENSION_CAPABILITIES = ["adapter-tab-reclaim-v1"];
 const DAEMON_PORT = 19825;
 const DAEMON_HOST = "localhost";
 const DAEMON_WS_URL = `ws://${DAEMON_HOST}:${DAEMON_PORT}/ext`;
@@ -1508,7 +1509,8 @@ async function connectAttempt() {
       type: "hello",
       contextId: currentContextId,
       version: chrome.runtime.getManifest().version,
-      compatRange: ">=1.8.7"
+      compatRange: ">=1.8.7",
+      capabilities: [...EXTENSION_CAPABILITIES]
     });
     startWsKeepalive(thisWs);
   };
@@ -1573,9 +1575,6 @@ const automationSessions = /* @__PURE__ */ new Map();
 const IDLE_TIMEOUT_DEFAULT = 3e4;
 const IDLE_TIMEOUT_INTERACTIVE = 6e5;
 const IDLE_TIMEOUT_NONE = -1;
-const WARM_TAB_TTL_DEFAULT_SECONDS = 1800;
-const MIN_WARM_TAB_TTL_SECONDS = -1;
-const MAX_WARM_TAB_TTL_SECONDS = 2147483647;
 const REGISTRY_KEY = "opencli_target_lease_registry_v2";
 const LEASE_IDLE_ALARM_PREFIX = "opencli:lease-idle:";
 const WARM_TAB_ALARM_PREFIX = "opencli:warm-tab:";
@@ -1592,6 +1591,8 @@ const ownedContainers = {
   automation: { windowId: null, groupId: null, promise: null, groupPromise: null }
 };
 const interactiveGroupLedger = /* @__PURE__ */ new Set();
+const adapterTabLedger = /* @__PURE__ */ new Set();
+let adapterReclaimInFlight = false;
 class CommandFailure extends Error {
   constructor(code, message, hint) {
     super(message);
@@ -1603,12 +1604,6 @@ class CommandFailure extends Error {
 const sessionOverrides = /* @__PURE__ */ new Map();
 function setSessionOverride(key, patch) {
   sessionOverrides.set(key, { ...sessionOverrides.get(key), ...patch });
-}
-function getWarmTabTtlSeconds(key) {
-  return sessionOverrides.get(key)?.warmTabTtlSeconds ?? WARM_TAB_TTL_DEFAULT_SECONDS;
-}
-function isValidWarmTabTtlSeconds(value) {
-  return typeof value === "number" && Number.isInteger(value) && value >= MIN_WARM_TAB_TTL_SECONDS && value <= MAX_WARM_TAB_TTL_SECONDS;
 }
 const activeCommandCounts = /* @__PURE__ */ new Map();
 const LEASE_KEY_SEPARATOR = "\0";
@@ -1674,9 +1669,6 @@ function leaseKeyFromAlarmName(name) {
     return null;
   }
 }
-function makeWarmTabAlarmName(tabId) {
-  return `${WARM_TAB_ALARM_PREFIX}${tabId}`;
-}
 function tabIdFromWarmTabAlarmName(name) {
   if (!name.startsWith(WARM_TAB_ALARM_PREFIX)) return null;
   const raw = name.slice(WARM_TAB_ALARM_PREFIX.length);
@@ -1684,19 +1676,22 @@ function tabIdFromWarmTabAlarmName(name) {
   const parsed = Number(raw);
   return Number.isSafeInteger(parsed) ? parsed : null;
 }
-function scheduleWarmTabAlarm(tabId, seconds) {
-  const alarmName = makeWarmTabAlarmName(tabId);
-  try {
-    chrome.alarms?.create?.(alarmName, { when: Date.now() + seconds * 1e3 });
-  } catch {
+function registerAdapterTab(leaseKey, tabId) {
+  if (getSurfaceFromKey(leaseKey) !== "adapter") return;
+  if (!adapterTabLedger.has(tabId)) {
+    adapterTabLedger.add(tabId);
+    void persistRuntimeState();
   }
 }
-function clearWarmTabAlarm(tabId) {
-  const alarmName = makeWarmTabAlarmName(tabId);
-  try {
-    chrome.alarms?.clear?.(alarmName);
-  } catch {
+function revokeAdapterTabOwnership(tabId) {
+  let changed = adapterTabLedger.delete(tabId);
+  for (const session of automationSessions.values()) {
+    if (session.preferredTabId === tabId && session.preferredTabOwned) {
+      session.preferredTabOwned = false;
+      changed = true;
+    }
   }
+  if (changed) void persistRuntimeState();
 }
 function withLeaseMutation(fn) {
   const run = leaseMutationQueue.then(fn, fn);
@@ -1710,7 +1705,9 @@ function makeSession(key, session) {
     contextId: currentContextId,
     ownership,
     lifecycle: getLeaseLifecycle(key, session.kind),
-    windowRole: getWindowRole(key, ownership)
+    windowRole: getWindowRole(key, ownership),
+    // Default: an owned adapter lease owns its tab; everything else does not.
+    preferredTabOwned: session.preferredTabOwned ?? (session.owned && getSurfaceFromKey(key) === "adapter")
   };
 }
 function emptyRegistry() {
@@ -1724,7 +1721,8 @@ function emptyRegistry() {
       },
       automation: { windowId: ownedContainers.automation.windowId }
     },
-    leases: {}
+    leases: {},
+    adapterTabIds: [...adapterTabLedger]
   };
 }
 async function readRegistry() {
@@ -1747,7 +1745,8 @@ async function readRegistry() {
           windowId: typeof storedContainers.automation?.windowId === "number" ? storedContainers.automation.windowId : null
         }
       },
-      leases: stored.leases
+      leases: stored.leases,
+      adapterTabIds: Array.isArray(stored.adapterTabIds) ? stored.adapterTabIds.filter((id) => typeof id === "number") : []
     };
   } catch {
     return emptyRegistry();
@@ -1775,7 +1774,7 @@ async function persistRuntimeState() {
       windowRole: session.windowRole,
       idleDeadlineAt: session.idleDeadlineAt,
       updatedAt: Date.now(),
-      warmTabTtlSeconds: getWarmTabTtlSeconds(leaseKey)
+      preferredTabOwned: session.preferredTabOwned
     };
   }
   await writeRegistry({
@@ -1788,7 +1787,8 @@ async function persistRuntimeState() {
       },
       automation: { windowId: ownedContainers.automation.windowId }
     },
-    leases
+    leases,
+    adapterTabIds: [...adapterTabLedger]
   });
 }
 function scheduleIdleAlarm(leaseKey, timeout) {
@@ -2200,7 +2200,7 @@ async function findReusableOwnedContainerTab(windowId, ownedGroupId, targetUrl) 
     const tabs = await chrome.tabs.query({ windowId });
     const dedicatedAdapterWindow = ownedContainers.automation.windowId === windowId;
     const reusable = tabs.filter(
-      (tab) => tab.id !== void 0 && initialTabIsAvailable(tab.id) && isDebuggableUrl(tab.url) && (dedicatedAdapterWindow || ownedGroupId === void 0 || ownedGroupId !== null && tab.groupId === ownedGroupId || !isSafeNavigationUrl(tab.url ?? ""))
+      (tab) => tab.id !== void 0 && initialTabIsAvailable(tab.id) && isDebuggableUrl(tab.url) && (dedicatedAdapterWindow ? adapterTabLedger.has(tab.id) || isStartupPlaceholderUrl(tab.url) : ownedGroupId === void 0 || ownedGroupId !== null && tab.groupId === ownedGroupId || !isSafeNavigationUrl(tab.url ?? ""))
     );
     const exactTarget = targetUrl ? reusable.find((tab) => isTargetUrl(tab.url, targetUrl)) : void 0;
     return (exactTarget ?? reusable[0])?.id;
@@ -2211,7 +2211,7 @@ async function findReusableOwnedContainerTab(windowId, ownedGroupId, targetUrl) 
 function initialTabIsAvailable(tabId) {
   if (tabId === void 0) return false;
   for (const session of automationSessions.values()) {
-    if (session.owned && session.preferredTabId === tabId) return false;
+    if (session.preferredTabId === tabId) return false;
   }
   return true;
 }
@@ -2235,6 +2235,7 @@ async function createOwnedTabLeaseUnlocked(leaseKey, initialUrl) {
   }
   const tabId = tab.id;
   if (!tabId) throw new Error("Failed to create tab lease in automation container");
+  registerAdapterTab(leaseKey, tabId);
   const group = await ensureOwnedContainerGroup(role, windowId, [tabId]);
   const sessionWindowId = group?.windowId ?? tab.windowId;
   if (tab.windowId !== sessionWindowId) tab = await chrome.tabs.get(tabId);
@@ -2244,7 +2245,8 @@ async function createOwnedTabLeaseUnlocked(leaseKey, initialUrl) {
     kind: "owned",
     windowId: sessionWindowId,
     owned: true,
-    preferredTabId: tabId
+    preferredTabId: tabId,
+    preferredTabOwned: true
   });
   resetWindowIdleTimer(leaseKey);
   return { tabId, tab };
@@ -2295,7 +2297,7 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
 });
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   await workerReady;
-  clearWarmTabAlarm(tabId);
+  adapterTabLedger.delete(tabId);
   evictTab(tabId);
   for (const [leaseKey, session] of automationSessions.entries()) {
     if (session.preferredTabId === tabId) {
@@ -2349,11 +2351,6 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     void connect();
     return;
   }
-  const warmTabId = tabIdFromWarmTabAlarmName(alarm.name);
-  if (warmTabId !== null) {
-    await expireWarmTab(warmTabId);
-    return;
-  }
   const leaseKey = leaseKeyFromAlarmName(alarm.name);
   if (!leaseKey) return;
   if ((activeCommandCounts.get(leaseKey) ?? 0) > 0) {
@@ -2396,22 +2393,21 @@ async function fetchDaemonVersion() {
   }
 }
 async function handleCommand(cmd) {
-  if (cmd.warmTabTtl !== void 0) {
-    if (!isValidWarmTabTtlSeconds(cmd.warmTabTtl)) {
-      return {
-        id: cmd.id,
-        ok: false,
-        errorCode: "invalid_warm_tab_ttl",
-        error: `warmTabTtl must be an integer between ${MIN_WARM_TAB_TTL_SECONDS} and ${MAX_WARM_TAB_TTL_SECONDS}. Received: ${String(cmd.warmTabTtl)}`
-      };
-    }
+  if (cmd.action === "reclaim-adapter-tabs") {
+    return handleReclaimAdapterTabs(cmd);
   }
   const session = getSessionName(cmd.session);
   const surface = getCommandSurface(cmd);
-  const leaseKey = getLeaseKey(session, surface);
-  if (cmd.warmTabTtl !== void 0) {
-    setSessionOverride(leaseKey, { warmTabTtlSeconds: cmd.warmTabTtl });
+  if (surface === "adapter" && adapterReclaimInFlight) {
+    return {
+      id: cmd.id,
+      ok: false,
+      errorCode: "adapter_tabs_busy",
+      error: "Adapter tab reclamation is in progress; adapter commands are temporarily rejected.",
+      errorHint: "Retry once the reclaim-adapter-tabs command completes."
+    };
   }
+  const leaseKey = getLeaseKey(session, surface);
   if (cmd.windowMode === "foreground" || cmd.windowMode === "background") {
     setSessionOverride(leaseKey, { windowMode: cmd.windowMode });
   }
@@ -2544,8 +2540,9 @@ function enumerateCrossOriginFrames(tree) {
 function setLeaseSession(leaseKey, session) {
   const existing = automationSessions.get(leaseKey);
   if (existing?.idleTimer) clearTimeout(existing.idleTimer);
-  if (session.preferredTabId !== null) {
-    clearWarmTabAlarm(session.preferredTabId);
+  const isOwnedAdapterLease = session.owned && session.surface === "adapter";
+  if (session.preferredTabId !== null && !isOwnedAdapterLease) {
+    revokeAdapterTabOwnership(session.preferredTabId);
   }
   const timeout = getIdleTimeout(leaseKey);
   automationSessions.set(leaseKey, {
@@ -2638,7 +2635,10 @@ async function resolveTab(tabId, leaseKey, initialUrl) {
     scopedWindowId,
     existingSession?.owned ? group?.id ?? null : void 0
   );
-  if (reusableTabId !== void 0) return { tabId: reusableTabId, tab: await chrome.tabs.get(reusableTabId) };
+  if (reusableTabId !== void 0) {
+    registerAdapterTab(leaseKey, reusableTabId);
+    return { tabId: reusableTabId, tab: await chrome.tabs.get(reusableTabId) };
+  }
   const tabs = await chrome.tabs.query({ windowId: scopedWindowId });
   const reuseTab = existingSession?.owned ? void 0 : tabs.find((t) => t.id);
   if (reuseTab?.id) {
@@ -2653,6 +2653,7 @@ async function resolveTab(tabId, leaseKey, initialUrl) {
   }
   const newTab = await chrome.tabs.create({ windowId: scopedWindowId, url: BLANK_PAGE, active: true });
   if (!newTab.id) throw new Error("Failed to create tab in automation container");
+  registerAdapterTab(leaseKey, newTab.id);
   await ensureOwnedContainerGroup(role, scopedWindowId, [newTab.id]);
   return { tabId: newTab.id, tab: await chrome.tabs.get(newTab.id) };
 }
@@ -2751,7 +2752,12 @@ function preferOwnedTab(leaseKey, tabId) {
     kind: session.kind,
     windowId: session.windowId,
     owned: true,
-    preferredTabId: tabId
+    preferredTabId: tabId,
+    // `tabs select` may target a user-opened tab living in the automation
+    // window. Ownership follows the physical-creation ledger only: a tab we
+    // created stays ours (and protected from user reuse), an unknown tab is
+    // recorded as non-owned so recovery can never adopt it for reclamation.
+    preferredTabOwned: adapterTabLedger.has(tabId)
   });
 }
 async function handleNavigate(cmd, leaseKey) {
@@ -2859,6 +2865,7 @@ async function handleTabs(cmd, leaseKey) {
       let tab = await chrome.tabs.create({ windowId, url: cmd.url ?? BLANK_PAGE, active: true });
       const tabId = tab.id;
       if (!tabId) return { id: cmd.id, ok: false, error: "Failed to create tab" };
+      registerAdapterTab(leaseKey, tabId);
       const group = await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), windowId, [tabId]);
       const sessionWindowId = group?.windowId ?? tab.windowId;
       if (tab.windowId !== sessionWindowId) tab = await chrome.tabs.get(tabId);
@@ -2868,7 +2875,8 @@ async function handleTabs(cmd, leaseKey) {
         kind: "owned",
         windowId: sessionWindowId,
         owned: true,
-        preferredTabId: tabId
+        preferredTabId: tabId,
+        preferredTabOwned: true
       });
       resetWindowIdleTimer(leaseKey);
       return pageScopedResult(cmd.id, tabId, { url: tab.url });
@@ -3178,44 +3186,6 @@ async function handleWaitDownload(cmd, leaseKey) {
 async function releaseLease(leaseKey, reason = "released") {
   return withLeaseMutation(() => releaseLeaseUnlocked(leaseKey, reason));
 }
-async function expireWarmTab(tabId) {
-  return withLeaseMutation(() => expireWarmTabUnlocked(tabId));
-}
-async function expireWarmTabUnlocked(tabId) {
-  clearWarmTabAlarm(tabId);
-  let tab;
-  try {
-    tab = await chrome.tabs.get(tabId);
-  } catch {
-    return;
-  }
-  if (!initialTabIsAvailable(tabId)) {
-    return;
-  }
-  const automationWindowId = ownedContainers.automation.windowId;
-  if (automationWindowId === null || tab.windowId !== automationWindowId) {
-    return;
-  }
-  try {
-    const tabs = await chrome.tabs.query({ windowId: automationWindowId });
-    if (!tabs.some((candidate) => candidate.id === tabId)) {
-      return;
-    }
-    if (tabs.length > 1) {
-      await safeDetach(tabId);
-      evictTab(tabId);
-      await chrome.tabs.remove(tabId).catch(() => {
-      });
-      console.log(`[opencli] Warm tab ${tabId} expired and closed (${tabs.length - 1} remaining in automation window)`);
-    } else if (tabs.length === 1) {
-      if (tab.url !== BLANK_PAGE) {
-        await chrome.tabs.update(tabId, { url: BLANK_PAGE });
-      }
-      console.log(`[opencli] Warm tab ${tabId} expired and reset to ${BLANK_PAGE} (last tab in automation window)`);
-    }
-  } catch {
-  }
-}
 async function releaseLeaseUnlocked(leaseKey, reason) {
   const session = automationSessions.get(leaseKey);
   if (!session) {
@@ -3226,23 +3196,15 @@ async function releaseLeaseUnlocked(leaseKey, reason) {
   }
   if (session.idleTimer) clearTimeout(session.idleTimer);
   scheduleIdleAlarm(leaseKey, IDLE_TIMEOUT_NONE);
-  let warmTabExpiryToRun = null;
   if (session.owned) {
     const tabId = session.preferredTabId;
     if (tabId !== null) {
       await safeDetach(tabId);
       evictTab(tabId);
-      if (session.surface === "adapter" && session.lifecycle === "ephemeral") {
-        const warmTtl = getWarmTabTtlSeconds(leaseKey);
-        console.log(`[opencli] Released ephemeral adapter tab lease ${tabId} as a warm reusable tab (session=${session.session}, ttl=${warmTtl}s, ${reason})`);
-        if (warmTtl === -1) {
-          clearWarmTabAlarm(tabId);
-        } else if (warmTtl === 0) {
-          clearWarmTabAlarm(tabId);
-          warmTabExpiryToRun = tabId;
-        } else if (warmTtl > 0) {
-          scheduleWarmTabAlarm(tabId, warmTtl);
-        }
+      const idleRelease = reason === "idle timeout" || reason === "idle alarm" || reason === "reconciled idle expiry";
+      const keepTabForReuse = session.surface === "adapter" && (idleRelease || session.lifecycle === "ephemeral");
+      if (keepTabForReuse) {
+        console.log(`[opencli] Released adapter tab lease ${tabId} for reuse (session=${session.session}, ${reason})`);
       } else {
         const hasOtherOwnedLease = [...automationSessions.entries()].some(
           ([otherLease, otherSession]) => otherLease !== leaseKey && otherSession.owned && otherSession.windowId === session.windowId && otherSession.preferredTabId !== null
@@ -3274,12 +3236,202 @@ async function releaseLeaseUnlocked(leaseKey, reason) {
   automationSessions.delete(leaseKey);
   sessionOverrides.delete(leaseKey);
   await persistRuntimeState();
-  if (warmTabExpiryToRun !== null) {
-    await expireWarmTabUnlocked(warmTabExpiryToRun);
+}
+function activeAdapterCommandCount() {
+  let count = 0;
+  for (const key of activeCommandCounts.keys()) {
+    if (getSurfaceFromKey(key) === "adapter") count += 1;
+  }
+  return count;
+}
+function isTabLeasedOutsideAdapterOwnership(tabId) {
+  for (const session of automationSessions.values()) {
+    if (session.preferredTabId !== tabId) continue;
+    if (!(session.owned && session.surface === "adapter")) return true;
+  }
+  return false;
+}
+function isMissingTabError(err) {
+  const message = err instanceof Error ? err.message : String(err);
+  return /No tab with id/i.test(message) || /Invalid tab ID/i.test(message);
+}
+function releaseAdapterLeasesForTab(tabId) {
+  for (const [leaseKey, session] of [...automationSessions.entries()]) {
+    if (!session.owned || session.surface !== "adapter" || session.preferredTabId !== tabId) continue;
+    if (session.idleTimer) clearTimeout(session.idleTimer);
+    automationSessions.delete(leaseKey);
+    sessionOverrides.delete(leaseKey);
+    scheduleIdleAlarm(leaseKey, IDLE_TIMEOUT_NONE);
+  }
+}
+function resolveReclaimDeadline(cmd) {
+  const value = cmd.deadlineAt;
+  if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value)) {
+    throw new CommandFailure(
+      "reclaim_failed",
+      "reclaim-adapter-tabs requires a finite integer absolute deadlineAt (epoch ms).",
+      "Retry through the daemon, which stamps a bounded 5s deadline."
+    );
+  }
+  return value;
+}
+function reclaimDeadlineExceeded(id, closedTabs, resetTabs) {
+  return {
+    id,
+    ok: false,
+    errorCode: "reclaim_deadline_exceeded",
+    error: `Adapter tab reclamation exceeded its deadline after closing ${closedTabs} and resetting ${resetTabs} tab(s); remaining tabs were left for a retry.`,
+    errorHint: "Retry reclaim-adapter-tabs with a fresh deadline."
+  };
+}
+async function inspectLedgerTab(tabId, automationWindowId) {
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch (err) {
+    if (isMissingTabError(err)) return "gone";
+    await persistRuntimeState();
+    throw new CommandFailure(
+      "reclaim_failed",
+      `Failed to inspect adapter tab ${tabId}: ${err instanceof Error ? err.message : String(err)}`,
+      "Retry reclaim-adapter-tabs."
+    );
+  }
+  if (isTabLeasedOutsideAdapterOwnership(tabId)) return "skip";
+  if (tab.windowId !== automationWindowId) return "skip";
+  if (!isDebuggableUrl(tab.url)) return "skip";
+  return tab;
+}
+async function handleReclaimAdapterTabs(cmd) {
+  if (adapterReclaimInFlight) {
+    return {
+      id: cmd.id,
+      ok: false,
+      errorCode: "adapter_tabs_busy",
+      error: "Another adapter tab reclamation is already running.",
+      errorHint: "Wait for it to finish before retrying."
+    };
+  }
+  adapterReclaimInFlight = true;
+  try {
+    await workerReady;
+    return await withLeaseMutation(() => reclaimAdapterTabsUnlocked(cmd));
+  } catch (err) {
+    return errorResult(cmd.id, err);
+  } finally {
+    adapterReclaimInFlight = false;
+  }
+}
+async function reclaimAdapterTabsUnlocked(cmd) {
+  if (activeAdapterCommandCount() > 0) {
+    throw new CommandFailure(
+      "adapter_tabs_busy",
+      "An adapter command is currently running; retry the reclaim after it finishes."
+    );
+  }
+  const deadlineAt = resolveReclaimDeadline(cmd);
+  const automationWindowId = ownedContainers.automation.windowId;
+  let closedTabs = 0;
+  let resetTabs = 0;
+  if (automationWindowId === null) {
+    await persistRuntimeState();
+    return { id: cmd.id, ok: true, data: { closedTabs, resetTabs } };
+  }
+  for (const tabId of [...adapterTabLedger]) {
+    if (Date.now() >= deadlineAt) {
+      await persistRuntimeState();
+      return reclaimDeadlineExceeded(cmd.id, closedTabs, resetTabs);
+    }
+    const inspected = await inspectLedgerTab(tabId, automationWindowId);
+    if (inspected === "gone" || inspected === "skip") {
+      adapterTabLedger.delete(tabId);
+      releaseAdapterLeasesForTab(tabId);
+      continue;
+    }
+    await safeDetach(tabId);
+    evictTab(tabId);
+    if (Date.now() >= deadlineAt) {
+      await persistRuntimeState();
+      return reclaimDeadlineExceeded(cmd.id, closedTabs, resetTabs);
+    }
+    const recheck = await inspectLedgerTab(tabId, automationWindowId);
+    if (recheck === "gone" || recheck === "skip") {
+      adapterTabLedger.delete(tabId);
+      releaseAdapterLeasesForTab(tabId);
+      continue;
+    }
+    let windowTabs;
+    try {
+      windowTabs = await chrome.tabs.query({ windowId: automationWindowId });
+    } catch (err) {
+      await persistRuntimeState();
+      throw new CommandFailure(
+        "reclaim_failed",
+        `Failed to inspect adapter window ${automationWindowId}: ${err instanceof Error ? err.message : String(err)}`,
+        "Retry reclaim-adapter-tabs."
+      );
+    }
+    if (!windowTabs.some((tab) => tab.id === tabId)) {
+      adapterTabLedger.delete(tabId);
+      releaseAdapterLeasesForTab(tabId);
+      continue;
+    }
+    if (Date.now() >= deadlineAt) {
+      await persistRuntimeState();
+      return reclaimDeadlineExceeded(cmd.id, closedTabs, resetTabs);
+    }
+    try {
+      const hasOtherOwnedTab = windowTabs.some(
+        (tab) => tab.id !== void 0 && tab.id !== tabId && adapterTabLedger.has(tab.id) && !isTabLeasedOutsideAdapterOwnership(tab.id) && isDebuggableUrl(tab.url)
+      );
+      if (hasOtherOwnedTab) {
+        await chrome.tabs.remove(tabId);
+        closedTabs++;
+      } else {
+        if (windowTabs.find((tab) => tab.id === tabId)?.url !== BLANK_PAGE) {
+          await chrome.tabs.update(tabId, { url: BLANK_PAGE });
+        }
+        resetTabs++;
+      }
+    } catch (err) {
+      await persistRuntimeState();
+      throw new CommandFailure(
+        "reclaim_failed",
+        `Failed to close adapter tab ${tabId}: ${err instanceof Error ? err.message : String(err)}`,
+        "Retry reclaim-adapter-tabs."
+      );
+    }
+    adapterTabLedger.delete(tabId);
+    releaseAdapterLeasesForTab(tabId);
+  }
+  await persistRuntimeState();
+  return { id: cmd.id, ok: true, data: { closedTabs, resetTabs } };
+}
+async function adoptLegacyWarmTabAlarms() {
+  if (typeof chrome.alarms?.getAll !== "function") return;
+  let existing;
+  try {
+    existing = await chrome.alarms.getAll();
+  } catch {
+    return;
+  }
+  for (const alarm of existing) {
+    if (!alarm.name.startsWith(WARM_TAB_ALARM_PREFIX)) continue;
+    const tabId = tabIdFromWarmTabAlarmName(alarm.name);
+    if (tabId !== null) adapterTabLedger.add(tabId);
+    if (typeof chrome.alarms?.clear === "function") {
+      try {
+        await chrome.alarms.clear(alarm.name);
+      } catch {
+      }
+    }
   }
 }
 async function reconcileTargetLeaseRegistry() {
   const registry = await readRegistry();
+  adapterTabLedger.clear();
+  for (const id of registry.adapterTabIds ?? []) adapterTabLedger.add(id);
+  await adoptLegacyWarmTabAlarms();
   interactiveGroupLedger.clear();
   for (const id of registry.ownedContainers.interactive.groupIds) interactiveGroupLedger.add(id);
   for (const role of Object.keys(ownedContainers)) {
@@ -3293,6 +3445,12 @@ async function reconcileTargetLeaseRegistry() {
       }
     }
   }
+  const externallyLeasedTabIds = /* @__PURE__ */ new Set();
+  for (const [leaseKey, stored] of Object.entries(registry.leases)) {
+    if (stored.preferredTabId === null) continue;
+    const storedSurface = stored.surface === "adapter" ? "adapter" : getSurfaceFromKey(leaseKey);
+    if (!(stored.owned && storedSurface === "adapter")) externallyLeasedTabIds.add(stored.preferredTabId);
+  }
   automationSessions.clear();
   for (const [leaseKey, stored] of Object.entries(registry.leases)) {
     const tabId = stored.preferredTabId;
@@ -3303,16 +3461,14 @@ async function reconcileTargetLeaseRegistry() {
       if (stored.lifecycle === "ephemeral" || stored.lifecycle === "persistent" || stored.lifecycle === "pinned") {
         setSessionOverride(leaseKey, { lifecycle: stored.lifecycle });
       }
-      if (isValidWarmTabTtlSeconds(stored.warmTabTtlSeconds)) {
-        setSessionOverride(leaseKey, { warmTabTtlSeconds: stored.warmTabTtlSeconds });
-      }
       const session = makeSession(leaseKey, {
         session: typeof stored.session === "string" ? stored.session : getSessionFromKey(leaseKey),
         surface: stored.surface === "adapter" ? "adapter" : getSurfaceFromKey(leaseKey),
         kind: stored.kind === "bound" || stored.owned === false ? "bound" : "owned",
         windowId: tab.windowId,
         owned: stored.owned,
-        preferredTabId: tabId
+        preferredTabId: tabId,
+        preferredTabOwned: stored.preferredTabOwned
       });
       const timeout = getIdleTimeout(leaseKey);
       automationSessions.set(leaseKey, {
@@ -3322,7 +3478,14 @@ async function reconcileTargetLeaseRegistry() {
       });
       if (session.owned) {
         const role = getOwnedWindowRole(leaseKey);
-        if (ownedContainers[role].windowId === null) ownedContainers[role].windowId = tab.windowId;
+        if (session.surface === "adapter") {
+          const adapterWindowId = ownedContainers.automation.windowId;
+          if (session.preferredTabOwned && !externallyLeasedTabIds.has(tabId) && adapterWindowId !== null && tab.windowId === adapterWindowId) {
+            adapterTabLedger.add(tabId);
+          }
+        } else if (ownedContainers[role].windowId === null) {
+          ownedContainers[role].windowId = tab.windowId;
+        }
         const group = await ensureOwnedContainerGroup(role, tab.windowId, [tabId]);
         if (group) {
           const current = automationSessions.get(leaseKey);

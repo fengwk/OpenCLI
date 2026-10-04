@@ -8,7 +8,7 @@
 declare const __OPENCLI_COMPAT_RANGE__: string;
 
 import type { Command, Result } from './protocol';
-import { DAEMON_HOST, DAEMON_PORT, DAEMON_WS_URL, DAEMON_PING_URL } from './protocol';
+import { DAEMON_HOST, DAEMON_PORT, DAEMON_WS_URL, DAEMON_PING_URL, EXTENSION_CAPABILITIES } from './protocol';
 import * as executor from './cdp';
 import * as identity from './identity';
 import { executeWithJournal } from './journal';
@@ -187,6 +187,7 @@ async function connectAttempt(): Promise<void> {
       contextId: currentContextId,
       version: chrome.runtime.getManifest().version,
       compatRange: __OPENCLI_COMPAT_RANGE__,
+      capabilities: [...EXTENSION_CAPABILITIES],
     });
     // Application-level keepalive. Chrome (116+) extends the service worker's
     // lifetime on WebSocket ACTIVITY — an idle OPEN socket does not count, so
@@ -298,6 +299,14 @@ type TargetLease = {
   idleDeadlineAt: number;
   owned: boolean;
   preferredTabId: number | null;
+  /**
+   * Whether `preferredTabId` is a tab this extension physically created (and
+   * therefore a legitimate adapter-reclaim target). `tabs select` can move a
+   * lease onto a user-opened tab inside the automation window; such a tab is
+   * marked non-owned so service-worker recovery never adopts it into the
+   * ownership ledger.
+   */
+  preferredTabOwned: boolean;
   contextId: BrowserContextId;
   ownership: LeaseOwnership;
   lifecycle: LeaseLifecycle;
@@ -308,11 +317,13 @@ const automationSessions = new Map<string, TargetLease>();
 const IDLE_TIMEOUT_DEFAULT = 30_000;      // 30s — adapter-driven automation
 const IDLE_TIMEOUT_INTERACTIVE = 600_000; // 10min — human-paced browser:* / operate:*
 const IDLE_TIMEOUT_NONE = -1;             // borrowed bound tabs stay bound until unbound/closed
-const WARM_TAB_TTL_DEFAULT_SECONDS = 1800; // 30min — default warm tab reclamation TTL
-const MIN_WARM_TAB_TTL_SECONDS = -1;
-const MAX_WARM_TAB_TTL_SECONDS = 2147483647;
 const REGISTRY_KEY = 'opencli_target_lease_registry_v2';
 const LEASE_IDLE_ALARM_PREFIX = 'opencli:lease-idle:';
+/**
+ * Prefix of the removed per-tab warm-tab TTL policy's one-shot alarms. Retained
+ * ONLY so the startup migration can adopt their tab ids into the adapter
+ * ownership ledger and clear them; no warm/alarm scheduling logic remains.
+ */
 const WARM_TAB_ALARM_PREFIX = 'opencli:warm-tab:';
 const CONTAINER_TAB_GROUP_TITLE: Record<OwnedWindowRole, string> = {
   interactive: 'OpenCLI Browser',
@@ -341,11 +352,27 @@ const ownedContainers: Record<OwnedWindowRole, {
 // StoredRegistry) and restored by reconcileTargetLeaseRegistry().
 const interactiveGroupLedger = new Set<number>();
 
-type StoredLease = Omit<TargetLease, 'idleTimer' | 'idleDeadlineAt'> & {
+// Ownership ledger of every adapter tab this extension has created and not yet
+// confirmed closed, keyed by physical Chrome tab id. It exists so the explicit
+// `reclaim-adapter-tabs` action can close leftover released/orphaned adapter
+// tabs (ephemeral warm leftovers, active persistent leases, tabs replaced by
+// `tabs new`) even after a service-worker restart. It records ids only — no
+// per-tab TTL or lifecycle protocol. Browser-surface and borrowed tabs are
+// never registered. Persisted with the session registry (see StoredRegistry).
+const adapterTabLedger = new Set<number>();
+/** True while a reclaim-adapter-tabs command owns the adapter mutation queue. */
+let adapterReclaimInFlight = false;
+
+type StoredLease = Omit<TargetLease, 'idleTimer' | 'idleDeadlineAt' | 'preferredTabOwned'> & {
   idleDeadlineAt: number;
   updatedAt: number;
-  // Active-lease policy only. Released warm tabs remain represented solely by alarms.
-  warmTabTtlSeconds?: number;
+  /**
+   * Absent in registries written before this field existed. An owned adapter
+   * lease with no flag is treated as owning its preferred tab (legacy
+   * verified-lease restoration), but an explicit `false` always wins so a
+   * user-selected tab is never adopted.
+   */
+  preferredTabOwned?: boolean;
 };
 
 // The registry lives in chrome.storage.session, never chrome.storage.local:
@@ -368,6 +395,8 @@ type StoredRegistry = {
     automation: { windowId: number | null };
   };
   leases: Record<string, StoredLease>;
+  /** Adapter ownership ledger (see `adapterTabLedger`). */
+  adapterTabIds?: number[];
 };
 
 class CommandFailure extends Error {
@@ -379,30 +408,18 @@ class CommandFailure extends Error {
 
 /**
  * Per-session overrides set via command fields (idleTimeout / windowMode /
- * siteSession / warmTabTtl). One record per lease key — a single map so create/clear
+ * siteSession). One record per lease key — a single map so create/clear
  * stay in lockstep.
  */
 type SessionOverrides = {
   idleTimeoutMs?: number;
   windowMode?: WindowMode;
   lifecycle?: LeaseLifecycle;
-  warmTabTtlSeconds?: number;
 };
 const sessionOverrides = new Map<string, SessionOverrides>();
 
 function setSessionOverride(key: string, patch: SessionOverrides): void {
   sessionOverrides.set(key, { ...sessionOverrides.get(key), ...patch });
-}
-
-function getWarmTabTtlSeconds(key: string): number {
-  return sessionOverrides.get(key)?.warmTabTtlSeconds ?? WARM_TAB_TTL_DEFAULT_SECONDS;
-}
-
-function isValidWarmTabTtlSeconds(value: unknown): value is number {
-  return typeof value === 'number'
-    && Number.isInteger(value)
-    && value >= MIN_WARM_TAB_TTL_SECONDS
-    && value <= MAX_WARM_TAB_TTL_SECONDS;
 }
 
 /** Commands currently executing per lease — idle release is deferred while > 0. */
@@ -485,10 +502,6 @@ function leaseKeyFromAlarmName(name: string): string | null {
   }
 }
 
-function makeWarmTabAlarmName(tabId: number): string {
-  return `${WARM_TAB_ALARM_PREFIX}${tabId}`;
-}
-
 function tabIdFromWarmTabAlarmName(name: string): number | null {
   if (!name.startsWith(WARM_TAB_ALARM_PREFIX)) return null;
   const raw = name.slice(WARM_TAB_ALARM_PREFIX.length);
@@ -497,22 +510,35 @@ function tabIdFromWarmTabAlarmName(name: string): number | null {
   return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
-function scheduleWarmTabAlarm(tabId: number, seconds: number): void {
-  const alarmName = makeWarmTabAlarmName(tabId);
-  try {
-    chrome.alarms?.create?.(alarmName, { when: Date.now() + seconds * 1000 });
-  } catch {
-    // Best-effort scheduling.
+/**
+ * Register an owned adapter tab in the global ownership ledger. Only adapter
+ * surface tabs are recorded; browser-surface and borrowed tabs are never
+ * reclaimable by the adapter cleanup API.
+ */
+function registerAdapterTab(leaseKey: string, tabId: number): void {
+  if (getSurfaceFromKey(leaseKey) !== 'adapter') return;
+  if (!adapterTabLedger.has(tabId)) {
+    adapterTabLedger.add(tabId);
+    void persistRuntimeState();
   }
 }
 
-function clearWarmTabAlarm(tabId: number): void {
-  const alarmName = makeWarmTabAlarmName(tabId);
-  try {
-    chrome.alarms?.clear?.(alarmName);
-  } catch {
-    // Best-effort cleanup.
+/**
+ * Permanently revoke adapter ownership of a physical tab: drop it from the
+ * ownership ledger AND clear the flag on every lease (including an owned
+ * adapter lease) that still references it. Called when a tab is reassigned to
+ * a borrowed or browser-surface lease, so neither a later reclaim nor a
+ * service-worker recovery can close a page the user has taken over.
+ */
+function revokeAdapterTabOwnership(tabId: number): void {
+  let changed = adapterTabLedger.delete(tabId);
+  for (const session of automationSessions.values()) {
+    if (session.preferredTabId === tabId && session.preferredTabOwned) {
+      session.preferredTabOwned = false;
+      changed = true;
+    }
   }
+  if (changed) void persistRuntimeState();
 }
 
 function withLeaseMutation<T>(fn: () => Promise<T>): Promise<T> {
@@ -521,9 +547,19 @@ function withLeaseMutation<T>(fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
+/**
+ * Caller-facing lease fields. `preferredTabOwned` is derived by `makeSession`
+ * unless the caller explicitly knows the tab's provenance (e.g. `preferOwnedTab`
+ * selecting a user tab).
+ */
+type LeaseSessionFields = Omit<
+  TargetLease,
+  'idleTimer' | 'idleDeadlineAt' | 'contextId' | 'ownership' | 'lifecycle' | 'windowRole' | 'preferredTabOwned'
+> & { preferredTabOwned?: boolean };
+
 function makeSession(
   key: string,
-  session: Omit<TargetLease, 'idleTimer' | 'idleDeadlineAt' | 'contextId' | 'ownership' | 'lifecycle' | 'windowRole'>,
+  session: LeaseSessionFields,
 ): Omit<TargetLease, 'idleTimer' | 'idleDeadlineAt'> {
   const ownership = session.owned ? 'owned' : 'borrowed';
   return {
@@ -532,6 +568,8 @@ function makeSession(
     ownership,
     lifecycle: getLeaseLifecycle(key, session.kind),
     windowRole: getWindowRole(key, ownership),
+    // Default: an owned adapter lease owns its tab; everything else does not.
+    preferredTabOwned: session.preferredTabOwned ?? (session.owned && getSurfaceFromKey(key) === 'adapter'),
   };
 }
 
@@ -547,6 +585,7 @@ function emptyRegistry(): StoredRegistry {
       automation: { windowId: ownedContainers.automation.windowId },
     },
     leases: {},
+    adapterTabIds: [...adapterTabLedger],
   };
 }
 
@@ -575,6 +614,9 @@ async function readRegistry(): Promise<StoredRegistry> {
         },
       },
       leases: stored.leases as Record<string, StoredLease>,
+      adapterTabIds: Array.isArray(stored.adapterTabIds)
+        ? stored.adapterTabIds.filter((id): id is number => typeof id === 'number')
+        : [],
     };
   } catch {
     return emptyRegistry();
@@ -605,7 +647,7 @@ async function persistRuntimeState(): Promise<void> {
       windowRole: session.windowRole,
       idleDeadlineAt: session.idleDeadlineAt,
       updatedAt: Date.now(),
-      warmTabTtlSeconds: getWarmTabTtlSeconds(leaseKey),
+      preferredTabOwned: session.preferredTabOwned,
     };
   }
   await writeRegistry({
@@ -619,6 +661,7 @@ async function persistRuntimeState(): Promise<void> {
       automation: { windowId: ownedContainers.automation.windowId },
     },
     leases,
+    adapterTabIds: [...adapterTabLedger],
   });
 }
 
@@ -1248,23 +1291,20 @@ async function findReusableOwnedContainerTab(
 ): Promise<number | undefined> {
   try {
     const tabs = await chrome.tabs.query({ windowId });
-    // When a canonical owned group lives in a user window (cross-window
-    // convergence can land it there), an http(s) tab outside the group is
-    // user content and must not be reused. Group members and non-http tabs
-    // (about:blank / data: / fresh container) stay eligible. The dedicated
-    // adapter windowId is itself an ownership signal, so its released warm
-    // http(s) tabs are safe to reuse. A null group id in any other window means
-    // no ownership signal exists, so only non-http placeholders qualify.
+    // Adapter window membership does not grant ownership. Reuse only recorded
+    // adapter tabs or available blank placeholders, never a manually opened
+    // page or a borrowed tab. Interactive groups keep their existing scope.
     const dedicatedAdapterWindow = ownedContainers.automation.windowId === windowId;
     const reusable = tabs.filter(tab =>
       tab.id !== undefined &&
       initialTabIsAvailable(tab.id) &&
       isDebuggableUrl(tab.url) &&
       (
-        dedicatedAdapterWindow ||
-        ownedGroupId === undefined ||
-        (ownedGroupId !== null && tab.groupId === ownedGroupId) ||
-        !isSafeNavigationUrl(tab.url ?? '')
+        dedicatedAdapterWindow
+          ? adapterTabLedger.has(tab.id!) || isStartupPlaceholderUrl(tab.url)
+          : ownedGroupId === undefined ||
+            (ownedGroupId !== null && tab.groupId === ownedGroupId) ||
+            !isSafeNavigationUrl(tab.url ?? '')
       ),
     );
     const exactTarget = targetUrl
@@ -1279,7 +1319,7 @@ async function findReusableOwnedContainerTab(
 function initialTabIsAvailable(tabId: number | undefined): tabId is number {
   if (tabId === undefined) return false;
   for (const session of automationSessions.values()) {
-    if (session.owned && session.preferredTabId === tabId) return false;
+    if (session.preferredTabId === tabId) return false;
   }
   return true;
 }
@@ -1306,6 +1346,9 @@ async function createOwnedTabLeaseUnlocked(leaseKey: string, initialUrl?: string
   }
   const tabId = tab.id;
   if (!tabId) throw new Error('Failed to create tab lease in automation container');
+  // Record adapter ownership before any group/persist await so a worker crash
+  // right after creation still leaves the tab reclaimable.
+  registerAdapterTab(leaseKey, tabId);
   const group = await ensureOwnedContainerGroup(role, windowId, [tabId]);
   const sessionWindowId = group?.windowId ?? tab.windowId;
   if (tab.windowId !== sessionWindowId) tab = await chrome.tabs.get(tabId);
@@ -1317,6 +1360,7 @@ async function createOwnedTabLeaseUnlocked(leaseKey: string, initialUrl?: string
     windowId: sessionWindowId,
     owned: true,
     preferredTabId: tabId,
+    preferredTabOwned: true,
   });
   resetWindowIdleTimer(leaseKey);
   return { tabId, tab };
@@ -1382,7 +1426,7 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   // Same wake-before-recovery hazard as windows.onRemoved.
   await workerReady;
-  clearWarmTabAlarm(tabId);
+  adapterTabLedger.delete(tabId);
   identity.evictTab(tabId);
   for (const [leaseKey, session] of automationSessions.entries()) {
     if (session.preferredTabId === tabId) {
@@ -1461,11 +1505,6 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     void connect();
     return;
   }
-  const warmTabId = tabIdFromWarmTabAlarmName(alarm.name);
-  if (warmTabId !== null) {
-    await expireWarmTab(warmTabId);
-    return;
-  }
   const leaseKey = leaseKeyFromAlarmName(alarm.name);
   if (!leaseKey) return;
   if ((activeCommandCounts.get(leaseKey) ?? 0) > 0) {
@@ -1522,23 +1561,23 @@ async function fetchDaemonVersion(): Promise<string | null> {
 // ─── Command dispatcher ─────────────────────────────────────────────
 
 async function handleCommand(cmd: Command): Promise<Result> {
-  if (cmd.warmTabTtl !== undefined) {
-    if (!isValidWarmTabTtlSeconds(cmd.warmTabTtl)) {
-      return {
-        id: cmd.id,
-        ok: false,
-        errorCode: 'invalid_warm_tab_ttl',
-        error: `warmTabTtl must be an integer between ${MIN_WARM_TAB_TTL_SECONDS} and ${MAX_WARM_TAB_TTL_SECONDS}. Received: ${String(cmd.warmTabTtl)}`,
-      };
-    }
+  // Session-less adapter maintenance command: reclaim every owned adapter tab.
+  if (cmd.action === 'reclaim-adapter-tabs') {
+    return handleReclaimAdapterTabs(cmd);
   }
 
   const session = getSessionName(cmd.session);
   const surface = getCommandSurface(cmd);
-  const leaseKey = getLeaseKey(session, surface);
-  if (cmd.warmTabTtl !== undefined) {
-    setSessionOverride(leaseKey, { warmTabTtlSeconds: cmd.warmTabTtl });
+  if (surface === 'adapter' && adapterReclaimInFlight) {
+    return {
+      id: cmd.id,
+      ok: false,
+      errorCode: 'adapter_tabs_busy',
+      error: 'Adapter tab reclamation is in progress; adapter commands are temporarily rejected.',
+      errorHint: 'Retry once the reclaim-adapter-tabs command completes.',
+    };
   }
+  const leaseKey = getLeaseKey(session, surface);
   if (cmd.windowMode === 'foreground' || cmd.windowMode === 'background') {
     setSessionOverride(leaseKey, { windowMode: cmd.windowMode });
   }
@@ -1706,12 +1745,15 @@ function enumerateCrossOriginFrames(tree: any): Array<{ index: number; frameId: 
 
 function setLeaseSession(
   leaseKey: string,
-  session: Omit<TargetLease, 'idleTimer' | 'idleDeadlineAt' | 'contextId' | 'ownership' | 'lifecycle' | 'windowRole'>,
+  session: LeaseSessionFields,
 ): void {
   const existing = automationSessions.get(leaseKey);
   if (existing?.idleTimer) clearTimeout(existing.idleTimer);
-  if (session.preferredTabId !== null) {
-    clearWarmTabAlarm(session.preferredTabId);
+  // Only create/adopt paths grant ownership. Reassignment to a borrowed or
+  // browser lease revokes it immediately, even if that lease later expires.
+  const isOwnedAdapterLease = session.owned && session.surface === 'adapter';
+  if (session.preferredTabId !== null && !isOwnedAdapterLease) {
+    revokeAdapterTabOwnership(session.preferredTabId);
   }
   const timeout = getIdleTimeout(leaseKey);
   automationSessions.set(leaseKey, {
@@ -1828,7 +1870,10 @@ async function resolveTab(tabId: number | undefined, leaseKey: string, initialUr
     scopedWindowId,
     existingSession?.owned ? (group?.id ?? null) : undefined,
   );
-  if (reusableTabId !== undefined) return { tabId: reusableTabId, tab: await chrome.tabs.get(reusableTabId) };
+  if (reusableTabId !== undefined) {
+    registerAdapterTab(leaseKey, reusableTabId);
+    return { tabId: reusableTabId, tab: await chrome.tabs.get(reusableTabId) };
+  }
 
   // No debuggable tab — another extension may have hijacked the tab URL.
   // Only recycle arbitrary tabs for legacy unscoped sessions. Owned sessions
@@ -1851,6 +1896,9 @@ async function resolveTab(tabId: number | undefined, leaseKey: string, initialUr
   // Fallback: create a new tab
   const newTab = await chrome.tabs.create({ windowId: scopedWindowId, url: BLANK_PAGE, active: true });
   if (!newTab.id) throw new Error('Failed to create tab in automation container');
+  // Orphan-resistant: record the replacement tab even though the session's
+  // preferredTabId is not updated on this path.
+  registerAdapterTab(leaseKey, newTab.id);
   await ensureOwnedContainerGroup(role, scopedWindowId, [newTab.id]);
   return { tabId: newTab.id, tab: await chrome.tabs.get(newTab.id) };
 }
@@ -1980,6 +2028,11 @@ function preferOwnedTab(leaseKey: string, tabId: number): void {
     windowId: session.windowId,
     owned: true,
     preferredTabId: tabId,
+    // `tabs select` may target a user-opened tab living in the automation
+    // window. Ownership follows the physical-creation ledger only: a tab we
+    // created stays ours (and protected from user reuse), an unknown tab is
+    // recorded as non-owned so recovery can never adopt it for reclamation.
+    preferredTabOwned: adapterTabLedger.has(tabId),
   });
 }
 
@@ -2116,6 +2169,10 @@ async function handleTabs(cmd: Command, leaseKey: string): Promise<Result> {
       let tab = await chrome.tabs.create({ windowId, url: cmd.url ?? BLANK_PAGE, active: true });
       const tabId = tab.id;
       if (!tabId) return { id: cmd.id, ok: false, error: 'Failed to create tab' };
+      // Record ownership immediately after creation and before any await, so a
+      // worker crash between create and the group/persist step still leaves the
+      // replacement tab reclaimable instead of leaking as an orphan.
+      registerAdapterTab(leaseKey, tabId);
       const group = await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), windowId, [tabId]);
       const sessionWindowId = group?.windowId ?? tab.windowId;
       if (tab.windowId !== sessionWindowId) tab = await chrome.tabs.get(tabId);
@@ -2126,6 +2183,7 @@ async function handleTabs(cmd: Command, leaseKey: string): Promise<Result> {
         windowId: sessionWindowId,
         owned: true,
         preferredTabId: tabId,
+        preferredTabOwned: true,
       });
       resetWindowIdleTimer(leaseKey);
       return pageScopedResult(cmd.id, tabId, { url: tab.url });
@@ -2459,50 +2517,6 @@ async function releaseLease(leaseKey: string, reason: string = 'released'): Prom
   return withLeaseMutation(() => releaseLeaseUnlocked(leaseKey, reason));
 }
 
-async function expireWarmTab(tabId: number): Promise<void> {
-  return withLeaseMutation(() => expireWarmTabUnlocked(tabId));
-}
-
-async function expireWarmTabUnlocked(tabId: number): Promise<void> {
-  clearWarmTabAlarm(tabId);
-  let tab: chrome.tabs.Tab;
-  try {
-    tab = await chrome.tabs.get(tabId);
-  } catch {
-    // Missing tab is a no-op
-    return;
-  }
-  if (!initialTabIsAvailable(tabId)) {
-    // Leased tab is a no-op (stale warm alarm does not reclaim active lease)
-    return;
-  }
-  const automationWindowId = ownedContainers.automation.windowId;
-  if (automationWindowId === null || tab.windowId !== automationWindowId) {
-    // Stale/moved tab is a no-op
-    return;
-  }
-  try {
-    const tabs = await chrome.tabs.query({ windowId: automationWindowId });
-    if (!tabs.some((candidate) => candidate.id === tabId)) {
-      // The tab moved after the initial ownership check.
-      return;
-    }
-    if (tabs.length > 1) {
-      await safeDetach(tabId);
-      identity.evictTab(tabId);
-      await chrome.tabs.remove(tabId).catch(() => {});
-      console.log(`[opencli] Warm tab ${tabId} expired and closed (${tabs.length - 1} remaining in automation window)`);
-    } else if (tabs.length === 1) {
-      if (tab.url !== BLANK_PAGE) {
-        await chrome.tabs.update(tabId, { url: BLANK_PAGE });
-      }
-      console.log(`[opencli] Warm tab ${tabId} expired and reset to ${BLANK_PAGE} (last tab in automation window)`);
-    }
-  } catch {
-    // Tab or window closed concurrently
-  }
-}
-
 async function releaseLeaseUnlocked(leaseKey: string, reason: string): Promise<void> {
   const session = automationSessions.get(leaseKey);
   if (!session) {
@@ -2515,24 +2529,22 @@ async function releaseLeaseUnlocked(leaseKey: string, reason: string): Promise<v
   if (session.idleTimer) clearTimeout(session.idleTimer);
   scheduleIdleAlarm(leaseKey, IDLE_TIMEOUT_NONE);
 
-  let warmTabExpiryToRun: number | null = null;
-
   if (session.owned) {
     const tabId = session.preferredTabId;
     if (tabId !== null) {
       await safeDetach(tabId);
       identity.evictTab(tabId);
-      if (session.surface === 'adapter' && session.lifecycle === 'ephemeral') {
-        const warmTtl = getWarmTabTtlSeconds(leaseKey);
-        console.log(`[opencli] Released ephemeral adapter tab lease ${tabId} as a warm reusable tab (session=${session.session}, ttl=${warmTtl}s, ${reason})`);
-        if (warmTtl === -1) {
-          clearWarmTabAlarm(tabId);
-        } else if (warmTtl === 0) {
-          clearWarmTabAlarm(tabId);
-          warmTabExpiryToRun = tabId;
-        } else if (warmTtl > 0) {
-          scheduleWarmTabAlarm(tabId, warmTtl);
-        }
+      // An idle release (timer, alarm, or reconcile expiry) never closes an
+      // adapter tab: the tab stays open at its current URL and registered in
+      // the ownership ledger, so only the explicit reclaim API closes it. This
+      // is independent of the requested adapter session lifecycle. An explicit
+      // user command (close-window / tabs close / rebind) keeps its original
+      // contract: ephemeral adapter tabs stay reusable, persistent ones are
+      // removed or reset to a placeholder.
+      const idleRelease = reason === 'idle timeout' || reason === 'idle alarm' || reason === 'reconciled idle expiry';
+      const keepTabForReuse = session.surface === 'adapter' && (idleRelease || session.lifecycle === 'ephemeral');
+      if (keepTabForReuse) {
+        console.log(`[opencli] Released adapter tab lease ${tabId} for reuse (session=${session.session}, ${reason})`);
       } else {
         const hasOtherOwnedLease = [...automationSessions.entries()].some(([otherLease, otherSession]) =>
           otherLease !== leaseKey &&
@@ -2567,14 +2579,283 @@ async function releaseLeaseUnlocked(leaseKey: string, reason: string): Promise<v
   sessionOverrides.delete(leaseKey);
 
   await persistRuntimeState();
+}
 
-  if (warmTabExpiryToRun !== null) {
-    await expireWarmTabUnlocked(warmTabExpiryToRun);
+/** Number of adapter-surface commands currently executing (across all sessions). */
+function activeAdapterCommandCount(): number {
+  let count = 0;
+  for (const key of activeCommandCounts.keys()) {
+    if (getSurfaceFromKey(key) === 'adapter') count += 1;
+  }
+  return count;
+}
+
+/**
+ * True when `tabId` is referenced by any lease that is not an owned adapter
+ * lease (a borrowed/user-bound tab, or a browser-surface owned tab). Such tabs
+ * are never reclaimed and their leases are never deleted by adapter cleanup.
+ */
+function isTabLeasedOutsideAdapterOwnership(tabId: number): boolean {
+  for (const session of automationSessions.values()) {
+    if (session.preferredTabId !== tabId) continue;
+    if (!(session.owned && session.surface === 'adapter')) return true;
+  }
+  return false;
+}
+
+/** Chrome signals a tab that no longer exists this way; other errors are API faults. */
+function isMissingTabError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /No tab with id/i.test(message) || /Invalid tab ID/i.test(message);
+}
+
+/** Release every owned adapter lease pointing at `tabId` and clear its idle alarm. */
+function releaseAdapterLeasesForTab(tabId: number): void {
+  for (const [leaseKey, session] of [...automationSessions.entries()]) {
+    if (!session.owned || session.surface !== 'adapter' || session.preferredTabId !== tabId) continue;
+    if (session.idleTimer) clearTimeout(session.idleTimer);
+    automationSessions.delete(leaseKey);
+    sessionOverrides.delete(leaseKey);
+    scheduleIdleAlarm(leaseKey, IDLE_TIMEOUT_NONE);
+  }
+}
+
+/**
+ * Validate the command's absolute deadline. Reclaim has no self-timed default:
+ * the daemon stamps a bounded absolute deadline at receipt, and a missing or
+ * non-finite value is rejected instead of silently restarting the clock here.
+ */
+function resolveReclaimDeadline(cmd: Command): number {
+  const value = cmd.deadlineAt;
+  if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value)) {
+    throw new CommandFailure(
+      'reclaim_failed',
+      'reclaim-adapter-tabs requires a finite integer absolute deadlineAt (epoch ms).',
+      'Retry through the daemon, which stamps a bounded 5s deadline.',
+    );
+  }
+  return value;
+}
+
+function reclaimDeadlineExceeded(id: string, closedTabs: number, resetTabs: number): Result {
+  return {
+    id,
+    ok: false,
+    errorCode: 'reclaim_deadline_exceeded',
+    error: `Adapter tab reclamation exceeded its deadline after closing ${closedTabs} and resetting ${resetTabs} tab(s); remaining tabs were left for a retry.`,
+    errorHint: 'Retry reclaim-adapter-tabs with a fresh deadline.',
+  };
+}
+
+/** Live adapter tab eligible for reclamation / `gone` / `skip` (protected or moved). */
+type LedgerTabInspection = chrome.tabs.Tab | 'gone' | 'skip';
+
+/**
+ * Read a ledger tab and classify it. A `chrome.tabs.get` API fault (anything
+ * but the "no such tab" signal) throws a retryable failure so the ledger and
+ * lease state are preserved rather than being mistaken for a closed tab.
+ */
+async function inspectLedgerTab(
+  tabId: number,
+  automationWindowId: number,
+): Promise<LedgerTabInspection> {
+  let tab: chrome.tabs.Tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch (err) {
+    if (isMissingTabError(err)) return 'gone';
+    await persistRuntimeState();
+    throw new CommandFailure(
+      'reclaim_failed',
+      `Failed to inspect adapter tab ${tabId}: ${err instanceof Error ? err.message : String(err)}`,
+      'Retry reclaim-adapter-tabs.',
+    );
+  }
+  if (isTabLeasedOutsideAdapterOwnership(tabId)) return 'skip';
+  if (tab.windowId !== automationWindowId) return 'skip';
+  if (!isDebuggableUrl(tab.url)) return 'skip';
+  return tab;
+}
+
+/**
+ * Extension-global adapter tab reclamation. Closes every adapter tab still
+ * registered in the ownership ledger — active leases, released leftovers, and
+ * tabs replaced by `tabs new` — releasing the matching owned adapter leases,
+ * while keeping the adapter window alive with one about:blank placeholder.
+ * Borrowed, browser-surface, and user-moved tabs are never touched. It runs
+ * inside the lease mutation queue so no other lease mutation can race it, and
+ * new adapter commands are rejected while it runs.
+ */
+async function handleReclaimAdapterTabs(cmd: Command): Promise<Result> {
+  if (adapterReclaimInFlight) {
+    return {
+      id: cmd.id,
+      ok: false,
+      errorCode: 'adapter_tabs_busy',
+      error: 'Another adapter tab reclamation is already running.',
+      errorHint: 'Wait for it to finish before retrying.',
+    };
+  }
+  adapterReclaimInFlight = true;
+  try {
+    // A freshly woken worker must rehydrate the ledger before reclaiming.
+    await workerReady;
+    return await withLeaseMutation(() => reclaimAdapterTabsUnlocked(cmd));
+  } catch (err) {
+    return errorResult(cmd.id, err);
+  } finally {
+    adapterReclaimInFlight = false;
+  }
+}
+
+async function reclaimAdapterTabsUnlocked(cmd: Command): Promise<Result> {
+  // Re-check inside the mutation queue: an adapter command may have started
+  // between the dispatcher's entry check and acquiring this queue slot.
+  if (activeAdapterCommandCount() > 0) {
+    throw new CommandFailure(
+      'adapter_tabs_busy',
+      'An adapter command is currently running; retry the reclaim after it finishes.',
+    );
+  }
+
+  const deadlineAt = resolveReclaimDeadline(cmd);
+  const automationWindowId = ownedContainers.automation.windowId;
+  let closedTabs = 0;
+  let resetTabs = 0;
+
+  if (automationWindowId === null) {
+    await persistRuntimeState();
+    return { id: cmd.id, ok: true, data: { closedTabs, resetTabs } };
+  }
+
+  for (const tabId of [...adapterTabLedger]) {
+    if (Date.now() >= deadlineAt) {
+      await persistRuntimeState();
+      return reclaimDeadlineExceeded(cmd.id, closedTabs, resetTabs);
+    }
+
+    const inspected = await inspectLedgerTab(tabId, automationWindowId);
+    if (inspected === 'gone' || inspected === 'skip') {
+      // Not (or no longer) an owned adapter tab: relinquish the ledger entry
+      // and any stale owned adapter lease, but never a borrowed lease.
+      adapterTabLedger.delete(tabId);
+      releaseAdapterLeasesForTab(tabId);
+      continue;
+    }
+
+    await safeDetach(tabId);
+    identity.evictTab(tabId);
+
+    // Re-verify after every await and immediately before the destructive call:
+    // an expired or re-bound tab must never be closed.
+    if (Date.now() >= deadlineAt) {
+      await persistRuntimeState();
+      return reclaimDeadlineExceeded(cmd.id, closedTabs, resetTabs);
+    }
+    const recheck = await inspectLedgerTab(tabId, automationWindowId);
+    if (recheck === 'gone' || recheck === 'skip') {
+      adapterTabLedger.delete(tabId);
+      releaseAdapterLeasesForTab(tabId);
+      continue;
+    }
+
+    let windowTabs: chrome.tabs.Tab[];
+    try {
+      windowTabs = await chrome.tabs.query({ windowId: automationWindowId });
+    } catch (err) {
+      await persistRuntimeState();
+      throw new CommandFailure(
+        'reclaim_failed',
+        `Failed to inspect adapter window ${automationWindowId}: ${err instanceof Error ? err.message : String(err)}`,
+        'Retry reclaim-adapter-tabs.',
+      );
+    }
+    if (!windowTabs.some((tab) => tab.id === tabId)) {
+      adapterTabLedger.delete(tabId);
+      releaseAdapterLeasesForTab(tabId);
+      continue;
+    }
+
+    if (Date.now() >= deadlineAt) {
+      await persistRuntimeState();
+      return reclaimDeadlineExceeded(cmd.id, closedTabs, resetTabs);
+    }
+
+    try {
+      // Keep one owned blank placeholder even when user pages share this window.
+      const hasOtherOwnedTab = windowTabs.some((tab) =>
+        tab.id !== undefined && tab.id !== tabId &&
+        adapterTabLedger.has(tab.id) &&
+        !isTabLeasedOutsideAdapterOwnership(tab.id) &&
+        isDebuggableUrl(tab.url),
+      );
+      if (hasOtherOwnedTab) {
+        await chrome.tabs.remove(tabId);
+        closedTabs++;
+      } else {
+        if (windowTabs.find((tab) => tab.id === tabId)?.url !== BLANK_PAGE) {
+          await chrome.tabs.update(tabId, { url: BLANK_PAGE });
+        }
+        resetTabs++;
+      }
+    } catch (err) {
+      // Keep the ledger entry and its lease so the reclaim stays retryable;
+      // never swallow a remove/update error and report success.
+      await persistRuntimeState();
+      throw new CommandFailure(
+        'reclaim_failed',
+        `Failed to close adapter tab ${tabId}: ${err instanceof Error ? err.message : String(err)}`,
+        'Retry reclaim-adapter-tabs.',
+      );
+    }
+    // Only after the tab is physically removed or blanked do we drop the
+    // ownership registration and release any lease still pointing at it.
+    adapterTabLedger.delete(tabId);
+    releaseAdapterLeasesForTab(tabId);
+  }
+
+  await persistRuntimeState();
+  return { id: cmd.id, ok: true, data: { closedTabs, resetTabs } };
+}
+
+/**
+ * One-time migration off the removed per-tab warm-tab TTL: adopt every legacy
+ * `opencli:warm-tab:<tabId>` alarm's tab into the adapter ownership ledger so
+ * the explicit reclaim API can still close it, then clear the alarms. No
+ * warm-alarm scheduling or expiry behavior is retained.
+ */
+async function adoptLegacyWarmTabAlarms(): Promise<void> {
+  if (typeof chrome.alarms?.getAll !== 'function') return;
+  let existing: chrome.alarms.Alarm[];
+  try {
+    existing = await chrome.alarms.getAll();
+  } catch {
+    return;
+  }
+  for (const alarm of existing) {
+    // Never touch keepalive or live idle-lease alarms — only the removed warm
+    // TTL prefix is migrated.
+    if (!alarm.name.startsWith(WARM_TAB_ALARM_PREFIX)) continue;
+    const tabId = tabIdFromWarmTabAlarmName(alarm.name);
+    if (tabId !== null) adapterTabLedger.add(tabId);
+    if (typeof chrome.alarms?.clear === 'function') {
+      try {
+        await chrome.alarms.clear(alarm.name);
+      } catch {
+        // Best-effort migration.
+      }
+    }
   }
 }
 
 async function reconcileTargetLeaseRegistry(): Promise<void> {
   const registry = await readRegistry();
+  // Restore the adapter ownership ledger, then fold in tab ids left behind by
+  // the removed warm-tab TTL alarms (one-time migration) so they stay
+  // reclaimable across a service-worker restart.
+  adapterTabLedger.clear();
+  for (const id of registry.adapterTabIds ?? []) adapterTabLedger.add(id);
+  await adoptLegacyWarmTabAlarms();
   // Restore the orphan-group ledger (readRegistry already coerced it to a
   // clean number[]).
   interactiveGroupLedger.clear();
@@ -2594,6 +2875,18 @@ async function reconcileTargetLeaseRegistry(): Promise<void> {
     }
   }
 
+  // Tabs referenced by any non-owned-adapter lease (borrowed/user-bound, or an
+  // owned browser-surface lease) are user-facing: a restored owned adapter
+  // lease must never reclaim them, so exclude them from ledger adoption.
+  const externallyLeasedTabIds = new Set<number>();
+  for (const [leaseKey, stored] of Object.entries(registry.leases)) {
+    if (stored.preferredTabId === null) continue;
+    // Resolve the surface exactly as makeSession does below: older registries
+    // omit `surface`, so the lease key is authoritative for it.
+    const storedSurface = stored.surface === 'adapter' ? 'adapter' : getSurfaceFromKey(leaseKey);
+    if (!(stored.owned && storedSurface === 'adapter')) externallyLeasedTabIds.add(stored.preferredTabId);
+  }
+
   automationSessions.clear();
   for (const [leaseKey, stored] of Object.entries(registry.leases)) {
     const tabId = stored.preferredTabId;
@@ -2604,9 +2897,6 @@ async function reconcileTargetLeaseRegistry(): Promise<void> {
       if (stored.lifecycle === 'ephemeral' || stored.lifecycle === 'persistent' || stored.lifecycle === 'pinned') {
         setSessionOverride(leaseKey, { lifecycle: stored.lifecycle });
       }
-      if (isValidWarmTabTtlSeconds(stored.warmTabTtlSeconds)) {
-        setSessionOverride(leaseKey, { warmTabTtlSeconds: stored.warmTabTtlSeconds });
-      }
       const session = makeSession(leaseKey, {
         session: typeof stored.session === 'string' ? stored.session : getSessionFromKey(leaseKey),
         surface: stored.surface === 'adapter' ? 'adapter' : getSurfaceFromKey(leaseKey),
@@ -2614,6 +2904,7 @@ async function reconcileTargetLeaseRegistry(): Promise<void> {
         windowId: tab.windowId,
         owned: stored.owned,
         preferredTabId: tabId,
+        preferredTabOwned: stored.preferredTabOwned,
       });
       const timeout = getIdleTimeout(leaseKey);
       automationSessions.set(leaseKey, {
@@ -2623,7 +2914,26 @@ async function reconcileTargetLeaseRegistry(): Promise<void> {
       });
       if (session.owned) {
         const role = getOwnedWindowRole(leaseKey);
-        if (ownedContainers[role].windowId === null) ownedContainers[role].windowId = tab.windowId;
+        if (session.surface === 'adapter') {
+          // Adoption of a restored lease tab is VERIFIED, never inferred:
+          // - the lease must still be flagged as owning the tab (a tab the
+          //   user picked via `tabs select` is not),
+          // - the tab must be alive in the persisted automation container
+          //   window (a tab the user dragged elsewhere is user content).
+          // The container window is never inferred from the lease tab itself;
+          // doing so could adopt a user window and later close user tabs.
+          const adapterWindowId = ownedContainers.automation.windowId;
+          if (
+            session.preferredTabOwned
+            && !externallyLeasedTabIds.has(tabId)
+            && adapterWindowId !== null
+            && tab.windowId === adapterWindowId
+          ) {
+            adapterTabLedger.add(tabId);
+          }
+        } else if (ownedContainers[role].windowId === null) {
+          ownedContainers[role].windowId = tab.windowId;
+        }
         const group = await ensureOwnedContainerGroup(role, tab.windowId, [tabId]);
         if (group) {
           const current = automationSessions.get(leaseKey);
@@ -2755,23 +3065,40 @@ export const __test__ = {
       preferredTabId: null,
     });
   },
-  setSession: (leaseKey: string, session: { windowId: number; owned: boolean; preferredTabId: number | null }) => {
+  setSession: (
+    leaseKey: string,
+    session: { windowId: number; owned: boolean; preferredTabId: number | null; preferredTabOwned?: boolean },
+  ) => {
+    const surface = getSurfaceFromKey(leaseKey);
+    // Mirror production physical-creation registration: a test that prepares an
+    // owned adapter session must also register the tab it declares it owns.
+    // Tests that intentionally simulate borrowed/unowned use either pass
+    // `owned: false` (which revokes, like a real binding) or delete the ledger
+    // entry themselves.
+    const preferredTabOwned = session.preferredTabOwned
+      ?? (session.owned && surface === 'adapter' && session.preferredTabId !== null);
+    if (preferredTabOwned && session.preferredTabId !== null) {
+      registerAdapterTab(leaseKey, session.preferredTabId);
+    }
     setLeaseSession(leaseKey, {
       session: getSessionFromKey(leaseKey),
-      surface: getSurfaceFromKey(leaseKey),
+      surface,
       kind: session.owned ? 'owned' : 'bound',
-      ...session,
+      windowId: session.windowId,
+      owned: session.owned,
+      preferredTabId: session.preferredTabId,
+      preferredTabOwned,
     });
   },
-  WARM_TAB_TTL_DEFAULT_SECONDS,
-  MIN_WARM_TAB_TTL_SECONDS,
-  MAX_WARM_TAB_TTL_SECONDS,
+  setActiveCommandCount: (leaseKey: string, count: number) => {
+    if (count <= 0) activeCommandCounts.delete(leaseKey);
+    else activeCommandCounts.set(leaseKey, count);
+  },
   WARM_TAB_ALARM_PREFIX,
-  getWarmTabTtlSeconds,
-  makeWarmTabAlarmName,
   tabIdFromWarmTabAlarmName,
-  scheduleWarmTabAlarm,
-  clearWarmTabAlarm,
-  expireWarmTab,
-  expireWarmTabUnlocked,
+  registerAdapterTab,
+  getAdapterTabLedger: () => [...adapterTabLedger],
+  clearAdapterTabLedger: () => adapterTabLedger.clear(),
+  handleReclaimAdapterTabs,
+  isAdapterReclaimInFlight: () => adapterReclaimInFlight,
 };

@@ -12,6 +12,7 @@ export type Action =
   | 'cookies'
   | 'screenshot'
   | 'close-window'
+  | 'reclaim-adapter-tabs'
   | 'sessions'
   | 'set-file-input'
   | 'insert-text'
@@ -79,12 +80,6 @@ export interface Command {
   windowMode?: 'foreground' | 'background';
   /** Custom idle timeout in seconds for this session while active. Overrides the default. */
   idleTimeout?: number;
-  /**
-   * Warm tab reclamation TTL in seconds after an owned ephemeral adapter lease
-   * is released (-1 disables, default 1800). Distinct from the active lease
-   * `idleTimeout`.
-   */
-  warmTabTtl?: number;
   /** Frame index for cross-frame operations (0-based, from 'frames' action) */
   frameIndex?: number;
   /** Browser profile/context REQUIRED by the CLI (--profile / env). Used by the daemon for strict routing. */
@@ -127,6 +122,13 @@ export interface Result {
   /** Page identity (targetId) — present only on page-scoped command responses */
   page?: string;
 }
+
+/**
+ * Capabilities this extension advertises in its `hello` handshake. The daemon
+ * exposes them per profile and refuses actions a profile does not advertise —
+ * no version-based guessing, no fallback.
+ */
+export const EXTENSION_CAPABILITIES = ['adapter-tab-reclaim-v1'] as const;
 
 /** Default daemon port */
 export const DAEMON_PORT = 19825;

@@ -340,12 +340,6 @@ export interface DaemonCommand {
   windowMode?: 'foreground' | 'background';
   /** Custom idle timeout in seconds for this session while active. Overrides the default. */
   idleTimeout?: number;
-  /**
-   * Warm tab reclamation TTL in seconds after an owned ephemeral adapter lease
-   * is released (-1 disables, default 1800). Distinct from the active lease
-   * `idleTimeout`.
-   */
-  warmTabTtl?: number;
   /** Frame index for cross-frame operations (0-based, from 'frames' action) */
   frameIndex?: number;
   /** Browser profile/context REQUIRED for this command (--profile / OPENCLI_PROFILE). Fails loud when offline. */

@@ -276,12 +276,13 @@ describe('escapeLeadingDashPositional', () => {
   });
 
   it('keeps adapter and browser options parseable when they follow the positional', () => {
+    // Preserves adapter options (--retry) and browser flags (--window) supplied after a leading-dash positional.
     expect(escapeLeadingDashPositional([
       'boss', 'detail', '-xyz',
-      '--retry', '2', '--window', 'foreground', '--warm-tab-ttl', '-1',
+      '--retry', '2', '--window', 'foreground',
     ], manifest)).toEqual([
       'boss', 'detail',
-      '--retry', '2', '--window', 'foreground', '--warm-tab-ttl', '-1',
+      '--retry', '2', '--window', 'foreground',
       '--', '-xyz',
     ]);
   });

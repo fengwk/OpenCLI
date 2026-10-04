@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.8.8-fengwk.4](https://github.com/fengwk/OpenCLI/releases/tag/fork-v1.8.8-fengwk.4) (2026-10-04)
+
+Single-policy context-scoped adapter tab reclamation for CLI `1.8.8-fengwk.4` and Browser Bridge extension `1.0.36`.
+
+### Features & Refactoring
+
+* **single-policy adapter tab lifecycle (`1.8.8-fengwk.4` / extension `1.0.36`)** — removed the legacy per-tab TTL CLI option, runtime/browser/protocol TTL fields, and per-tab Chrome alarm expiry. Standalone OpenCLI no longer auto-expires adapter tabs: releasing an adapter lease only detaches automation state and keeps the page open for later reuse while never sharing an active lease.
+* **explicit context reclamation (`reclaim-adapter-tabs`)** — added capability `adapter-tab-reclaim-v1` (advertised in extension `hello` and daemon `/status`) and action `reclaim-adapter-tabs` (`POST /command` with `contextId`, `surface: "adapter"`, `deadlineAt`, `timeout`). OpenCLI Hub schedules explicit context reclamation when an instance becomes idle; `persistent` (`siteSession: 'persistent'`) and `--keep-tab` adapter tabs are not exempt in Hub reclamation. Surplus owned adapter tabs are closed and the last tab in the dedicated automation window is reset to `about:blank` while preserving the window and profile/cookies.
+* **extension ownership ledger & legacy alarm cleanup** — `adapterTabLedger` persists owned adapter physical tab IDs in `chrome.storage.session` across MV3 service-worker restarts (covering active leases, released tabs, and tabs replaced via `tabs new`). Startup runs a one-time cleanup migration that adopts tab IDs from any legacy per-tab alarms into the ledger and clears those alarms without retaining any TTL expiry fallback. User tabs, borrowed (`bind`) tabs, `browser`-surface tabs, and tabs moved to user windows are never closed.
+
 ## [1.8.4](https://github.com/jackwener/opencli/compare/v1.8.3...v1.8.4) (2026-06-15)
 
 Patch release surfacing the bundled skills directory, expanding the auth subsystem across 50+ adapters, refactoring the extension's tab-group model, and adding ten or so new adapter capabilities.

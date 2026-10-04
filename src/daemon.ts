@@ -52,6 +52,15 @@ import {
   SESSION_RECOVERY_FAILED_CODE,
   type SessionLeaseRecoveryMode,
 } from './session-lease.js';
+import {
+  ADAPTER_TAB_RECLAIM_ACTION,
+  ADAPTER_TAB_RECLAIM_CAPABILITY,
+  evaluateBrowserCommandAdmission,
+  evaluateReclaimAdmission,
+  isAdapterTabReclaimAction,
+  parseExtensionCapabilities,
+  parseReclaimRequest,
+} from './daemon-reclaim.js';
 
 const PORT = DEFAULT_DAEMON_PORT;
 if (!isIgnorableDaemonPortEnv(process.env.OPENCLI_DAEMON_PORT)) {
@@ -66,6 +75,8 @@ type ExtensionProfileConnection = {
   ws: WebSocket;
   extensionVersion: string | null;
   extensionCompatRange: string | null;
+  /** Capabilities advertised by the extension hello for THIS profile. */
+  capabilities: string[];
   lastSeenAt: number;
 };
 
@@ -95,11 +106,23 @@ type PendingEntry = {
   runId?: string;
   /** Recovery fenced this run; late extension results must never revive it. */
   recoveryRevoked?: boolean;
+  /**
+   * Set for reclaim-adapter-tabs entries: while pending, the daemon rejects new
+   * browser commands for this context and removes it from `reclaimingContexts`
+   * when the entry settles.
+   */
+  reclaimContextId?: string;
 };
 const pending = new Map<string, PendingEntry>();
 
 const SESSION_RECOVERY_RESET_TIMEOUT_MS = 5_000;
-const DAEMON_CAPABILITIES = ['session-lease-v1', 'session-recover-v1'] as const;
+const DAEMON_CAPABILITIES = ['session-lease-v1', 'session-recover-v1', ADAPTER_TAB_RECLAIM_CAPABILITY] as const;
+
+/**
+ * Contexts with an in-flight reclaim-adapter-tabs command. New browser commands
+ * for such a context are rejected until the reclaim settles.
+ */
+const reclaimingContexts = new Set<string>();
 
 // One logical write lease per (contextId, surface, persistent site session).
 // Serializes concurrent adapter write commands so a retry can't drive the same
@@ -121,6 +144,19 @@ function pendingCountForRun(runId: string): number {
     if (entry.runId === runId) count++;
   }
   return count;
+}
+
+function pendingCountForContext(contextId: string): number {
+  let count = 0;
+  for (const entry of pending.values()) {
+    if (entry.contextId === contextId) count++;
+  }
+  return count;
+}
+
+/** True when the context holds any logical write lease (active or recovering). */
+function contextHasSessionLease(contextId: string): boolean {
+  return sessionLeaseStatus().some((lease) => lease.contextId === contextId);
 }
 
 /** Conservative owner liveness: only ESRCH proves a CLI run is gone. */
@@ -197,6 +233,8 @@ function isOwnerProcessConfirmedDead(pid: number | null): boolean {
 function settlePending(id: string, entry: PendingEntry, outcome: { data?: unknown; error?: Error }): void {
   clearTimeout(entry.timer);
   pending.delete(id);
+  // The reclaim is over: allow browser commands for this context again.
+  if (entry.reclaimContextId) reclaimingContexts.delete(entry.reclaimContextId);
   // A settling command is proof of holder liveness — restart the TTL clock so
   // an exec that outlived the TTL hands over to normal heartbeats seamlessly.
   if (entry.leaseKey && entry.runId && !entry.recoveryRevoked) {
@@ -365,6 +403,21 @@ function recoverSessionLease(input: SessionRecoveryInput): Promise<SessionRecove
 }
 
 async function performSessionLeaseRecovery(input: SessionRecoveryInput): Promise<SessionRecoveryResponse> {
+  // A reclaim owns the adapter mutation queue; never start the destructive
+  // close-window reset underneath it. Fence nothing and leave the lease intact.
+  if (reclaimingContexts.has(input.contextId)) {
+    return {
+      ok: false,
+      result: 'RESET_FAILED',
+      runId: input.expectedRunId,
+      tabReset: false,
+      cancelledPending: 0,
+      errorCode: 'adapter_tabs_busy',
+      error: `Adapter tab reclamation is in progress for browser profile "${input.contextId}"; session recovery was not started.`,
+      errorHint: 'Retry recovery after the reclaim-adapter-tabs command finishes.',
+    };
+  }
+
   const key = getSessionLeaseKey(input.contextId, input.surface, input.session);
   const transition = sessionLeases.beginRecovery({
     key,
@@ -484,6 +537,7 @@ function registerExtensionConnection(ws: WebSocket, rawContextId: unknown): Exte
     ws,
     extensionVersion: current?.ws === ws ? current.extensionVersion : null,
     extensionCompatRange: current?.ws === ws ? current.extensionCompatRange : null,
+    capabilities: current?.ws === ws ? current.capabilities : [],
     lastSeenAt: Date.now(),
   };
   extensionProfiles.set(contextId, connection);
@@ -579,6 +633,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       extensionConnected: true,
       extensionVersion: profile.extensionVersion ?? undefined,
       extensionCompatRange: profile.extensionCompatRange ?? undefined,
+      capabilities: profile.capabilities,
       pending: [...pending.values()].filter((entry) => entry.contextId === profile.contextId).length,
       lastSeenAt: profile.lastSeenAt,
     }));
@@ -723,6 +778,128 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         return;
       }
 
+      // ─── Sessionless adapter tab reclamation ─────────────────────────
+      // Daemon-local admission plus a WS dispatch to the profile's extension.
+      // The guard (`reclaimingContexts`) is held from acceptance until the
+      // pending entry settles, and the daemon stamps a bounded absolute
+      // deadline so a queued/late extension never closes a fresh task's tabs.
+      if (isAdapterTabReclaimAction(body)) {
+        const now = Date.now();
+        const parsed = parseReclaimRequest(body as Record<string, unknown>, now);
+        if (!parsed.ok) {
+          jsonResponse(res, parsed.failure.status, {
+            id: body.id,
+            ok: false,
+            errorCode: parsed.failure.errorCode,
+            error: parsed.failure.error,
+            errorHint: parsed.failure.errorHint,
+          });
+          return;
+        }
+        const { id, contextId, deadlineAt, timeoutMs } = parsed.request;
+
+        // Same-id transport retry: attach to the reclaim already in flight —
+        // but only when it targets the same context and action. Never re-admit
+        // (the original holds the maintenance guard) and never re-dispatch.
+        const inFlight = pending.get(id);
+        if (inFlight) {
+          if (inFlight.contextId !== contextId || inFlight.action !== ADAPTER_TAB_RECLAIM_ACTION) {
+            jsonResponse(res, 409, {
+              id,
+              ok: false,
+              errorCode: 'command_id_conflict',
+              error: `Command id "${id}" is already in flight for a different context/action.`,
+              errorHint: 'Use a fresh command id for this reclaim-adapter-tabs request.',
+            });
+            return;
+          }
+          const result = await new Promise<unknown>((resolve, reject) => {
+            inFlight.settlers.push({ resolve, reject });
+          });
+          jsonResponse(res, 200, result);
+          return;
+        }
+
+        const reclaimRoute = resolveExtensionConnection(contextId);
+        if (!reclaimRoute.connection) {
+          jsonResponse(res, reclaimRoute.errorCode === 'profile_required' ? 409 : 503, {
+            id,
+            ok: false,
+            errorCode: reclaimRoute.errorCode,
+            error: reclaimRoute.error,
+            ...(reclaimRoute.errorHint ? { errorHint: reclaimRoute.errorHint } : {}),
+          });
+          return;
+        }
+        const admission = evaluateReclaimAdmission({
+          capabilitySupported: reclaimRoute.connection.capabilities.includes(ADAPTER_TAB_RECLAIM_CAPABILITY),
+          sameContextPendingCommands: pendingCountForContext(contextId),
+          sameContextHasLease: contextHasSessionLease(contextId),
+          sameContextReclaiming: reclaimingContexts.has(contextId),
+        });
+        if (!admission.ok) {
+          jsonResponse(res, admission.failure.status, {
+            id,
+            ok: false,
+            errorCode: admission.failure.errorCode,
+            error: admission.failure.error,
+            errorHint: admission.failure.errorHint,
+          });
+          return;
+        }
+
+        // Hold the maintenance guard before dispatch so a racing command for
+        // the same context is rejected from this point until settlement.
+        reclaimingContexts.add(contextId);
+        const result = await new Promise<unknown>((resolve, reject) => {
+          const timer = setTimeout(() => {
+            const entry = pending.get(id);
+            if (!entry) return;
+            settlePending(id, entry, {
+              error: new DaemonCommandFailure(
+                `Adapter tab reclamation exceeded its deadline after ${timeoutMs}ms.`,
+                'reclaim_deadline_exceeded',
+                'Retry reclaim-adapter-tabs with a fresh deadline.',
+                408,
+              ),
+            });
+          }, timeoutMs);
+          const entry: PendingEntry = {
+            contextId,
+            action: ADAPTER_TAB_RECLAIM_ACTION,
+            dispatched: false,
+            settlers: [{ resolve, reject }],
+            timer,
+            reclaimContextId: contextId,
+          };
+          pending.set(id, entry);
+          const failBeforeDispatch = (err: unknown) => {
+            if (pending.get(id) !== entry) return;
+            const failure = buildCommandDispatchFailure(contextId);
+            settlePending(id, entry, {
+              error: new DaemonCommandFailure(failure.message, failure.errorCode, failure.errorHint, failure.status),
+            });
+            log.warn(`[daemon] Failed to dispatch reclaim-adapter-tabs ${id}: ${err instanceof Error ? err.message : String(err)}`);
+          };
+          try {
+            reclaimRoute.connection!.ws.send(JSON.stringify({
+              id,
+              action: ADAPTER_TAB_RECLAIM_ACTION,
+              contextId,
+              surface: 'adapter',
+              deadlineAt,
+            }), (err?: Error) => {
+              if (err && !entry.dispatched) failBeforeDispatch(err);
+            });
+            entry.dispatched = true;
+          } catch (err) {
+            failBeforeDispatch(err);
+          }
+        });
+        jsonResponse(res, 200, result);
+        return;
+      }
+
       const route = resolveExtensionConnection(
         typeof body.contextId === 'string' ? body.contextId : undefined,
         typeof body.preferredContextId === 'string' ? body.preferredContextId : undefined,
@@ -734,6 +911,24 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
           errorCode: route.errorCode,
           error: route.error,
           ...(route.errorHint ? { errorHint: route.errorHint } : {}),
+        });
+        return;
+      }
+
+      // A reclamation owns this context's adapter mutation queue; refuse to
+      // dispatch a racing browser command for the same context. Other contexts
+      // and daemon-local cleanup (lease-release above) are unaffected.
+      const browserAdmission = evaluateBrowserCommandAdmission({
+        contextId: route.connection.contextId,
+        reclaiming: reclaimingContexts.has(route.connection.contextId),
+      });
+      if (!browserAdmission.ok) {
+        jsonResponse(res, browserAdmission.failure.status, {
+          id: body.id,
+          ok: false,
+          errorCode: browserAdmission.failure.errorCode,
+          error: browserAdmission.failure.error,
+          errorHint: browserAdmission.failure.errorHint,
         });
         return;
       }
@@ -950,6 +1145,7 @@ wss.on('connection', (ws: WebSocket) => {
         const connection = registerExtensionConnection(ws, msg.contextId);
         connection.extensionVersion = typeof msg.version === 'string' ? msg.version : null;
         connection.extensionCompatRange = typeof msg.compatRange === 'string' ? msg.compatRange : null;
+        connection.capabilities = parseExtensionCapabilities(msg.capabilities);
         connection.lastSeenAt = Date.now();
         if (connection.extensionVersion) recordExtensionVersion(connection.extensionVersion);
         log.info(`[daemon] Extension profile connected: ${connection.contextId}`);

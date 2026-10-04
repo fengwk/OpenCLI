@@ -56,6 +56,8 @@ export interface BrowserProfileStatus {
   extensionConnected: boolean;
   extensionVersion?: string;
   extensionCompatRange?: string;
+  /** Capabilities this profile's extension advertised in its `hello` handshake. */
+  capabilities?: string[];
   pending: number;
   lastSeenAt?: number;
 }

@@ -148,7 +148,7 @@ Agent 在内部自动处理所有 `opencli browser` 命令——你只需用自�
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `OPENCLI_WINDOW` | 命令默认值 | 设为 `foreground` 或 `background` 来覆盖 Browser Bridge 窗口位置。浏览器型命令也支持 `--window <foreground\|background>` |
-| `OPENCLI_SITE_SESSION` | adapter 默认值 | 设为 `ephemeral` 或 `persistent`，覆盖浏览器型 adapter 命令的 `siteSession` 元数据。`ephemeral` 会在命令结束时关闭一次性自动化窗口；`persistent` 会复用该站点的 session。命令级 `--site-session` 优先。 |
+| `OPENCLI_SITE_SESSION` | adapter 默认值 | 设为 `ephemeral` 或 `persistent`，覆盖浏览器型 adapter 命令的 `siteSession` 元数据。`ephemeral` 会在命令结束时释放独立 tab lease（仅 detach 自动化状态并保留页面供后续复用，不会按 tab 自动过期关闭）；`persistent` 会复用该站点的逻辑 session。命令级 `--site-session` 优先。 |
 | `OPENCLI_BROWSER_CONNECT_TIMEOUT` | `45` | 浏览器连接超时（秒） |
 | `OPENCLI_BROWSER_COMMAND_TIMEOUT` | `60` | 单个浏览器命令超时（秒） |
 | `OPENCLI_CDP_ENDPOINT` | — | Chrome DevTools Protocol 端点，用于远程浏览器或 Electron 应用 |
@@ -158,7 +158,7 @@ Agent 在内部自动处理所有 `opencli browser` 命令——你只需用自�
 
 Browser Bridge daemon 与扩展的通信端口固定为 `localhost:19825`，不再支持通过 `OPENCLI_DAEMON_PORT` 配置自定义端口。
 
-`opencli browser *` 必须紧跟一个 `<session>` 位置参数，默认使用前台窗口，并保留该 session 的 tab lease，直到你手动执行 `opencli browser <session> close` 或等空闲超时。浏览器型 adapter 默认使用后台 adapter 窗口并在命令结束后释放一次性 tab lease；如果需要调试最终页面，可以传 `--window foreground --keep-tab true`。
+`opencli browser *` 必须紧跟一个 `<session>` 位置参数，默认使用前台窗口，并保留该 session 的 tab lease，直到你手动执行 `opencli browser <session> close` 或等空闲超时。浏览器型 adapter 默认使用后台 adapter 窗口并在命令结束后释放一次性逻辑 tab lease；独立运行的 OpenCLI 不会自动按 tab 过期回收页面，释放 adapter lease 仅 detach 自动化状态并保留页面供后续命令复用（租用期间绝不共享）。交互式 adapter 可声明 `siteSession: 'persistent'` 保持稳定逻辑会话；如果需要调试最终页面，可以传 `--window foreground --keep-tab true`。在 OpenCLI Hub 托管下，由 Hub 在实例空闲时按 context 显式调度 `reclaim-adapter-tabs` 统一回收该 profile 下的自有 adapter 标签页（`persistent` 与 `--keep-tab` 在 Hub 回收中不豁免，用户/借用标签页与 `browser` surface 标签页绝不关闭）。
 
 ## 内置命令
 

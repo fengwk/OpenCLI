@@ -21,6 +21,18 @@ Use it when merging back to mainline or rebasing onto upstream.
 
 ## Changelog (fork)
 
+### 2026-10-04
+
+#### Single-policy context-scoped adapter tab reclamation
+
+Paired as CLI `1.8.8-fengwk.4` and extension `1.0.36` in `fork-v1.8.8-fengwk.4`; both must be updated together for capability `adapter-tab-reclaim-v1` and action `reclaim-adapter-tabs` (also includes CLI `1.8.8-fengwk.3` ChatGPT active composer form submit fix).
+
+| Area | Change | Paths |
+|------|--------|-------|
+| single-policy adapter tab lifecycle | Removed the legacy per-tab TTL CLI option, runtime/browser/protocol TTL fields, and per-tab Chrome alarm expiry. Standalone OpenCLI no longer auto-expires adapter tabs: releasing an adapter lease only detaches automation state and keeps the page open for later reuse while never sharing an active lease. | `src/commanderAdapter.ts`, `src/cli-argv-preprocess.ts`, `src/execution.ts`, `src/help.ts`, `src/runtime.ts`, `src/browser/`, `extension/src/protocol.ts`, `extension/src/background.ts` |
+| explicit context reclaim (`reclaim-adapter-tabs`) | Added daemon & extension capability `adapter-tab-reclaim-v1` and action `reclaim-adapter-tabs` (`POST /command` with `{id, action: "reclaim-adapter-tabs", contextId, surface: "adapter", deadlineAt, timeout}`). OpenCLI Hub schedules explicit context-scoped reclamation when an instance is idle; `persistent` (`siteSession: 'persistent'`) and `--keep-tab` adapter tabs are **not** exempt in Hub reclamation. Surplus owned adapter tabs are closed and the last tab in the dedicated automation window is reset to `about:blank` while preserving the window and profile/cookies. | `src/daemon.ts`, `src/daemon-reclaim.ts`, `extension/src/protocol.ts`, `extension/src/background.ts` |
+| ownership ledger & legacy alarm cleanup | `adapterTabLedger` persists owned adapter physical tab IDs in `chrome.storage.session` across MV3 service-worker restarts (covering active leases, released tabs, and tabs replaced via `tabs new`). Startup performs a one-time cleanup migration that adopts tab IDs from any legacy `opencli:warm-tab:<tabId>` alarms into the ledger and clears those alarms (cleanup only, no TTL fallback). User tabs, borrowed (`bind`) tabs, `browser`-surface tabs, and tabs moved to user windows are never closed. | `extension/src/background.ts`, `extension/src/background.test.ts` |
+
 ### 2026-09-25
 
 #### HTTP SSE stream capture
@@ -50,14 +62,14 @@ This release includes upstream `origin/main` at `8271afc67e8504bda94c147f446ee29
 | e2e tolerance | Added network restriction / timeout skip guards for dictionary public API e2e tests. | `tests/e2e/public-commands.test.ts` |
 | website dispatch | Added secret check to avoid failing website rebuild dispatch in fork repos. | `.github/workflows/docs.yml` |
 
-#### Configurable warm-tab reclamation
+#### Configurable per-tab reclamation (historical; superseded)
 
-Released as CLI `1.8.7-fengwk.12` with paired extension `1.0.33`.
+Released as CLI `1.8.7-fengwk.12` with paired extension `1.0.33`; superseded by the single-policy `reclaim-adapter-tabs` architecture in CLI `1.8.8-fengwk.4` / extension `1.0.36`.
 
 | Area | Change | Paths |
 |------|--------|-------|
-| warm-tab TTL | Browser-backed adapter commands accept `--warm-tab-ttl <seconds>` with `-1` (never reclaim), `0` (immediate reclaim), and positive-second semantics; the default is 1800 seconds. | `src/commanderAdapter.ts`, `src/execution.ts`, `src/browser/` |
-| MV3 reclamation | Released ephemeral adapter tabs use one-shot Chrome alarms keyed by physical tab ID. Expiry closes surplus tabs or resets the last automation tab to `about:blank`; active leases and persistent sessions are protected. | `extension/src/background.ts`, `extension/src/protocol.ts` |
+| per-tab TTL (removed in `1.8.8-fengwk.4`) | Historical per-command adapter tab TTL option and protocol field; removed in favor of explicit context-scoped `reclaim-adapter-tabs` scheduled by OpenCLI Hub. | `src/commanderAdapter.ts`, `src/execution.ts`, `src/browser/` |
+| MV3 alarm expiry (removed in `1.0.36`) | Historical one-shot Chrome alarms keyed by physical tab ID; replaced by `adapterTabLedger` ownership tracking plus one-time startup alarm cleanup migration. | `extension/src/background.ts`, `extension/src/protocol.ts` |
 
 ### 2026-09-02
 
@@ -143,8 +155,8 @@ CLI `1.8.7-fengwk.9` and extension `1.0.30`.
 
 | Component | Version |
 |-----------|---------|
-| CLI (`@jackwener/opencli`) | `1.8.8-fengwk.2` |
-| Extension | `1.0.35` (`compatRange`: `>=1.8.7`) |
+| CLI (`@jackwener/opencli`) | `1.8.8-fengwk.4` (paired tag: `fork-v1.8.8-fengwk.4`) |
+| Extension | `1.0.36` (`compatRange`: `>=1.8.7`) |
 
 ### Auto-update policy (fork)
 
@@ -199,15 +211,15 @@ npm ci
 
 Artifacts (version-based names, no timestamps):
 
-- `jackwener-opencli-1.8.7-fengwk.12.tgz`
-- `opencli-extension-v1.0.33.zip`
+- `jackwener-opencli-1.8.8-fengwk.4.tgz`
+- `opencli-extension-v1.0.36.zip`
 - `SHA256SUMS`
 - `build-info.json`
 
 ```bash
 # install CLI from the tarball (not npm publish)
-npm install -g ./artifacts/jackwener-opencli-1.8.7-fengwk.12.tgz
-opencli --version   # → 1.8.7-fengwk.12
+npm install -g ./artifacts/jackwener-opencli-1.8.8-fengwk.4.tgz
+opencli --version   # → 1.8.8-fengwk.4
 
 # plugin
 opencli plugin install ~/proj/my-opencli/packages/chatgpt-agent
@@ -217,6 +229,6 @@ opencli chatgpt-agent ask --help
 ### GitHub fork release
 
 1. Ensure `package.json` version is `X` and commit any regenerated `cli-manifest.json` / `extension/dist`.
-2. Tag exactly `fork-vX` (example: `fork-v1.8.7-fengwk.11`) and push the tag.
+2. Tag exactly `fork-vX` (example: `fork-v1.8.8-fengwk.4`) and push the tag.
 3. Workflow `Fork Release` packages, uploads the Actions artifact bundle, and attaches tgz/zip/SHA256SUMS/build-info.json to the GitHub Release.
 4. Never runs `npm publish` or upstream website dispatch jobs.

@@ -222,6 +222,7 @@ function createChromeMock() {
     alarms: {
       create: vi.fn(),
       clear: vi.fn(),
+      getAll: vi.fn(async () => []),
       onAlarm: { addListener: vi.fn() } as Listener<(alarm: { name: string }) => void>,
     },
     storage: {
@@ -1622,7 +1623,8 @@ describe('background tab isolation', () => {
     expect(mod.__test__.getSession(adapterKey('twitter'))).toBeNull();
   });
 
-  it('reuses a retained warm tab after restoring an adapter container with no stored leases', async () => {
+  it('reuses a registered released adapter tab after restoring a container with no leases', async () => {
+    // Released pages require persisted ownership, not just window membership.
     const { chrome, tabs, groups } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
     await chrome.storage.session.set({
@@ -1631,6 +1633,7 @@ describe('background tab isolation', () => {
         contextId: 'user-default',
         ownedContainers: { interactive: { windowId: null }, automation: { windowId: 1 } },
         leases: {},
+        adapterTabIds: [1],
       },
     });
 
@@ -1673,7 +1676,6 @@ describe('background tab isolation', () => {
             windowRole: 'automation',
             idleDeadlineAt: deadline,
             updatedAt: now,
-            warmTabTtlSeconds: 77,
           },
           [browserKey('default')]: {
             windowId: 2,
@@ -1722,9 +1724,10 @@ describe('background tab isolation', () => {
       session: 'twitter',
       surface: 'adapter',
     });
-    expect(chrome.alarms.create).toHaveBeenCalledWith('opencli:warm-tab:1', {
-      when: now + 77_000,
-    });
+    // The released ephemeral adapter tab is retained for reuse and stays
+    // registered in the ownership ledger for the explicit reclaim API.
+    expect(mod.__test__.getSession(adapterKey('twitter'))).toBeNull();
+    expect(mod.__test__.getAdapterTabLedger()).toContain(1);
   });
 
   it('honors the persisted remaining idle lifetime on reconcile instead of granting a fresh full timeout', async () => {
@@ -2024,7 +2027,8 @@ describe('background tab isolation', () => {
     expect(chrome.tabGroups.update).not.toHaveBeenCalled();
   });
 
-  it('prefers an exact warm target in a restored adapter container', async () => {
+  it('prefers an exact registered target in a restored adapter container', async () => {
+    // Both released pages have ownership records across worker recovery.
     const { chrome, tabs } = createChromeMock();
     tabs.push({
       id: 77,
@@ -2042,6 +2046,7 @@ describe('background tab isolation', () => {
         contextId: 'user-default',
         ownedContainers: { interactive: { windowId: null }, automation: { windowId: 1 } },
         leases: {},
+        adapterTabIds: [1, 77],
       },
     });
 
@@ -2872,49 +2877,10 @@ describe('background tab isolation', () => {
     expect(leftover).toBeUndefined();
   });
 
-  describe('warm-tab-ttl lifecycle and expiry', () => {
-    it('defensively validates warmTabTtl parameter on commands without modifying lease state', async () => {
-      const { chrome } = createChromeMock();
-      vi.stubGlobal('chrome', chrome);
-      const mod = await import('./background');
-
-      // Valid values in [-1, 2147483647]
-      const res60 = await mod.__test__.handleCommand({ id: 'c1', action: 'close-window', session: 'val-test', surface: 'adapter', warmTabTtl: 60 });
-      expect(res60.ok).toBe(true);
-
-      const res0 = await mod.__test__.handleCommand({ id: 'c2', action: 'close-window', session: 'val-test', surface: 'adapter', warmTabTtl: 0 });
-      expect(res0.ok).toBe(true);
-
-      const resNeg1 = await mod.__test__.handleCommand({ id: 'c3', action: 'close-window', session: 'val-test', surface: 'adapter', warmTabTtl: -1 });
-      expect(resNeg1.ok).toBe(true);
-
-      const resMax = await mod.__test__.handleCommand({ id: 'c4', action: 'close-window', session: 'val-test', surface: 'adapter', warmTabTtl: mod.__test__.MAX_WARM_TAB_TTL_SECONDS });
-      expect(resMax.ok).toBe(true);
-
-      // Invalid values reject and do not modify lease state
-      const badSession = 'invalid-state-check';
-      const badKey = adapterKey(badSession);
-
-      const resNeg2 = await mod.__test__.handleCommand({ id: 'c5', action: 'close-window', session: badSession, surface: 'adapter', warmTabTtl: -2 });
-      expect(resNeg2.ok).toBe(false);
-      expect(resNeg2.errorCode).toBe('invalid_warm_tab_ttl');
-      expect(resNeg2.error).toContain('warmTabTtl must be an integer between -1 and 2147483647');
-      expect(mod.__test__.getWarmTabTtlSeconds(badKey)).toBe(1800);
-
-      const resOverflow = await mod.__test__.handleCommand({ id: 'c6', action: 'close-window', session: badSession, surface: 'adapter', warmTabTtl: mod.__test__.MAX_WARM_TAB_TTL_SECONDS + 1 });
-      expect(resOverflow.ok).toBe(false);
-      expect(resOverflow.errorCode).toBe('invalid_warm_tab_ttl');
-
-      const resFrac = await mod.__test__.handleCommand({ id: 'c7', action: 'close-window', session: badSession, surface: 'adapter', warmTabTtl: 1.5 });
-      expect(resFrac.ok).toBe(false);
-      expect(resFrac.errorCode).toBe('invalid_warm_tab_ttl');
-
-      const resStr = await mod.__test__.handleCommand({ id: 'c8', action: 'close-window', session: badSession, surface: 'adapter', warmTabTtl: 'bad' as any });
-      expect(resStr.ok).toBe(false);
-      expect(resStr.errorCode).toBe('invalid_warm_tab_ttl');
-    });
-
-    it('parses only canonical non-negative decimal physical tab ids from alarm names', async () => {
+  describe('adapter tab ownership ledger and reclaim', () => {
+    it('parses only canonical non-negative decimal physical tab ids from legacy warm alarm names', async () => {
+      // Guards the one-time migration parser: malformed names must never be
+      // turned into a tab id (which could reclaim an unrelated tab).
       const { chrome } = createChromeMock();
       vi.stubGlobal('chrome', chrome);
       const mod = await import('./background');
@@ -2931,44 +2897,129 @@ describe('background tab isolation', () => {
       expect(mod.__test__.tabIdFromWarmTabAlarmName('opencli:lease-idle:foo')).toBeNull();
     });
 
-    it('schedules default 1800s warm-tab alarm on ephemeral release when TTL omitted', async () => {
+    it('migrates legacy warm alarms into the ledger and leaves unrelated alarms untouched', async () => {
+      const { chrome } = createChromeMock();
+      chrome.alarms.getAll = vi.fn(async () => [
+        { name: 'opencli:warm-tab:5' },
+        { name: 'opencli:warm-tab:not-a-tab' },
+        { name: 'keepalive' },
+        { name: 'opencli:lease-idle:x' },
+      ]) as any;
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+      await mod.__test__.reconcileTargetLeaseRegistry();
+
+      expect(mod.__test__.getAdapterTabLedger()).toContain(5);
+      // Only the warm prefix is cleared; keepalive and live idle-lease alarms survive.
+      expect(chrome.alarms.clear).toHaveBeenCalledWith('opencli:warm-tab:5');
+      expect(chrome.alarms.clear).not.toHaveBeenCalledWith('keepalive');
+      expect(chrome.alarms.clear).not.toHaveBeenCalledWith('opencli:lease-idle:x');
+    });
+
+    it('registers owned adapter tabs and keeps released tabs in the ledger for later reclaim', async () => {
       const { chrome } = createChromeMock();
       vi.stubGlobal('chrome', chrome);
       const mod = await import('./background');
 
-      const now = 1700000000000;
-      vi.spyOn(Date, 'now').mockReturnValue(now);
-
       await mod.__test__.handleCommand({
-        id: 'ephemeral-nav',
-        action: 'navigate',
-        session: 'ephemeral-default',
-        surface: 'adapter',
-        siteSession: 'ephemeral',
-        url: 'https://example.com/',
+        id: 'nav-ledger', action: 'navigate', session: 'ledger', surface: 'adapter',
+        siteSession: 'ephemeral', url: 'https://a.example/',
       });
-      const tabId = mod.__test__.getSession(adapterKey('ephemeral-default'))?.preferredTabId;
+      const tabId = mod.__test__.getSession(adapterKey('ledger'))?.preferredTabId;
       expect(tabId).toBeDefined();
+      expect(mod.__test__.getAdapterTabLedger()).toContain(tabId);
 
-      chrome.alarms.create.mockClear();
-
-      await mod.__test__.handleCommand({
-        id: 'ephemeral-close',
-        action: 'close-window',
-        session: 'ephemeral-default',
-        surface: 'adapter',
-      });
-
-      const expectedAlarmName = `opencli:warm-tab:${tabId}`;
-      expect(chrome.alarms.create).toHaveBeenCalledWith(expectedAlarmName, {
-        when: now + 1800 * 1000,
-      });
-      expect(mod.__test__.getSession(adapterKey('ephemeral-default'))).toBeNull();
+      await mod.__test__.handleCommand({ id: 'close-ledger', action: 'close-window', session: 'ledger', surface: 'adapter' });
+      expect(mod.__test__.getSession(adapterKey('ledger'))).toBeNull();
+      // Released tab stays open and reclaimable; no warm alarm/timer closes it.
+      expect(mod.__test__.getAdapterTabLedger()).toContain(tabId);
     });
 
-    it('expires an alarm-owned warm tab after service-worker recovery without a lease cache', async () => {
-      const { chrome, tabs, update } = createChromeMock();
-      tabs.splice(1);
+    it('keeps a persistent adapter tab open and registered on idle release', async () => {
+      const { chrome, tabs } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+
+      await mod.__test__.handleCommand({
+        id: 'nav-pers', action: 'navigate', session: 'pers', surface: 'adapter',
+        siteSession: 'persistent', url: 'https://chatgpt.com/',
+      });
+      const tabId = mod.__test__.getSession(adapterKey('pers'))?.preferredTabId;
+      expect(tabId).toBeDefined();
+      tabs.length = 0;
+      tabs.push({ id: tabId!, windowId: 1, url: 'https://chatgpt.com/', active: true, status: 'complete', groupId: -1 });
+      chrome.tabs.remove.mockClear();
+
+      // Idle release (here via the lease-idle alarm) must not close the tab.
+      const onAlarmListener = chrome.alarms.onAlarm.addListener.mock.calls[0][0];
+      await onAlarmListener({ name: `opencli:lease-idle:${encodeURIComponent(adapterKey('pers'))}` });
+
+      expect(chrome.tabs.remove).not.toHaveBeenCalled();
+      expect(tabs.some((t) => t.id === tabId)).toBe(true);
+      expect(mod.__test__.getAdapterTabLedger()).toContain(tabId);
+      expect(mod.__test__.getSession(adapterKey('pers'))).toBeNull();
+    });
+
+    it('reclaims all owned adapter tabs, releases leases, keeps one blank placeholder, and leaves foreign tabs alone', async () => {
+      const { chrome, tabs } = createChromeMock();
+      chrome.tabs.remove.mockImplementation(async (removeTabId: number) => {
+        const idx = tabs.findIndex((t) => t.id === removeTabId);
+        if (idx !== -1) tabs.splice(idx, 1);
+      });
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+
+      await mod.__test__.handleCommand({
+        id: 'n1', action: 'navigate', session: 's1', surface: 'adapter', siteSession: 'ephemeral', url: 'https://a.example/',
+      });
+      await mod.__test__.handleCommand({
+        id: 'n2', action: 'navigate', session: 's2', surface: 'adapter', siteSession: 'ephemeral', url: 'https://b.example/',
+      });
+      const adapterIds = mod.__test__.getAdapterTabLedger();
+      expect(adapterIds.length).toBe(2);
+
+      // A browser-surface lease on a user tab and an adapter-ledger tab moved to
+      // a user window must both survive reclamation.
+      mod.__test__.setSession(browserKey('browsersess'), { windowId: 2, owned: true, preferredTabId: 2 });
+      mod.__test__.registerAdapterTab(adapterKey('moved'), 99);
+      tabs.length = 0;
+      tabs.push(
+        { id: adapterIds[0], windowId: 1, url: 'https://a.example/', active: false, status: 'complete', groupId: -1 },
+        { id: adapterIds[1], windowId: 1, url: 'https://b.example/', active: true, status: 'complete', groupId: -1 },
+        { id: 99, windowId: 2, url: 'https://moved.example/', active: true, status: 'complete', groupId: -1 },
+        { id: 2, windowId: 2, url: 'https://user.example/', active: true, status: 'complete', groupId: -1 },
+      );
+
+      const res = await mod.__test__.handleReclaimAdapterTabs({
+        id: 'r1', action: 'reclaim-adapter-tabs', deadlineAt: Date.now() + 5000,
+      });
+      expect(res.ok).toBe(true);
+      expect(res.data).toEqual({ closedTabs: 1, resetTabs: 1 });
+      // Adapter window survives with a single about:blank placeholder.
+      expect(tabs.filter((t) => t.windowId === 1)).toHaveLength(1);
+      expect(tabs.find((t) => t.windowId === 1)?.url).toBe('about:blank');
+      // Leases released and the ownership ledger drained.
+      expect(mod.__test__.getSession(adapterKey('s1'))).toBeNull();
+      expect(mod.__test__.getSession(adapterKey('s2'))).toBeNull();
+      expect(mod.__test__.getAdapterTabLedger()).toEqual([]);
+      // The user tab and the moved tab are untouched.
+      expect(chrome.tabs.remove).not.toHaveBeenCalledWith(2);
+      expect(chrome.tabs.remove).not.toHaveBeenCalledWith(99);
+      expect(tabs.some((t) => t.id === 2)).toBe(true);
+      expect(tabs.some((t) => t.id === 99)).toBe(true);
+    });
+
+    it('reclaims a released/orphan adapter tab after service-worker recovery from the persisted ledger', async () => {
+      const { chrome, tabs } = createChromeMock();
+      chrome.tabs.remove.mockImplementation(async (removeTabId: number) => {
+        const idx = tabs.findIndex((t) => t.id === removeTabId);
+        if (idx !== -1) tabs.splice(idx, 1);
+      });
+      tabs.length = 0;
+      tabs.push(
+        { id: 1, windowId: 1, url: 'https://released.example/', active: false, status: 'complete', groupId: -1 },
+        { id: 10, windowId: 1, url: 'about:blank', active: true, status: 'complete', groupId: -1 },
+      );
       vi.stubGlobal('chrome', chrome);
       await chrome.storage.session.set({
         opencli_target_lease_registry_v2: {
@@ -2976,319 +3027,603 @@ describe('background tab isolation', () => {
           contextId: 'user-default',
           ownedContainers: { interactive: { windowId: null, groupIds: [] }, automation: { windowId: 1 } },
           leases: {},
+          adapterTabIds: [1, 10],
         },
       });
-      await import('./background');
 
-      const onAlarmListener = chrome.alarms.onAlarm.addListener.mock.calls[0][0];
-      await onAlarmListener({ name: 'opencli:warm-tab:1' });
-
-      expect(update).toHaveBeenCalledWith(1, { url: 'about:blank' });
-    });
-
-    it('schedules custom TTL warm-tab alarm with last-release-wins across session reuse', async () => {
-      const { chrome } = createChromeMock();
-      vi.stubGlobal('chrome', chrome);
       const mod = await import('./background');
+      await mod.__test__.reconcileTargetLeaseRegistry();
+      expect([...mod.__test__.getAdapterTabLedger()].sort((a, b) => a - b)).toEqual([1, 10]);
 
-      const now = 1700000000000;
-      vi.spyOn(Date, 'now').mockReturnValue(now);
-
-      // Session A opens ephemeral adapter lease with 300s TTL
-      await mod.__test__.handleCommand({
-        id: 'nav-a',
-        action: 'navigate',
-        session: 'session-a',
-        surface: 'adapter',
-        siteSession: 'ephemeral',
-        url: 'https://a.example/',
-        warmTabTtl: 300,
+      const res = await mod.__test__.handleReclaimAdapterTabs({
+        id: 'recover', action: 'reclaim-adapter-tabs', deadlineAt: Date.now() + 5000,
       });
-      const tabId = mod.__test__.getSession(adapterKey('session-a'))?.preferredTabId;
-      expect(tabId).toBeDefined();
-      await vi.waitFor(async () => {
-        const stored = await chrome.storage.session.get('opencli_target_lease_registry_v2') as Record<string, any>;
-        expect(stored.opencli_target_lease_registry_v2.leases[adapterKey('session-a')].warmTabTtlSeconds).toBe(300);
-      });
-
-      chrome.alarms.create.mockClear();
-      chrome.alarms.clear.mockClear();
-
-      // Session A releases tab, scheduling alarm at now + 300s
-      await mod.__test__.handleCommand({
-        id: 'close-a',
-        action: 'close-window',
-        session: 'session-a',
-        surface: 'adapter',
-      });
-
-      const expectedAlarmName = `opencli:warm-tab:${tabId}`;
-      expect(chrome.alarms.create).toHaveBeenCalledWith(expectedAlarmName, {
-        when: now + 300 * 1000,
-      });
-      expect(mod.__test__.getSession(adapterKey('session-a'))).toBeNull();
-
-      chrome.alarms.create.mockClear();
-      chrome.alarms.clear.mockClear();
-
-      // Session B claims the reusable tab, clearing Session A's warm alarm
-      await mod.__test__.handleCommand({
-        id: 'nav-b',
-        action: 'navigate',
-        session: 'session-b',
-        surface: 'adapter',
-        siteSession: 'ephemeral',
-        url: 'https://b.example/',
-        warmTabTtl: 60,
-      });
-
-      expect(chrome.alarms.clear).toHaveBeenCalledWith(expectedAlarmName);
-      expect(mod.__test__.getSession(adapterKey('session-b'))?.preferredTabId).toBe(tabId);
-
-      chrome.alarms.create.mockClear();
-
-      // Session B releases the tab with 60s TTL; new alarm scheduled at later + 60s
-      const later = now + 10000;
-      vi.spyOn(Date, 'now').mockReturnValue(later);
-
-      await mod.__test__.handleCommand({
-        id: 'close-b',
-        action: 'close-window',
-        session: 'session-b',
-        surface: 'adapter',
-      });
-
-      expect(chrome.alarms.create).toHaveBeenCalledWith(expectedAlarmName, {
-        when: later + 60 * 1000,
-      });
+      expect(res.ok).toBe(true);
+      expect(res.data).toEqual({ closedTabs: 1, resetTabs: 1 });
+      expect(tabs.filter((t) => t.windowId === 1)).toHaveLength(1);
+      expect(tabs.find((t) => t.windowId === 1)?.url).toBe('about:blank');
     });
 
-    it('clears warm alarm and does not schedule when TTL is -1', async () => {
-      const { chrome } = createChromeMock();
-      vi.stubGlobal('chrome', chrome);
-      const mod = await import('./background');
-
-      await mod.__test__.handleCommand({
-        id: 'nav-neg1',
-        action: 'navigate',
-        session: 'ephemeral-neg1',
-        surface: 'adapter',
-        siteSession: 'ephemeral',
-        url: 'https://example.com/',
-      });
-      const tabId = mod.__test__.getSession(adapterKey('ephemeral-neg1'))?.preferredTabId;
-
-      chrome.alarms.create.mockClear();
-      chrome.alarms.clear.mockClear();
-
-      await mod.__test__.handleCommand({
-        id: 'close-neg1',
-        action: 'close-window',
-        session: 'ephemeral-neg1',
-        surface: 'adapter',
-        warmTabTtl: -1,
-      });
-
-      expect(chrome.alarms.clear).toHaveBeenCalledWith(`opencli:warm-tab:${tabId}`);
-      const warmAlarmCalls = chrome.alarms.create.mock.calls.filter((c: any[]) =>
-        typeof c[0] === 'string' && c[0].startsWith('opencli:warm-tab:'),
-      );
-      expect(warmAlarmCalls).toHaveLength(0);
-    });
-
-    it('immediately expires warm tab without deadlock when TTL is 0', async () => {
+    it('aborts a reclaim whose absolute deadline has already passed without closing anything', async () => {
       const { chrome, tabs } = createChromeMock();
       vi.stubGlobal('chrome', chrome);
       const mod = await import('./background');
 
       await mod.__test__.handleCommand({
-        id: 'nav-first',
-        action: 'navigate',
-        session: 'first',
-        surface: 'adapter',
-        siteSession: 'ephemeral',
-        url: 'https://example.com/1',
+        id: 'dn', action: 'navigate', session: 'dl', surface: 'adapter', siteSession: 'ephemeral', url: 'https://a.example/',
       });
-      const firstTabId = mod.__test__.getSession(adapterKey('first'))?.preferredTabId;
+      const tabId = mod.__test__.getSession(adapterKey('dl'))?.preferredTabId!;
+      tabs.length = 0;
+      tabs.push({ id: tabId, windowId: 1, url: 'https://a.example/', active: true, status: 'complete', groupId: -1 });
 
-      // Add a second tab to automation window so firstTabId is not the last tab
-      await chrome.tabs.create({ windowId: 1, url: 'https://example.com/2', active: true });
-
-      chrome.tabs.remove.mockClear();
-      chrome.alarms.clear.mockClear();
-
-      await mod.__test__.handleCommand({
-        id: 'close-zero',
-        action: 'close-window',
-        session: 'first',
-        surface: 'adapter',
-        warmTabTtl: 0,
+      const res = await mod.__test__.handleReclaimAdapterTabs({
+        id: 'rd', action: 'reclaim-adapter-tabs', deadlineAt: Date.now() - 1,
       });
-
-      expect(chrome.alarms.clear).toHaveBeenCalledWith(`opencli:warm-tab:${firstTabId}`);
-      expect(chrome.tabs.remove).toHaveBeenCalledWith(firstTabId);
+      expect(res.ok).toBe(false);
+      expect(res.errorCode).toBe('reclaim_deadline_exceeded');
+      // Ledger + lease retained so the reclaim can be retried.
+      expect(mod.__test__.getAdapterTabLedger()).toContain(tabId);
+      expect(mod.__test__.getSession(adapterKey('dl'))).not.toBeNull();
+      expect(chrome.tabs.remove).not.toHaveBeenCalled();
+      expect(chrome.tabs.update).not.toHaveBeenCalledWith(tabId, { url: 'about:blank' });
     });
 
-    it('cancels stale warm alarm when physical tab is claimed in setLeaseSession', async () => {
+    it('rejects a reclaim without a finite integer absolute deadline instead of restarting the clock', async () => {
+      const { chrome } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+
+      const missing = await mod.__test__.handleReclaimAdapterTabs({ id: 'r-missing', action: 'reclaim-adapter-tabs' });
+      expect(missing.ok).toBe(false);
+      expect(missing.errorCode).toBe('reclaim_failed');
+
+      const infinite = await mod.__test__.handleReclaimAdapterTabs({
+        id: 'r-inf', action: 'reclaim-adapter-tabs', deadlineAt: Number.POSITIVE_INFINITY,
+      });
+      expect(infinite.ok).toBe(false);
+      expect(infinite.errorCode).toBe('reclaim_failed');
+    });
+
+    it('keeps ownership and lease state and reports failure when a tab cannot be removed', async () => {
       const { chrome } = createChromeMock();
       vi.stubGlobal('chrome', chrome);
       const mod = await import('./background');
 
       await mod.__test__.handleCommand({
-        id: 'nav-reuse',
-        action: 'navigate',
-        session: 'reuse-1',
-        surface: 'adapter',
-        siteSession: 'ephemeral',
-        url: 'https://example.com/',
-        warmTabTtl: 100,
+        id: 'f1', action: 'navigate', session: 'f1', surface: 'adapter', siteSession: 'ephemeral', url: 'https://a.example/',
       });
-      const tabId = mod.__test__.getSession(adapterKey('reuse-1'))?.preferredTabId;
-
       await mod.__test__.handleCommand({
-        id: 'close-reuse',
-        action: 'close-window',
-        session: 'reuse-1',
-        surface: 'adapter',
+        id: 'f2', action: 'navigate', session: 'f2', surface: 'adapter', siteSession: 'ephemeral', url: 'https://b.example/',
       });
+      const ledgerBefore = [...mod.__test__.getAdapterTabLedger()].sort((a, b) => a - b);
+      expect(ledgerBefore.length).toBe(2);
 
-      chrome.alarms.clear.mockClear();
-
-      // Another session claims the tabId directly
-      mod.__test__.setSession(adapterKey('reuse-2'), {
-        windowId: 1,
-        owned: true,
-        preferredTabId: tabId!,
+      chrome.tabs.remove.mockImplementation(async () => { throw new Error('boom'); });
+      const res = await mod.__test__.handleReclaimAdapterTabs({
+        id: 'rf', action: 'reclaim-adapter-tabs', deadlineAt: Date.now() + 5000,
       });
-
-      expect(chrome.alarms.clear).toHaveBeenCalledWith(`opencli:warm-tab:${tabId}`);
+      expect(res.ok).toBe(false);
+      expect(res.errorCode).toBe('reclaim_failed');
+      expect([...mod.__test__.getAdapterTabLedger()].sort((a, b) => a - b)).toEqual(ledgerBefore);
+      expect(mod.__test__.getSession(adapterKey('f1'))).not.toBeNull();
+      expect(mod.__test__.getSession(adapterKey('f2'))).not.toBeNull();
     });
 
-    it('ensures active and new leases survive stale warm alarms', async () => {
-      const { chrome, update } = createChromeMock();
+    it('treats a non-"missing" tab inspection error as retryable and keeps the ledger', async () => {
+      const { chrome, tabs } = createChromeMock();
       vi.stubGlobal('chrome', chrome);
       const mod = await import('./background');
 
       await mod.__test__.handleCommand({
-        id: 'nav-survive',
-        action: 'navigate',
-        session: 'active-session',
-        surface: 'adapter',
-        siteSession: 'ephemeral',
-        url: 'https://active.example/',
+        id: 'g1', action: 'navigate', session: 'g1', surface: 'adapter', siteSession: 'ephemeral', url: 'https://a.example/',
       });
-      const activeTabId = mod.__test__.getSession(adapterKey('active-session'))?.preferredTabId!;
-
-      chrome.tabs.remove.mockClear();
-      update.mockClear();
-
-      // Trigger warm alarm for the active tab
-      const onAlarmListener = chrome.alarms.onAlarm.addListener.mock.calls[0][0];
-      await onAlarmListener({ name: `opencli:warm-tab:${activeTabId}` });
-
-      expect(chrome.tabs.remove).not.toHaveBeenCalled();
-      expect(update).not.toHaveBeenCalled();
-      expect(mod.__test__.getSession(adapterKey('active-session'))).not.toBeNull();
-    });
-
-    it('converges multiple expired warm tabs to one about:blank placeholder', async () => {
-      const { chrome, tabs, update } = createChromeMock();
-      vi.stubGlobal('chrome', chrome);
-      const mod = await import('./background');
-
-      await mod.__test__.resolveTabId(undefined, adapterKey('init'));
-      await mod.__test__.handleCommand({ id: 'c', action: 'close-window', session: 'init', surface: 'adapter' });
-
-      // Construct three unleased warm tabs in the container
+      const tabId = mod.__test__.getSession(adapterKey('g1'))?.preferredTabId!;
       tabs.length = 0;
-      tabs.push(
-        { id: 10, windowId: 1, url: 'https://site1.example', active: false, status: 'complete', groupId: -1 },
-        { id: 20, windowId: 1, url: 'https://site2.example', active: false, status: 'complete', groupId: -1 },
-        { id: 30, windowId: 1, url: 'https://site3.example', active: true, status: 'complete', groupId: -1 },
-      );
+      tabs.push({ id: tabId, windowId: 1, url: 'https://a.example/', active: true, status: 'complete', groupId: -1 });
+
+      const originalGet = chrome.tabs.get.getMockImplementation()!;
+      chrome.tabs.get.mockImplementation(async (id: number) => {
+        if (id === tabId) throw new Error('tabs API temporarily unavailable');
+        return originalGet(id);
+      });
+
+      const res = await mod.__test__.handleReclaimAdapterTabs({
+        id: 'rg', action: 'reclaim-adapter-tabs', deadlineAt: Date.now() + 5000,
+      });
+      expect(res.ok).toBe(false);
+      expect(res.errorCode).toBe('reclaim_failed');
+      expect(mod.__test__.getAdapterTabLedger()).toContain(tabId);
+      expect(chrome.tabs.remove).not.toHaveBeenCalled();
+    });
+
+    it('protects a borrowed tab even when it is still in the adapter ledger', async () => {
+      const { chrome, tabs } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+
+      await mod.__test__.handleCommand({
+        id: 'b1', action: 'navigate', session: 'b1', surface: 'adapter', siteSession: 'ephemeral', url: 'https://a.example/',
+      });
+      const tabId = mod.__test__.getSession(adapterKey('b1'))?.preferredTabId!;
+      // The same physical tab is also bound to a browser session (borrowed).
+      mod.__test__.setSession(browserKey('user'), { windowId: 1, owned: false, preferredTabId: tabId });
+      tabs.length = 0;
+      tabs.push({ id: tabId, windowId: 1, url: 'https://a.example/', active: true, status: 'complete', groupId: -1 });
+
+      const res = await mod.__test__.handleReclaimAdapterTabs({
+        id: 'rb', action: 'reclaim-adapter-tabs', deadlineAt: Date.now() + 5000,
+      });
+      expect(res.ok).toBe(true);
+      expect(chrome.tabs.remove).not.toHaveBeenCalled();
+      // The borrowed lease is never deleted by adapter cleanup.
+      expect(mod.__test__.getSession(browserKey('user'))).not.toBeNull();
+      expect(mod.__test__.getAdapterTabLedger()).not.toContain(tabId);
+    });
+
+    it('rejects another reclaim and new adapter commands while a reclaim is in flight', async () => {
+      const { chrome, tabs } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+
+      await mod.__test__.handleCommand({
+        id: 'q1', action: 'navigate', session: 'q1', surface: 'adapter', siteSession: 'ephemeral', url: 'https://a.example/',
+      });
+      const tabId = mod.__test__.getSession(adapterKey('q1'))?.preferredTabId!;
+      tabs.length = 0;
+      tabs.push({ id: tabId, windowId: 1, url: 'https://a.example/', active: true, status: 'complete', groupId: -1 });
+
+      const gate = deferred<void>();
+      const originalGet = chrome.tabs.get.getMockImplementation()!;
+      chrome.tabs.get.mockImplementation(async (id: number) => { await gate.promise; return originalGet(id); });
+
+      const first = mod.__test__.handleReclaimAdapterTabs({
+        id: 'rq1', action: 'reclaim-adapter-tabs', deadlineAt: Date.now() + 5000,
+      });
+      // The in-flight flag is set synchronously, so a second reclaim is rejected.
+      const second = await mod.__test__.handleReclaimAdapterTabs({
+        id: 'rq2', action: 'reclaim-adapter-tabs', deadlineAt: Date.now() + 5000,
+      });
+      expect(second.ok).toBe(false);
+      expect(second.errorCode).toBe('adapter_tabs_busy');
+
+      const concurrent = await mod.__test__.handleCommand({
+        id: 'q2', action: 'navigate', session: 'q2', surface: 'adapter', siteSession: 'ephemeral', url: 'https://b.example/',
+      });
+      expect(concurrent.errorCode).toBe('adapter_tabs_busy');
+
+      gate.resolve();
+      const finished = await first;
+      expect(finished.ok).toBe(true);
+    });
+
+    // ── Ownership-safety regression tests ──────────────────────────────
+
+    it('does not adopt a manually opened page when acquiring another adapter lease', async () => {
+      // An exact URL match in the adapter window is not proof of ownership.
+      const { chrome, tabs } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+      await mod.__test__.handleCommand({
+        id: 'first-owned', action: 'navigate', session: 'first', surface: 'adapter',
+        url: 'https://owned.example/',
+      });
+      tabs.push({ id: 20, windowId: 1, url: 'https://manual.example/', active: false, status: 'complete', groupId: -1 });
+      const result = await mod.__test__.handleCommand({
+        id: 'next-owned', action: 'navigate', session: 'next', surface: 'adapter',
+        url: 'https://manual.example/',
+      });
+      expect(result.ok).toBe(true);
+      expect(mod.__test__.getSession(adapterKey('next'))?.preferredTabId).not.toBe(20);
+      expect(mod.__test__.getAdapterTabLedger()).not.toContain(20);
+      const reclaimed = await mod.__test__.handleReclaimAdapterTabs({
+        id: 'manual-reclaim', action: 'reclaim-adapter-tabs', deadlineAt: Date.now() + 5000,
+      });
+      expect(reclaimed.ok).toBe(true);
+      expect(chrome.tabs.remove).not.toHaveBeenCalledWith(20);
+      expect(tabs.find((tab) => tab.id === 20)?.url).toBe('https://manual.example/');
+    });
+
+    it('reuses the blank placeholder after reclaim and registers the next adapter page', async () => {
+      // The placeholder is retained for reuse, not exempt from the next idle cycle.
+      const { chrome, tabs } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+      await mod.__test__.handleCommand({
+        id: 'cycle-one', action: 'navigate', session: 'cycle', surface: 'adapter',
+        url: 'https://one.example/',
+      });
+      const firstId = mod.__test__.getSession(adapterKey('cycle'))?.preferredTabId!;
+      tabs.length = 0;
+      tabs.push({ id: firstId, windowId: 1, url: 'https://one.example/', active: true, status: 'complete', groupId: -1 });
+      expect((await mod.__test__.handleCommand({
+        id: 'reclaim-one', action: 'reclaim-adapter-tabs', deadlineAt: Date.now() + 5000,
+      })).ok).toBe(true);
+      expect(tabs[0].url).toBe('about:blank');
+      await mod.__test__.handleCommand({
+        id: 'cycle-two', action: 'navigate', session: 'cycle', surface: 'adapter',
+        url: 'https://two.example/',
+      });
+      expect(mod.__test__.getSession(adapterKey('cycle'))?.preferredTabId).toBe(firstId);
+      expect(mod.__test__.getAdapterTabLedger()).toContain(firstId);
+      expect((await mod.__test__.handleCommand({
+        id: 'reclaim-two', action: 'reclaim-adapter-tabs', deadlineAt: Date.now() + 5000,
+      })).data).toEqual({ closedTabs: 0, resetTabs: 1 });
+      expect(tabs[0].url).toBe('about:blank');
+    });
+
+    it('reclaims both tabs created by navigate + tabs new in one session after release and worker recovery', async () => {
+      // Original leak: one adapter session legitimately produces two physical
+      // tabs across a navigate and a `tabs new`. Both are ours, so both must be
+      // registered immediately and reclaimable after release + SW recovery —
+      // asserting physical URLs/removals, not just the ledger.
+      const { chrome, tabs } = createChromeMock();
       chrome.tabs.remove.mockImplementation(async (removeTabId: number) => {
         const idx = tabs.findIndex((t) => t.id === removeTabId);
         if (idx !== -1) tabs.splice(idx, 1);
       });
-
-      const onAlarmListener = chrome.alarms.onAlarm.addListener.mock.calls[0][0];
-
-      await onAlarmListener({ name: 'opencli:warm-tab:10' });
-      await onAlarmListener({ name: 'opencli:warm-tab:20' });
-      await onAlarmListener({ name: 'opencli:warm-tab:30' });
-
-      expect(tabs.length).toBe(1);
-      expect(tabs[0].id).toBe(30);
-      expect(update).toHaveBeenCalledWith(30, { url: 'about:blank' });
-    });
-
-    it('clears physical tab warm alarm on chrome.tabs.onRemoved', async () => {
-      const { chrome } = createChromeMock();
-      vi.stubGlobal('chrome', chrome);
-      await import('./background');
-
-      chrome.alarms.clear.mockClear();
-
-      const onRemovedListener = chrome.tabs.onRemoved.addListener.mock.calls[0][0];
-      await onRemovedListener(42);
-
-      expect(chrome.alarms.clear).toHaveBeenCalledWith('opencli:warm-tab:42');
-    });
-
-    it('treats missing or moved tabs as no-ops during warm tab expiry', async () => {
-      const { chrome, tabs, query, update } = createChromeMock();
-      vi.stubGlobal('chrome', chrome);
-      await import('./background');
-
-      const onAlarmListener = chrome.alarms.onAlarm.addListener.mock.calls[0][0];
-
-      // Missing tab (id 999 not in tabs)
-      await onAlarmListener({ name: 'opencli:warm-tab:999' });
-      expect(chrome.tabs.remove).not.toHaveBeenCalled();
-      expect(update).not.toHaveBeenCalled();
-
-      // Tab moved out of automation container (windowId 2 !== automationWindow 1)
-      await onAlarmListener({ name: 'opencli:warm-tab:2' });
-      expect(chrome.tabs.remove).not.toHaveBeenCalled();
-      expect(update).not.toHaveBeenCalled();
-
-      // Tab 1 moves after tabs.get() validates it but before the window query returns.
-      query.mockImplementation(async (queryInfo: { windowId?: number } = {}) => {
-        const target = tabs.find((tab) => tab.id === 1);
-        if (queryInfo.windowId === 1 && target) target.windowId = 2;
-        return tabs.filter((tab) => queryInfo.windowId === undefined || tab.windowId === queryInfo.windowId);
-      });
-      await onAlarmListener({ name: 'opencli:warm-tab:1' });
-      expect(chrome.tabs.remove).not.toHaveBeenCalled();
-      expect(update).not.toHaveBeenCalled();
-    });
-
-    it('does not schedule warm-tab alarm on persistent adapter release', async () => {
-      const { chrome } = createChromeMock();
       vi.stubGlobal('chrome', chrome);
       const mod = await import('./background');
 
       await mod.__test__.handleCommand({
-        id: 'pers-nav',
-        action: 'navigate',
-        session: 'pers-sess',
-        surface: 'adapter',
-        siteSession: 'persistent',
-        url: 'https://chatgpt.com/',
+        id: 'leak-nav', action: 'navigate', session: 'leak', surface: 'adapter', siteSession: 'ephemeral', url: 'https://first.example/',
       });
-      chrome.alarms.create.mockClear();
+      const firstTabId = mod.__test__.getSession(adapterKey('leak'))?.preferredTabId!;
+      await mod.__test__.handleCommand({
+        id: 'leak-new', action: 'tabs', op: 'new', session: 'leak', surface: 'adapter', url: 'https://second.example/',
+      });
+      const secondTabId = mod.__test__.getSession(adapterKey('leak'))?.preferredTabId!;
+      expect(secondTabId).not.toBe(firstTabId);
+      expect([...mod.__test__.getAdapterTabLedger()].sort((a, b) => a - b))
+        .toEqual([firstTabId, secondTabId].sort((a, b) => a - b));
+
+      // Release: neither owned tab may be closed by an ordinary release.
+      await mod.__test__.handleCommand({ id: 'leak-close', action: 'close-window', session: 'leak', surface: 'adapter' });
+      expect(mod.__test__.getSession(adapterKey('leak'))).toBeNull();
+      const alarmNames = chrome.alarms.create.mock.calls.map((call: unknown[]) => String(call[0]));
+      expect(alarmNames).not.toEqual(expect.arrayContaining([expect.stringMatching(/^opencli:warm-tab:/)]));
+
+      // Worker recovery: rebuild purely from the persisted ledger.
+      tabs.length = 0;
+      tabs.push(
+        { id: firstTabId, windowId: 1, url: 'https://first.example/', active: false, status: 'complete', groupId: -1 },
+        { id: secondTabId, windowId: 1, url: 'https://second.example/', active: true, status: 'complete', groupId: -1 },
+      );
+      await mod.__test__.reconcileTargetLeaseRegistry();
+      expect([...mod.__test__.getAdapterTabLedger()].sort((a, b) => a - b))
+        .toEqual([firstTabId, secondTabId].sort((a, b) => a - b));
+
+      const res = await mod.__test__.handleCommand({
+        id: 'leak-reclaim', action: 'reclaim-adapter-tabs', deadlineAt: Date.now() + 5000,
+      });
+      expect(res.ok).toBe(true);
+      expect(res.data).toEqual({ closedTabs: 1, resetTabs: 1 });
+      // The first tab is physically gone and the last owned tab is the blank placeholder.
+      expect(tabs.some((t) => t.id === firstTabId)).toBe(false);
+      expect(tabs.find((t) => t.id === secondTabId)?.url).toBe('about:blank');
+      expect(tabs.filter((t) => t.windowId === 1)).toHaveLength(1);
+      expect(mod.__test__.getAdapterTabLedger()).toEqual([]);
+    });
+
+    it('keeps a user-opened automation-window tab across tabs select, worker recovery, and reclaim', async () => {
+      // `tabs select` may move a lease onto a user tab that lives in the
+      // automation window. It must never be adopted as owned — including after
+      // a SW restart — while the previously owned page stays reclaimable.
+      const { chrome, tabs } = createChromeMock();
+      chrome.tabs.remove.mockImplementation(async (removeTabId: number) => {
+        const idx = tabs.findIndex((t) => t.id === removeTabId);
+        if (idx !== -1) tabs.splice(idx, 1);
+      });
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
 
       await mod.__test__.handleCommand({
-        id: 'pers-close',
-        action: 'close-window',
-        session: 'pers-sess',
-        surface: 'adapter',
+        id: 'own-nav', action: 'navigate', session: 'own', surface: 'adapter', siteSession: 'ephemeral', url: 'https://owned.example/',
+      });
+      const ownedTabId = mod.__test__.getSession(adapterKey('own'))?.preferredTabId!;
+      const userTabId = 20;
+      tabs.length = 0;
+      tabs.push(
+        { id: ownedTabId, windowId: 1, url: 'https://owned.example/', active: false, status: 'complete', groupId: -1 },
+        { id: userTabId, windowId: 1, url: 'https://user-manual.example/', active: true, status: 'complete', groupId: -1 },
+      );
+
+      const select = await mod.__test__.handleTabs(
+        { id: 'own-select', action: 'tabs', op: 'select', session: adapterKey('own'), page: `target-${userTabId}` },
+        adapterKey('own'),
+      );
+      expect(select.ok).toBe(true);
+      expect(mod.__test__.getSession(adapterKey('own'))?.preferredTabId).toBe(userTabId);
+      expect(mod.__test__.getSession(adapterKey('own'))?.preferredTabOwned).toBe(false);
+      expect(mod.__test__.getAdapterTabLedger()).not.toContain(userTabId);
+      expect(mod.__test__.getAdapterTabLedger()).toContain(ownedTabId);
+      expect(tabs.some((t) => t.id === userTabId)).toBe(true);
+
+      await mod.__test__.reconcileTargetLeaseRegistry();
+      expect(mod.__test__.getSession(adapterKey('own'))?.preferredTabId).toBe(userTabId);
+      expect(mod.__test__.getAdapterTabLedger()).not.toContain(userTabId);
+      expect(mod.__test__.getAdapterTabLedger()).toContain(ownedTabId);
+      expect(tabs.some((t) => t.id === userTabId)).toBe(true);
+
+      const res = await mod.__test__.handleReclaimAdapterTabs({
+        id: 'own-reclaim', action: 'reclaim-adapter-tabs', deadlineAt: Date.now() + 5000,
+      });
+      expect(res.ok).toBe(true);
+      // The owned page becomes the blank placeholder; the user's tab stays untouched.
+      expect(tabs.some((t) => t.id === userTabId)).toBe(true);
+      expect(tabs.find((t) => t.id === ownedTabId)?.url).toBe('about:blank');
+      expect(res.data).toEqual({ closedTabs: 0, resetTabs: 1 });
+      expect(chrome.tabs.remove).not.toHaveBeenCalledWith(userTabId);
+    });
+
+    it('revokes adapter ownership immediately when an owned adapter tab is bound borrowed', async () => {
+      // A borrowed binding takes the page over: ownership must be dropped at
+      // binding time, not deferred to reclaim. A release/recovery before the
+      // hub cleanup must not hand the page back to the reclaim API.
+      const { chrome, tabs, setLastFocusedWindowId } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+
+      await mod.__test__.handleCommand({
+        id: 'borrow-nav', action: 'navigate', session: 'owned', surface: 'adapter', siteSession: 'ephemeral', url: 'https://owned.example/',
+      });
+      const tabId = mod.__test__.getSession(adapterKey('owned'))?.preferredTabId!;
+      expect(mod.__test__.getAdapterTabLedger()).toContain(tabId);
+
+      tabs.length = 0;
+      tabs.push({ id: tabId, windowId: 1, url: 'https://owned.example/', active: true, status: 'complete', groupId: -1 });
+      setLastFocusedWindowId(1);
+      const bound = await mod.__test__.handleCommand({
+        id: 'user-bind', action: 'bind', session: 'user', surface: 'browser',
+      });
+      expect(bound.ok).toBe(true);
+      expect(mod.__test__.getSession(browserKey('user'))?.owned).toBe(false);
+      expect(mod.__test__.getSession(browserKey('user'))?.preferredTabId).toBe(tabId);
+      // Dropped immediately from the ledger, and the stale owned adapter lease
+      // no longer claims the tab, so recovery cannot re-adopt it either.
+      expect(mod.__test__.getAdapterTabLedger()).not.toContain(tabId);
+      expect(mod.__test__.getSession(adapterKey('owned'))?.preferredTabOwned).toBe(false);
+
+      await mod.__test__.handleCommand({ id: 'user-close', action: 'close-window', session: 'user', surface: 'browser' });
+      expect(mod.__test__.getSession(browserKey('user'))).toBeNull();
+
+      await mod.__test__.reconcileTargetLeaseRegistry();
+      expect(mod.__test__.getAdapterTabLedger()).not.toContain(tabId);
+      expect(mod.__test__.getSession(adapterKey('owned'))?.preferredTabOwned).toBe(false);
+      const res = await mod.__test__.handleCommand({
+        id: 'borrow-reclaim', action: 'reclaim-adapter-tabs', deadlineAt: Date.now() + 5000,
+      });
+      expect(res.ok).toBe(true);
+      expect(chrome.tabs.remove).not.toHaveBeenCalled();
+      expect(tabs.find((t) => t.id === tabId)?.url).toBe('https://owned.example/');
+    });
+
+    it('protects a borrowed tab even when a raw ledger fixture still lists it', async () => {
+      // Defence in depth: even if a stale ledger entry survives for a tab that
+      // a borrowed lease now references, reclaim must skip it and never close
+      // the borrowed page.
+      const { chrome, tabs } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+
+      // Seed the automation container window (reclaim is a no-op without one).
+      await mod.__test__.handleCommand({
+        id: 'seed-nav', action: 'navigate', session: 'seed', surface: 'adapter', siteSession: 'ephemeral', url: 'https://seed.example/',
+      });
+      mod.__test__.clearAdapterTabLedger();
+
+      const tabId = 20;
+      tabs.length = 0;
+      tabs.push({ id: tabId, windowId: 1, url: 'https://user.example/', active: true, status: 'complete', groupId: -1 });
+      mod.__test__.setSession(browserKey('user'), { windowId: 1, owned: false, preferredTabId: tabId });
+      // Simulate a raw ledger fixture that outlived the binding.
+      mod.__test__.registerAdapterTab(adapterKey('fixture'), tabId);
+      expect(mod.__test__.getAdapterTabLedger()).toContain(tabId);
+
+      const res = await mod.__test__.handleReclaimAdapterTabs({
+        id: 'raw-borrow-reclaim', action: 'reclaim-adapter-tabs', deadlineAt: Date.now() + 5000,
+      });
+      expect(res.ok).toBe(true);
+      expect(chrome.tabs.remove).not.toHaveBeenCalled();
+      expect(tabs.some((t) => t.id === tabId)).toBe(true);
+      expect(mod.__test__.getSession(browserKey('user'))).not.toBeNull();
+      expect(mod.__test__.getAdapterTabLedger()).not.toContain(tabId);
+    });
+
+    it('reports adapter_tabs_busy with no side effects while an adapter command is active', async () => {
+      // The reverse of the in-flight-reclaim guard: an executing adapter
+      // command must block reclamation mid-flight, before any tab is touched.
+      const { chrome, tabs } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+
+      await mod.__test__.handleCommand({
+        id: 'busy-nav', action: 'navigate', session: 'busy', surface: 'adapter', siteSession: 'ephemeral', url: 'https://busy.example/',
+      });
+      const tabId = mod.__test__.getSession(adapterKey('busy'))?.preferredTabId!;
+      tabs.length = 0;
+      tabs.push({ id: tabId, windowId: 1, url: 'https://busy.example/', active: true, status: 'complete', groupId: -1 });
+      chrome.tabs.remove.mockClear();
+      chrome.tabs.update.mockClear();
+
+      mod.__test__.setActiveCommandCount(adapterKey('busy'), 1);
+      const res = await mod.__test__.handleReclaimAdapterTabs({
+        id: 'busy-reclaim', action: 'reclaim-adapter-tabs', deadlineAt: Date.now() + 5000,
+      });
+      expect(res.ok).toBe(false);
+      expect(res.errorCode).toBe('adapter_tabs_busy');
+      expect(chrome.tabs.remove).not.toHaveBeenCalled();
+      expect(chrome.tabs.update).not.toHaveBeenCalled();
+      expect(mod.__test__.getSession(adapterKey('busy'))).not.toBeNull();
+      expect(mod.__test__.getAdapterTabLedger()).toContain(tabId);
+    });
+
+    it('does not remove or update a tab when the deadline elapses during tabs.query', async () => {
+      // Proves the post-await deadline re-check: a reclaim that overruns its
+      // budget mid-loop leaves the tab untouched for a retry.
+      const { chrome, tabs } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+
+      await mod.__test__.handleCommand({
+        id: 'late-nav', action: 'navigate', session: 'late', surface: 'adapter', siteSession: 'ephemeral', url: 'https://late.example/',
+      });
+      const tabId = mod.__test__.getSession(adapterKey('late'))?.preferredTabId!;
+      tabs.length = 0;
+      tabs.push({ id: tabId, windowId: 1, url: 'https://late.example/', active: true, status: 'complete', groupId: -1 });
+      chrome.tabs.remove.mockClear();
+      chrome.tabs.update.mockClear();
+
+      let nowMs = 1_700_000_000_000;
+      const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => nowMs);
+      const deadlineAt = nowMs + 5_000;
+      const originalQuery = chrome.tabs.query.getMockImplementation()!;
+      // The deadline elapses exactly while the post-detach window query runs.
+      chrome.tabs.query.mockImplementation(async (queryInfo: any) => {
+        nowMs = deadlineAt;
+        return originalQuery(queryInfo);
       });
 
-      const warmAlarmCalls = chrome.alarms.create.mock.calls.filter((c: any[]) =>
-        typeof c[0] === 'string' && c[0].startsWith('opencli:warm-tab:'),
+      try {
+        const res = await mod.__test__.handleReclaimAdapterTabs({ id: 'late-reclaim', action: 'reclaim-adapter-tabs', deadlineAt });
+        expect(res.ok).toBe(false);
+        expect(res.errorCode).toBe('reclaim_deadline_exceeded');
+        expect(chrome.tabs.remove).not.toHaveBeenCalled();
+        expect(chrome.tabs.update).not.toHaveBeenCalledWith(tabId, { url: 'about:blank' });
+        expect(mod.__test__.getAdapterTabLedger()).toContain(tabId);
+        expect(mod.__test__.getSession(adapterKey('late'))).not.toBeNull();
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
+
+    it('preserves ownership and leases across a remove failure and closes on retry', async () => {
+      const { chrome, tabs } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+
+      await mod.__test__.handleCommand({
+        id: 'retry-nav-1', action: 'navigate', session: 'retry1', surface: 'adapter', siteSession: 'ephemeral', url: 'https://a.example/',
+      });
+      await mod.__test__.handleCommand({
+        id: 'retry-nav-2', action: 'navigate', session: 'retry2', surface: 'adapter', siteSession: 'ephemeral', url: 'https://b.example/',
+      });
+      const firstId = mod.__test__.getSession(adapterKey('retry1'))?.preferredTabId!;
+      const secondId = mod.__test__.getSession(adapterKey('retry2'))?.preferredTabId!;
+      tabs.length = 0;
+      tabs.push(
+        { id: firstId, windowId: 1, url: 'https://a.example/', active: false, status: 'complete', groupId: -1 },
+        { id: secondId, windowId: 1, url: 'https://b.example/', active: true, status: 'complete', groupId: -1 },
       );
-      expect(warmAlarmCalls).toHaveLength(0);
+      const ledgerBefore = [...mod.__test__.getAdapterTabLedger()].sort((a, b) => a - b);
+
+      chrome.tabs.remove.mockImplementationOnce(async () => { throw new Error('transient remove failure'); });
+      const failed = await mod.__test__.handleReclaimAdapterTabs({
+        id: 'retry-fail', action: 'reclaim-adapter-tabs', deadlineAt: Date.now() + 5000,
+      });
+      expect(failed.ok).toBe(false);
+      expect(failed.errorCode).toBe('reclaim_failed');
+      // Ownership and leases survive the failure, so nothing is silently lost.
+      expect([...mod.__test__.getAdapterTabLedger()].sort((a, b) => a - b)).toEqual(ledgerBefore);
+      expect(tabs).toHaveLength(2);
+      expect(mod.__test__.getSession(adapterKey('retry1'))).not.toBeNull();
+      expect(mod.__test__.getSession(adapterKey('retry2'))).not.toBeNull();
+
+      // Retry actually succeeds.
+      chrome.tabs.remove.mockImplementation(async (removeTabId: number) => {
+        const idx = tabs.findIndex((t) => t.id === removeTabId);
+        if (idx !== -1) tabs.splice(idx, 1);
+      });
+      const retried = await mod.__test__.handleReclaimAdapterTabs({
+        id: 'retry-ok', action: 'reclaim-adapter-tabs', deadlineAt: Date.now() + 5000,
+      });
+      expect(retried.ok).toBe(true);
+      expect(retried.data).toEqual({ closedTabs: 1, resetTabs: 1 });
+      expect(tabs.filter((t) => t.windowId === 1)).toHaveLength(1);
+      expect(tabs[0].url).toBe('about:blank');
+      expect(mod.__test__.getAdapterTabLedger()).toEqual([]);
+    });
+
+    it('preserves ownership and leases across an update failure and blanks on retry', async () => {
+      const { chrome, tabs } = createChromeMock();
+      vi.stubGlobal('chrome', chrome);
+      const mod = await import('./background');
+
+      await mod.__test__.handleCommand({
+        id: 'upd-nav', action: 'navigate', session: 'upd', surface: 'adapter', siteSession: 'ephemeral', url: 'https://upd.example/',
+      });
+      const tabId = mod.__test__.getSession(adapterKey('upd'))?.preferredTabId!;
+      tabs.length = 0;
+      tabs.push({ id: tabId, windowId: 1, url: 'https://upd.example/', active: true, status: 'complete', groupId: -1 });
+      chrome.tabs.update.mockClear();
+
+      chrome.tabs.update.mockImplementationOnce(async () => { throw new Error('transient update failure'); });
+      const failed = await mod.__test__.handleReclaimAdapterTabs({
+        id: 'upd-fail', action: 'reclaim-adapter-tabs', deadlineAt: Date.now() + 5000,
+      });
+      expect(failed.ok).toBe(false);
+      expect(failed.errorCode).toBe('reclaim_failed');
+      expect(mod.__test__.getAdapterTabLedger()).toContain(tabId);
+      expect(mod.__test__.getSession(adapterKey('upd'))).not.toBeNull();
+
+      const retried = await mod.__test__.handleReclaimAdapterTabs({
+        id: 'upd-ok', action: 'reclaim-adapter-tabs', deadlineAt: Date.now() + 5000,
+      });
+      expect(retried.ok).toBe(true);
+      expect(retried.data).toEqual({ closedTabs: 0, resetTabs: 1 });
+      expect(tabs.find((t) => t.id === tabId)?.url).toBe('about:blank');
+      expect(mod.__test__.getAdapterTabLedger()).toEqual([]);
+    });
+
+    it('does not infer the adapter container from a moved owned tab on worker recovery', async () => {
+      // Safety over completeness: when the persisted container window is gone,
+      // recovery must NOT adopt a moved owned tab's window as the container
+      // (which would make a later reclaim close a user window's tab).
+      const { chrome, tabs, groups } = createChromeMock();
+      tabs.push({ id: 50, windowId: 2, url: 'https://moved.example/', active: true, status: 'complete', groupId: -1 });
+      vi.stubGlobal('chrome', chrome);
+      const deadline = Date.now() + 30_000;
+      await chrome.storage.session.set({
+        opencli_target_lease_registry_v2: {
+          version: 2,
+          contextId: 'user-default',
+          ownedContainers: { interactive: { windowId: null, groupIds: [] }, automation: { windowId: null } },
+          leases: {
+            [adapterKey('moved')]: {
+              session: 'moved',
+              surface: 'adapter',
+              kind: 'owned',
+              windowId: 2,
+              owned: true,
+              preferredTabId: 50,
+              preferredTabOwned: true,
+              contextId: 'user-default',
+              ownership: 'owned',
+              lifecycle: 'ephemeral',
+              windowRole: 'automation',
+              idleDeadlineAt: deadline,
+              updatedAt: Date.now(),
+            },
+          },
+          adapterTabIds: [50],
+        },
+      });
+
+      const mod = await import('./background');
+      await mod.__test__.reconcileTargetLeaseRegistry();
+
+      expect(mod.__test__.getSession(adapterKey('moved'))?.preferredTabId).toBe(50);
+      // No container inference: the automation windowId stays null, so the moved
+      // tab is neither moved back nor grouped.
+      expect(chrome.tabs.move).not.toHaveBeenCalled();
+      expect(groups).toEqual([]);
+
+      const res = await mod.__test__.handleReclaimAdapterTabs({
+        id: 'moved-reclaim', action: 'reclaim-adapter-tabs', deadlineAt: Date.now() + 5000,
+      });
+      expect(res.ok).toBe(true);
+      // The moved tab is user content: never removed.
+      expect(chrome.tabs.remove).not.toHaveBeenCalled();
+      expect(tabs.some((t) => t.id === 50)).toBe(true);
     });
   });
 });

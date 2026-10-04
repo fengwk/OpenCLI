@@ -47,6 +47,7 @@ export default defineConfig({
             'tests/e2e/output-formats.test.ts',
             'tests/e2e/plugin-management.test.ts',
             'tests/e2e/article-download-pipeline.test.ts',
+            'tests/e2e/daemon-reclaim-transport.test.ts',
             ...(includeAxChromeE2e ? ['tests/e2e/browser-ax-chrome.test.ts'] : []),
             // Extended browser tests (20+ sites) — opt-in only:
             //   OPENCLI_E2E=1 npx vitest run
