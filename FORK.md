@@ -23,6 +23,10 @@ Use it when merging back to mainline or rebasing onto upstream.
 
 ### 2026-10-04
 
+#### Production dependency security patch
+
+CLI `1.8.8-fengwk.5` / extension `1.0.36` in `fork-v1.8.8-fengwk.5` supersede the `.4` pair. Pinned `undici` to `7.30.0` to resolve the production Security Audit high-severity findings against `7.29.0`; the Node requirement remains `>=20.18.1`. The extension and adapter tab reclamation protocol are unchanged.
+
 #### Single-policy context-scoped adapter tab reclamation
 
 Paired as CLI `1.8.8-fengwk.4` and extension `1.0.36` in `fork-v1.8.8-fengwk.4`; both must be updated together for capability `adapter-tab-reclaim-v1` and action `reclaim-adapter-tabs` (also includes CLI `1.8.8-fengwk.3` ChatGPT active composer form submit fix).
@@ -155,7 +159,7 @@ CLI `1.8.7-fengwk.9` and extension `1.0.30`.
 
 | Component | Version |
 |-----------|---------|
-| CLI (`@jackwener/opencli`) | `1.8.8-fengwk.4` (paired tag: `fork-v1.8.8-fengwk.4`) |
+| CLI (`@jackwener/opencli`) | `1.8.8-fengwk.5` (paired tag: `fork-v1.8.8-fengwk.5`) |
 | Extension | `1.0.36` (`compatRange`: `>=1.8.7`) |
 
 ### Auto-update policy (fork)
@@ -211,15 +215,15 @@ npm ci
 
 Artifacts (version-based names, no timestamps):
 
-- `jackwener-opencli-1.8.8-fengwk.4.tgz`
+- `jackwener-opencli-1.8.8-fengwk.5.tgz`
 - `opencli-extension-v1.0.36.zip`
 - `SHA256SUMS`
 - `build-info.json`
 
 ```bash
 # install CLI from the tarball (not npm publish)
-npm install -g ./artifacts/jackwener-opencli-1.8.8-fengwk.4.tgz
-opencli --version   # → 1.8.8-fengwk.4
+npm install -g ./artifacts/jackwener-opencli-1.8.8-fengwk.5.tgz
+opencli --version   # → 1.8.8-fengwk.5
 
 # plugin
 opencli plugin install ~/proj/my-opencli/packages/chatgpt-agent
@@ -229,6 +233,6 @@ opencli chatgpt-agent ask --help
 ### GitHub fork release
 
 1. Ensure `package.json` version is `X` and commit any regenerated `cli-manifest.json` / `extension/dist`.
-2. Tag exactly `fork-vX` (example: `fork-v1.8.8-fengwk.4`) and push the tag.
+2. Tag exactly `fork-vX` (example: `fork-v1.8.8-fengwk.5`) and push the tag.
 3. Workflow `Fork Release` packages, uploads the Actions artifact bundle, and attaches tgz/zip/SHA256SUMS/build-info.json to the GitHub Release.
 4. Never runs `npm publish` or upstream website dispatch jobs.

@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.8.8-fengwk.5](https://github.com/fengwk/OpenCLI/releases/tag/fork-v1.8.8-fengwk.5) (2026-10-04)
+
+### Security
+
+* Pin the production `undici` dependency to `7.30.0`, resolving the high-severity advisories reported against `7.29.0`. Node remains `>=20.18.1`; paired Browser Bridge extension `1.0.36` and the adapter reclamation protocol are unchanged.
+
 ## [1.8.8-fengwk.4](https://github.com/fengwk/OpenCLI/releases/tag/fork-v1.8.8-fengwk.4) (2026-10-04)
 
 Single-policy context-scoped adapter tab reclamation for CLI `1.8.8-fengwk.4` and Browser Bridge extension `1.0.36`.
