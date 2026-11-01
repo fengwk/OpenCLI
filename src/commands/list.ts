@@ -1,7 +1,9 @@
 import { Command, InvalidArgumentError } from 'commander';
+import { ArgumentError } from '../errors.js';
 import { normalizeOutputFormat } from '../output-format.js';
 import { render } from '../output.js';
 import { fullName, getRegistry } from '../registry.js';
+import { serializeCommand } from '../serialization.js';
 
 function integer(value: string): number {
   if (!/^\d+$/.test(value)) throw new InvalidArgumentError('Expected a non-negative integer.');
@@ -13,11 +15,32 @@ function integer(value: string): number {
 export function registerListCommand(program: Command): void {
   program.command('list').argument('[query]', 'Filter command names and descriptions')
     .description('Find available capabilities; inspect a command with --help -f json')
+    .option('--manifest', 'Export full adapter metadata without pagination')
     .option('--site <site>', 'Only adapters for this site')
     .option('--limit <n>', 'Maximum results (1–100)', integer, 25)
     .option('--offset <n>', 'Start offset from the previous result', integer, 0)
     .option('-f, --format <fmt>', 'json, table, yaml, md, csv', normalizeOutputFormat, 'json')
-    .action((query, opts) => {
+    .action((query, opts, cmd) => {
+      if (opts.manifest) {
+        if (query && String(query).trim().length > 0) {
+          throw new ArgumentError('--manifest exports full metadata and cannot be combined with a query argument. Use --site to filter by site.');
+        }
+        if (cmd?.getOptionValueSource?.('limit') === 'cli') {
+          throw new ArgumentError('--manifest exports full metadata and cannot be combined with --limit.');
+        }
+        if (cmd?.getOptionValueSource?.('offset') === 'cli') {
+          throw new ArgumentError('--manifest exports full metadata and cannot be combined with --offset.');
+        }
+
+        const adapters = [...new Set(getRegistry().values())];
+        const filtered = adapters
+          .filter(c => !opts.site || c.site === opts.site)
+          .sort((a, b) => fullName(a).localeCompare(fullName(b)));
+        const metadata = filtered.map(serializeCommand);
+        render(metadata, { fmt: opts.format, fmtExplicit: true });
+        return;
+      }
+
       if (opts.limit < 1 || opts.limit > 100) throw new InvalidArgumentError('--limit must be between 1 and 100.');
       const adapters = [...new Set(getRegistry().values())];
       const sites = new Set(adapters.map(cmd => cmd.site));

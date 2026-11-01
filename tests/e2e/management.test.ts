@@ -41,6 +41,35 @@ describe('management commands E2E', () => {
     const site = parseJsonOutput((await runCli(['list', 'top', '--site', 'hackernews'])).stdout);
     expect(site.commands.some((row: any) => row.command === 'hackernews top')).toBe(true);
   });
+  it('exports full unpaginated adapter manifest via list --manifest', async () => {
+    const result = await runCli(['list', '--manifest']);
+    expect(result.code).toBe(0);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed.ok).toBe(true);
+    expect(Array.isArray(parsed.data)).toBe(true);
+    // Over 1000 adapters in the real registry, not truncated to 25
+    expect(parsed.data.length).toBeGreaterThan(100);
+
+    const first = parsed.data[0];
+    expect(first).toHaveProperty('command');
+    expect(first).toHaveProperty('site');
+    expect(first).toHaveProperty('name');
+    expect(first).toHaveProperty('args');
+    expect(Array.isArray(first.args)).toBe(true);
+
+    // Site filtering
+    const siteOnly = await runCli(['list', '--manifest', '--site', 'hackernews']);
+    expect(siteOnly.code).toBe(0);
+    const siteParsed = JSON.parse(siteOnly.stdout);
+    expect(siteParsed.ok).toBe(true);
+    expect(siteParsed.data.length).toBeGreaterThan(0);
+    expect(siteParsed.data.every((c: any) => c.site === 'hackernews')).toBe(true);
+
+    // Mutually exclusive options reject with code 2
+    const conflicting = await runCli(['list', '--manifest', '--limit', '10']);
+    expect(conflicting.code).toBe(2);
+    expect(JSON.parse(conflicting.stdout).ok).toBe(false);
+  });
   it.each(['yaml', 'csv', 'md', 'table'])('exports a compact list as %s', async format => {
     const result = await runCli(['list', '--site', 'hackernews', '-f', format]);
     expect(result.code).toBe(0);

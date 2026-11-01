@@ -23,6 +23,17 @@ Use it when merging back to mainline or rebasing onto upstream.
 
 ### 2026-11-01
 
+#### Hub adapter manifest export & metadata completeness
+
+CLI `2.0.2-fengwk.2` / extension `1.0.37`.
+
+Added `opencli list --manifest` to export full adapter registry metadata without pagination, preserving command metadata for OpenCLI Hub integration.
+
+| Area | Change | Paths |
+|------|--------|-------|
+| list --manifest | Added `--manifest` flag to `opencli list` to dump unpaginated full adapter metadata (builtin, user overrides, dynamic plugins) while omitting management commands. Returns 2.0 wire envelope `{ ok: true, data: [...] }`. Supports `--site` filtering; mutually exclusive with `query`, `--limit`, and `--offset` (throws `ArgumentError`). | `src/commands/list.ts`, `src/commands/list.test.ts`, `tests/e2e/management.test.ts` |
+| metadata completeness | Restored `args[].repeatable` in `serializeArg` and `defaultWindowMode` in `serializeCommand` to ensure full parity with adapter definitions without modifying other fields. | `src/serialization.ts`, `src/serialization.test.ts` |
+
 #### Upstream v2.0.2 merge & security / capability preservation
 
 CLI `2.0.2-fengwk.1` / extension `1.0.37`.

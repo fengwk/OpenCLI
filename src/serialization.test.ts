@@ -84,4 +84,56 @@ describe('formatRegistryHelpText', () => {
     });
     expect(formatRegistryHelpText(cmd)).toContain('Default format: json');
   });
+
+  it('preserves repeatable args and defaultWindowMode in command serialization', () => {
+    const cmd: CliCommand = {
+      site: 'chatgpt',
+      name: 'ask',
+      access: 'write',
+      description: 'Ask ChatGPT with files',
+      strategy: Strategy.COOKIE,
+      browser: true,
+      defaultWindowMode: 'background',
+      siteSession: 'persistent',
+      args: [
+        {
+          name: 'file',
+          help: 'File path to attach',
+          repeatable: true,
+        },
+        {
+          name: 'prompt',
+          help: 'Prompt to send',
+        },
+      ],
+    };
+
+    const serialized = serializeCommand(cmd);
+    expect(serialized.defaultWindowMode).toBe('background');
+    expect(serialized.siteSession).toBe('persistent');
+    expect(serialized.args).toEqual([
+      {
+        name: 'file',
+        type: 'string',
+        required: false,
+        valueRequired: false,
+        positional: false,
+        choices: [],
+        default: null,
+        help: 'File path to attach',
+        repeatable: true,
+      },
+      {
+        name: 'prompt',
+        type: 'string',
+        required: false,
+        valueRequired: false,
+        positional: false,
+        choices: [],
+        default: null,
+        help: 'Prompt to send',
+        repeatable: false,
+      },
+    ]);
+  });
 });

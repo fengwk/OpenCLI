@@ -19,6 +19,7 @@ export type SerializedArg = {
   choices: string[];
   default: unknown;
   help: string;
+  repeatable: boolean;
 };
 
 /** Stable arg schema — every field is always present (no sparse objects). */
@@ -32,6 +33,7 @@ export function serializeArg(a: Arg): SerializedArg {
     choices: a.choices ?? [],
     default: a.default ?? null,
     help: a.help ?? '',
+    repeatable: !!a.repeatable,
   };
 }
 
@@ -52,6 +54,7 @@ export function serializeCommand(cmd: CliCommand) {
     example: formatCommandExample(cmd),
     defaultFormat: 'json',
     siteSession: cmd.siteSession ?? null,
+    defaultWindowMode: cmd.defaultWindowMode ?? null,
   };
 }
 
