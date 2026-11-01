@@ -21,7 +21,20 @@ Use it when merging back to mainline or rebasing onto upstream.
 
 ## Changelog (fork)
 
-### 2026-10-04
+### 2026-11-01
+
+#### Upstream v2.0.2 merge & security / capability preservation
+
+CLI `2.0.2-fengwk.1` / extension `1.0.37`.
+
+This release merges upstream `origin/main` at `97dc0cd5214b9602bcda78d7422f231ee8a803e9` (`v2.0.2`).
+
+| Area | Change | Paths |
+|------|--------|-------|
+| upstream merge | Merged upstream OpenCLI 2.0 architecture: site slots scheduling, command admission, output formatters, new Douyin/Xiaohongshu/Proton/DBLP commands, undici 7.30.1 security patch, and removal of obsolete Electron desktop automation. | across repo |
+| fork capabilities preserved | Preserved long-lived stream capture (WS frames & HTTP SSE streams), hardened pure-CDP `setFileInput` (objectId/backendNodeId with nodeId fallback), repeatable CLI flags (`Arg.repeatable`), tab-scoped download routing, and single-policy context-scoped adapter tab reclamation (`adapter-tab-reclaim-v1`). | `extension/`, `src/browser/`, `src/daemon.ts`, `src/execution.ts` |
+| extension bridge | Bumped extension version to `1.0.37`, integrated upstream idle placeholder URL and chrome-call/describe handlers alongside fork adapter tab ledger. | `extension/` |
+
 
 #### Production dependency security patch
 

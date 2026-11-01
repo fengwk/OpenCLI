@@ -41,6 +41,7 @@ import {
   resolveProfileRoute,
 } from './daemon-utils.js';
 import {
+  SESSION_LEASE_TTL_MS,
   SessionLeaseRegistry,
   buildSessionBusyFailure,
   buildSessionLeaseRevokedFailure,
@@ -61,6 +62,7 @@ import {
   parseExtensionCapabilities,
   parseReclaimRequest,
 } from './daemon-reclaim.js';
+import { SLOT_WAIT_DEFAULT_MS, SiteSlotScheduler, SlotAdmission, parseSlotPolicy, validSlotWaitMs } from './site-slots.js';
 
 const PORT = DEFAULT_DAEMON_PORT;
 if (!isIgnorableDaemonPortEnv(process.env.OPENCLI_DAEMON_PORT)) {
@@ -129,6 +131,18 @@ const reclaimingContexts = new Set<string>();
 // Chrome tab as a still-running command. Stale leases self-expire (see
 // session-lease.ts).
 const sessionLeases = new SessionLeaseRegistry();
+
+// Per-(contextId, site) slot pools with a cancellable admission queue
+// (site-slots.ts). A queued slot-acquire is an open HTTP request.
+const slotAdmission = new SlotAdmission({
+  scheduler: new SiteSlotScheduler({ ttlMs: SESSION_LEASE_TTL_MS }),
+  routeFailure: (contextId) => {
+    const route = resolveExtensionConnection(contextId, undefined);
+    return route.connection ? null : { errorCode: route.errorCode, error: route.error };
+  },
+  hasPendingWork: (runId) => runHasPendingWork(runId),
+  log: (msg) => pushLog({ level: 'info', msg, ts: Date.now() }),
+});
 
 /** A TTL-stale lease holder with a command still in flight is alive, not dead. */
 function runHasPendingWork(runId: string): boolean {
@@ -240,6 +254,7 @@ function settlePending(id: string, entry: PendingEntry, outcome: { data?: unknow
   if (entry.leaseKey && entry.runId && !entry.recoveryRevoked) {
     sessionLeases.heartbeat(entry.leaseKey, entry.runId, Date.now());
   }
+  if (entry.runId) slotAdmission.onWorkSettled(entry.runId);
   for (const settler of entry.settlers) {
     if (outcome.error) settler.reject(outcome.error);
     else settler.resolve(outcome.data);
@@ -652,6 +667,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       pending: pending.size,
       capabilities: DAEMON_CAPABILITIES,
       sessionLeases: sessionLeaseStatus(),
+      siteSlots: slotAdmission.list(),
       commandResultUnknown: commandResultUnknownCount,
       memoryMB: Math.round(mem.rss / 1024 / 1024 * 10) / 10,
       port: PORT,
@@ -773,7 +789,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       // runIds are globally unique, and re-resolving the profile route here
       // could fail (the profile may have disconnected since acquire).
       if (body.action === 'lease-release') {
-        if (typeof body.runId === 'string') sessionLeases.releaseByRunId(body.runId);
+        if (typeof body.runId === 'string') {
+          sessionLeases.releaseByRunId(body.runId);
+          slotAdmission.release(body.runId);
+        }
         jsonResponse(res, 200, { id: body.id, ok: true });
         return;
       }
@@ -933,6 +952,40 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         return;
       }
 
+      // ─── Site slot pool: admission ───────────────────────────────────
+      // Daemon-local. Runs after profile routing (pools are per profile) and
+      // before anything is dispatched. The request stays open while the run
+      // is queued; a client that goes away is dequeued (site-slots.ts).
+      if (body.action === 'slot-acquire') {
+        const policy = parseSlotPolicy(body);
+        if (typeof body.site !== 'string' || !body.site || typeof body.runId !== 'string' || !body.runId || !policy || (body.waitMs !== undefined && !validSlotWaitMs(body.waitMs))) {
+          jsonResponse(res, 400, { id: body.id, ok: false, error: 'slot-acquire needs site, runId, poolSize' });
+          return;
+        }
+        let replied = false;
+        const cancel = slotAdmission.acquire({
+          contextId: route.connection.contextId,
+          site: body.site,
+          runId: body.runId,
+          policy,
+          waitMs: body.waitMs === undefined ? SLOT_WAIT_DEFAULT_MS : body.waitMs as number,
+          reply: ({ status, body: payload }) => {
+            replied = true;
+            jsonResponse(res, status, { id: body.id, ...payload });
+          },
+        });
+        res.on('close', () => { if (!replied) cancel(); });
+        return;
+      }
+
+      // Slot ownership: a holder's command refreshes its slot; a run that lost
+      // its slot can no longer drive that tab.
+      const slotRejection = slotAdmission.admitCommand({ contextId: route.connection.contextId, session: body.session, runId: body.runId });
+      if (slotRejection) {
+        jsonResponse(res, slotRejection.status, { id: body.id, ...slotRejection.body });
+        return;
+      }
+
       // ─── Session write lease: arbitration ────────────────────────────
       // Runs AFTER profile routing (the resolved contextId is part of the
       // lease key — the same site session in two Chrome profiles drives two
@@ -1059,6 +1112,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
           settlers: [{ resolve, reject }],
           timer,
           ...(leaseKey && leaseRunId ? { leaseKey, runId: leaseRunId } : {}),
+          // Slot holders (reads included) stay alive while an exec is in flight.
+          ...(!leaseKey && typeof body.runId === 'string' && body.runId ? { runId: body.runId } : {}),
         };
         pending.set(body.id, entry);
         const failBeforeDispatch = (err: unknown) => {

@@ -30,7 +30,9 @@ import { adapterLoadError, ArgumentError, CommandExecutionError, SessionBusyErro
 import { shouldUseBrowserSession } from './capabilityRouting.js';
 import { getBrowserFactory, browserSession, runWithTimeout, DEFAULT_BROWSER_COMMAND_TIMEOUT, type BrowserWindowMode } from './runtime.js';
 import { profileRouteParams, resolveProfileSelection } from './browser/profile.js';
+import { SLOT_WAIT_DEFAULT_MS, MAX_SLOT_DELAY_MS, parseSlotPolicy, type SlotPolicy } from './site-slots.js';
 import {
+  acquireSiteSlot,
   clearDaemonRunContext,
   generateRunId,
   isUnknownOutcomeError,
@@ -44,8 +46,6 @@ import {
 import { installBoundedSignalRecovery } from './browser/session-recovery.js';
 import { emitHook, type HookContext } from './hooks.js';
 import { log } from './logger.js';
-import { isElectronApp } from './electron-apps.js';
-import { probeCDP, resolveElectronEndpoint } from './launcher.js';
 import { ObservationSession, exportObservationSession, type ObservationExportResult, type ObservationExportStatus } from './observation/index.js';
 import { resolveAdapterSourcePath } from './adapter-source.js';
 
@@ -225,9 +225,18 @@ export async function executeCommand(
   // Resolve browser-only configuration before argument hooks or any browser
   // lifecycle setup. Non-browser commands must not be affected by browser
   // environment defaults, even when those defaults are invalid.
-  const siteSession = shouldUseBrowserSession(cmd)
+  const resolvedSiteSession = shouldUseBrowserSession(cmd)
     ? resolveSiteSession(cmd, opts.siteSession)
     : null;
+  // A pooled site (OPENCLI_SITE_SLOTS) runs on persistent slot sessions unless
+  // this invocation explicitly asks for a one-shot tab with --site-session.
+  const slotPolicy = resolvedSiteSession !== null && opts.siteSession !== 'ephemeral'
+    ? resolveSiteSlotPolicy(cmd.site)
+    : null;
+  if (slotPolicy && process.env.OPENCLI_CDP_ENDPOINT) {
+    throw new ArgumentError('OPENCLI_SITE_SLOTS requires Browser Bridge; use --site-session ephemeral with a direct CDP endpoint.');
+  }
+  const siteSession = slotPolicy ? 'persistent' : resolvedSiteSession;
 
   let kwargs: CommandArgs;
   try {
@@ -255,34 +264,14 @@ export async function executeCommand(
   let result: unknown;
   try {
     if (siteSession !== null) {
-      const electron = isElectronApp(cmd.site);
-      let cdpEndpoint: string | undefined;
-
-      if (electron) {
-        // Electron apps: respect manual endpoint override, then try auto-detect
-        const manualEndpoint = process.env.OPENCLI_CDP_ENDPOINT;
-        if (manualEndpoint) {
-          const port = Number(new URL(manualEndpoint).port);
-          if (!await probeCDP(port)) {
-            throw new CommandExecutionError(
-              `CDP not reachable at ${manualEndpoint}`,
-              'Check that the app is running with --remote-debugging-port and the endpoint is correct.',
-            );
-          }
-          cdpEndpoint = manualEndpoint;
-        } else {
-          cdpEndpoint = await resolveElectronEndpoint(cmd.site);
-        }
-      }
-
-      const BrowserFactory = getBrowserFactory(cmd.site);
+      const BrowserFactory = getBrowserFactory();
       // Requirement vs preference: --profile / OPENCLI_PROFILE route strictly;
       // the config default is a soft preference the daemon arbitrates.
       const profileSelection = resolveProfileSelection(opts.profile);
       const profileRouting = profileRouteParams(profileSelection);
       const contextId = profileSelection?.contextId;
       const internal = cmd as InternalCliCommand;
-      const session = resolveAdapterBrowserSession(cmd, siteSession);
+      let session = resolveAdapterBrowserSession(cmd, siteSession);
       const keepTab = resolveKeepTab(siteSession, opts.keepTab);
       const windowMode = resolveBrowserWindowMode(cmd.defaultWindowMode ?? 'background', opts.windowMode);
       // Persistent-session write commands take a logical lease on the site
@@ -290,10 +279,30 @@ export async function executeCommand(
       // Chrome tab. The runId flows to the daemon on every command (acquire +
       // heartbeat); we release it explicitly when the command settles. Read and
       // ephemeral commands are never leased.
-      const leaseRun = siteSession === 'persistent' && cmd.access === 'write'
+      let leaseRun = siteSession === 'persistent' && cmd.access === 'write'
         ? { runId: generateRunId(), session }
         : null;
-      if (leaseRun) {
+      let slotWaitedSec = 0;
+      if (slotPolicy) {
+        // A pooled site borrows one slot (= one persistent session = one warm
+        // tab) for the whole run, reads included. Every exec carries the
+        // runId so the daemon keeps the slot alive; the finally below returns it.
+        const runId = leaseRun?.runId ?? generateRunId();
+        setDaemonRunContext({ runId, command: fullName(cmd), access: cmd.access, owner: resolveDaemonRunOwner() });
+        try {
+          // A user --timeout budgets queue wait + run together; without one the
+          // queue has its own default and the run keeps its usual ceiling.
+          const waitMs = userTimeoutSec !== null ? Math.min(MAX_SLOT_DELAY_MS, userTimeoutSec * 1000) : SLOT_WAIT_DEFAULT_MS;
+          const slotStartedAt = Date.now();
+          const grant = await acquireSiteSlot({ site: cmd.site, ...slotPolicy, waitMs, ...profileRouting });
+          session = grant.session;
+          slotWaitedSec = Math.max(grant.waitedMs / 1000, (Date.now() - slotStartedAt) / 1000);
+        } catch (err) {
+          setDaemonRunContext(null);
+          throw err;
+        }
+        leaseRun = { runId, session };
+      } else if (leaseRun) {
         setDaemonRunContext({
           runId: leaseRun.runId,
           command: fullName(cmd),
@@ -368,6 +377,7 @@ export async function executeCommand(
           });
           await page.startNetworkCapture?.().catch(() => false);
         }
+        if (slotPolicy) await activateSlotTab(page);
         const preNavUrl = resolvePreNav(cmd);
         if (preNavUrl && await shouldRunPreNav(cmd, page, siteSession, preNavUrl)) {
           observation?.record({
@@ -378,9 +388,7 @@ export async function executeCommand(
           });
           // Navigate directly — the extension's handleNavigate already has a fast-path
           // that skips navigation if the tab is already at the target URL.
-          // This avoids an extra exec round-trip (getCurrentUrl) on first command and
-          // lets the extension create the automation window with the target URL directly
-          // instead of about:blank.
+          // This avoids an extra exec round-trip (getCurrentUrl) on first command.
           try {
             await page.goto(preNavUrl);
             observation?.record({
@@ -407,7 +415,7 @@ export async function executeCommand(
             // the cause chain, and a pre-nav navigate/exec can itself end with an
             // unknown outcome while still running against the persistent tab.
             wrapped.cause = err;
-            const needsRecovery = leaseRun !== null && isUnknownOutcomeError(wrapped);
+            const needsRecovery = leaseRun !== null && cmd.access === 'write' && isUnknownOutcomeError(wrapped);
             if (needsRecovery) await requestSessionRecovery('command_outcome_unknown');
             if (observation && (traceMode === 'on' || traceMode === 'retain-on-failure')) {
               observation.record({
@@ -424,7 +432,7 @@ export async function executeCommand(
           }
         }
         const browserTimeout = userTimeoutSec !== null
-          ? userTimeoutSec + RUNTIME_TIMEOUT_PADDING_SECONDS
+          ? Math.max(1, userTimeoutSec - slotWaitedSec) + RUNTIME_TIMEOUT_PADDING_SECONDS
           : DEFAULT_BROWSER_COMMAND_TIMEOUT;
         const commandRun = runCommand(cmd, page, kwargs, debug);
         adapterRun = commandRun;
@@ -455,7 +463,7 @@ export async function executeCommand(
           return result;
         } catch (err) {
           if (!commandSettled) adapterStillRunning = true;
-          const needsRecovery = leaseRun !== null && (
+          const needsRecovery = leaseRun !== null && cmd.access === 'write' && (
             !commandSettled || isUnknownOutcomeError(err)
           );
           let surfacedError = err;
@@ -497,7 +505,7 @@ export async function executeCommand(
           if (!keepTab && !needsRecovery) await page.closeWindow?.().catch(() => {});
           throw surfacedError;
         }
-      }, { session, cdpEndpoint, ...profileRouting, windowMode, surface: 'adapter', siteSession });
+      }, { session, ...profileRouting, windowMode, surface: 'adapter', siteSession });
       } catch (err) {
         browserRunError = err;
         throw err;
@@ -506,7 +514,7 @@ export async function executeCommand(
         if (leaseRun) {
           // Pre-navigation can surface an unknown outcome outside the adapter
           // timeout catch. It still needs the same fence -> reset path.
-          if (!recoveryPromise && isUnknownOutcomeError(browserRunError)) {
+          if (!recoveryPromise && cmd.access === 'write' && isUnknownOutcomeError(browserRunError)) {
             await requestSessionRecovery('command_outcome_unknown');
           }
           const runWasFenced = recoveryPromise !== null;
@@ -525,6 +533,7 @@ export async function executeCommand(
             adapterRun.then(() => settle(), (err) => settle(err));
           } else {
             clearDaemonRunContext(leaseRun.runId);
+            setDaemonRunContext(null);
             if (!runWasFenced && !isUnknownOutcomeError(browserRunError)) {
               await releaseSiteSessionLease({ runId: leaseRun.runId, session: leaseRun.session, surface: 'adapter' });
             }
@@ -659,6 +668,42 @@ function resolveSiteSession(cmd: CliCommand, rawOption?: unknown): SiteSessionMo
     ?? normalizeSiteSession('OPENCLI_SITE_SESSION', process.env.OPENCLI_SITE_SESSION)
     ?? cmd.siteSession
     ?? 'ephemeral';
+}
+
+/**
+ * Every adapter tab shares one automation window, and only a window's active
+ * tab renders: a background tab stalls IntersectionObserver/rAF-driven lazy
+ * loading. A warm slot tab may have been backgrounded since its last run, so
+ * bring it to the front. A session bound to its tab lists exactly that tab;
+ * any other shape (no tab yet — the first navigate creates it active — or a
+ * window-wide listing) is left alone rather than risk selecting a tab that
+ * belongs to another session.
+ */
+async function activateSlotTab(page: IPage): Promise<void> {
+  const tabs = await page.tabs() as Array<{ page?: string; active?: boolean }>;
+  if (tabs.length === 1 && tabs[0].page && !tabs[0].active) await page.selectTab(tabs[0].page);
+}
+
+/**
+ * OPENCLI_SITE_SLOTS="xiaohongshu:1:1500-3000,weibo:2" pools the listed sites:
+ * `site:poolSize[:minMs[-maxMs]]`, where the optional interval spaces slot
+ * grants (one per command run) by a jittered delay.
+ */
+function resolveSiteSlotPolicy(site: string): SlotPolicy | null {
+  for (const raw of (process.env.OPENCLI_SITE_SLOTS ?? '').split(',')) {
+    const entry = raw.trim();
+    if (entry !== site && !entry.startsWith(`${site}:`)) continue;
+    const match = /^(\d+)(?::(\d+)(?:-(\d+))?)?$/.exec(entry.slice(site.length + 1));
+    if (!match || Number(match[1]) < 1) {
+      throw new ArgumentError(`OPENCLI_SITE_SLOTS entry "${entry}" must be site:poolSize[:minMs[-maxMs]] with poolSize >= 1.`);
+    }
+    const minIntervalMs = Number(match[2] ?? 0);
+    const maxIntervalMs = Math.max(minIntervalMs, Number(match[3] ?? minIntervalMs));
+    const policy = parseSlotPolicy({ poolSize: Number(match[1]), minIntervalMs, maxIntervalMs });
+    if (!policy) throw new ArgumentError('OPENCLI_SITE_SLOTS requires poolSize 1–32 and finite intervals no greater than 2147483647 ms.');
+    return policy;
+  }
+  return null;
 }
 
 function resolveAdapterBrowserSession(cmd: CliCommand, siteSession: SiteSessionMode): string {

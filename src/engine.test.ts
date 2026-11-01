@@ -442,6 +442,53 @@ browser: false
     await expect(discoverPlugins()).resolves.not.toThrow();
     expect(getRegistry().get('__test-plugin-broken__/hello')).toBeUndefined();
   });
+
+  it('restores the host package link before loading a plugin', async () => {
+    const pluginRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'opencli-plugin-runtime-'));
+    const pluginDir = path.join(pluginRoot, 'peer-demo');
+    const installedCopy = path.join(pluginDir, 'node_modules', '@jackwener', 'opencli');
+
+    try {
+      await fs.promises.mkdir(installedCopy, { recursive: true });
+      await fs.promises.writeFile(path.join(installedCopy, 'package.json'), JSON.stringify({
+        name: '@jackwener/opencli',
+        version: '1.8.8',
+      }));
+      await fs.promises.writeFile(path.join(pluginDir, 'peer-demo.js'), `
+import { cli, Strategy } from '@jackwener/opencli/registry';
+cli({ site: 'peer-demo', name: 'host-link', description: 'host link test', strategy: Strategy.PUBLIC, browser: false, access: 'read', columns: [], func: async () => [] });
+`);
+
+      await discoverPlugins(pluginRoot);
+
+      expect(fs.lstatSync(installedCopy).isSymbolicLink()).toBe(true);
+      expect(fs.realpathSync(installedCopy)).toBe(fs.realpathSync(path.resolve('')));
+      expect(getRegistry().get('peer-demo/host-link')).toBeDefined();
+    } finally {
+      await fs.promises.rm(pluginRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('skips plugins when the host package link cannot be created', async () => {
+    const pluginRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'opencli-plugin-link-failure-'));
+    const pluginDir = path.join(pluginRoot, 'peer-demo');
+
+    try {
+      await fs.promises.mkdir(pluginDir, { recursive: true });
+      await fs.promises.writeFile(path.join(pluginDir, 'node_modules'), 'blocks directory creation');
+      await fs.promises.writeFile(path.join(pluginDir, 'peer-demo.js'), `
+import { cli, Strategy } from '@jackwener/opencli/registry';
+cli({ site: 'peer-demo', name: 'link-failure', description: 'link failure test', strategy: Strategy.PUBLIC, browser: false, access: 'read', columns: [], func: async () => [] });
+`);
+
+      const { writes } = await captureStderr(() => discoverPlugins(pluginRoot));
+
+      expect(getRegistry().get('peer-demo/link-failure')).toBeUndefined();
+      expect(writes.join('')).toContain('Skipping plugin peer-demo because its host package could not be linked.');
+    } finally {
+      await fs.promises.rm(pluginRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('executeCommand', () => {
@@ -552,28 +599,5 @@ describe('executeCommand', () => {
     expect(typeof seen[0].finishedAt).toBe('number');
   });
 
-  it('uses launcher for registered Electron apps (chatwise)', async () => {
-    // Mock the launcher to return a fake endpoint (avoids real HTTP/process calls).
-    const launcher = await import('./launcher.js');
-    const launcherSpy = vi.spyOn(launcher, 'resolveElectronEndpoint')
-      .mockResolvedValue('http://127.0.0.1:9228');
-    const fakePage = {} as any;
-    vi.spyOn(runtime, 'browserSession').mockImplementation(async (_Factory, fn) => fn(fakePage));
 
-    const cmd = cli({
-      site: 'chatwise',
-      name: 'status', access: 'read',
-      description: 'chatwise status',
-      browser: true,
-      strategy: Strategy.PUBLIC,
-      func: async () => [{ ok: true }],
-    });
-
-    try {
-      await expect(executeCommand(cmd, {})).resolves.toEqual([{ ok: true }]);
-      expect(launcherSpy).toHaveBeenCalledWith('chatwise');
-    } finally {
-      vi.restoreAllMocks();
-    }
-  });
 });
