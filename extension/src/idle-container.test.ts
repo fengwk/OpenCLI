@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { consumeIdlePlaceholder, findIdleInteractiveGroup, idlePlaceholderUrl, parkIdleInteractiveTab } from './idle-container';
+import { consumeIdlePlaceholder, findIdleInteractiveGroup, idlePlaceholderUrl, isIdlePageUrl, parkIdleInteractiveTab } from './idle-container';
 const KEY = 'opencli_idle_interactive_v1';
 const token = '00000000-0000-4000-8000-000000000001';
 const marker = `chrome-extension://opencli/idle.html#${token}`;
@@ -73,6 +73,17 @@ describe('idle container ownership', () => {
     tabs.push({ id: 71, windowId: 7 });
     await expect(parkIdleInteractiveTab(70, 7)).resolves.toBeNull();
     expect(chromeMock.storage.local.set).not.toHaveBeenCalled();
+  });
+  it('recognizes only this extension\'s idle page as owned', () => {
+    // Recovery must not treat a foreign extension page or user content as our
+    // placeholder just because it is not CDP-debuggable.
+    expect(isIdlePageUrl(marker)).toBe(true);
+    expect(isIdlePageUrl('chrome-extension://opencli/idle.html')).toBe(true);
+    expect(isIdlePageUrl('chrome-extension://other/idle.html#' + token)).toBe(false);
+    expect(isIdlePageUrl('chrome-extension://opencli/idle.html.example')).toBe(false);
+    expect(isIdlePageUrl('https://user.example/form')).toBe(false);
+    expect(isIdlePageUrl('about:blank')).toBe(false);
+    expect(isIdlePageUrl(undefined)).toBe(false);
   });
   it('propagates storage failures instead of inventing ownership', async () => {
     chromeMock.storage.local.get.mockRejectedValue(new Error('storage unavailable'));

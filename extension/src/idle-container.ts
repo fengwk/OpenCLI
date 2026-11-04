@@ -19,6 +19,29 @@ export async function parkIdleInteractiveTab(tabId: number, windowId: number): P
   return `${chrome.runtime.getURL(PAGE)}#${token}`;
 }
 
+/**
+ * True only for this extension's own idle placeholder page. The token is
+ * deliberately not compared: a marker consumed on first claim leaves the
+ * document in place and the tab is still ours. Foreign extension pages and
+ * user content never match.
+ */
+export function isIdlePageUrl(url: string | undefined): boolean {
+  if (typeof url !== 'string') return false;
+  const page = chrome.runtime.getURL(PAGE);
+  return url === page || url.startsWith(`${page}#`);
+}
+
+/**
+ * Non-mutating claim check: the tab still shows the exact marked placeholder
+ * (token from storage) and the user has not started navigating it. The marker
+ * is the only ownership evidence, so callers verify first and consume only
+ * after the claim actually succeeded.
+ */
+export async function isClaimableIdlePlaceholder(tab: chrome.tabs.Tab): Promise<boolean> {
+  const url = await idlePlaceholderUrl();
+  return !!url && tab.url === url && (!tab.pendingUrl || tab.pendingUrl === url);
+}
+
 export async function consumeIdlePlaceholder(tab: chrome.tabs.Tab): Promise<void> {
   const url = await idlePlaceholderUrl();
   if (url && tab.url === url) {

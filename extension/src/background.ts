@@ -10,7 +10,7 @@ declare const __OPENCLI_COMPAT_RANGE__: string;
 import { callChrome, describeChrome, ChromeApiError } from './chrome-api';
 import type { Command, Result } from './protocol';
 import { DAEMON_HOST, DAEMON_PORT, DAEMON_WS_URL, DAEMON_PING_URL, EXTENSION_CAPABILITIES } from './protocol';
-import { findIdleInteractiveGroup, idlePlaceholderUrl, parkIdleInteractiveTab, consumeIdlePlaceholder } from './idle-container';
+import { findIdleInteractiveGroup, idlePlaceholderUrl, isClaimableIdlePlaceholder, isIdlePageUrl, parkIdleInteractiveTab, consumeIdlePlaceholder } from './idle-container';
 import * as executor from './cdp';
 import * as identity from './identity';
 import { executeWithJournal } from './journal';
@@ -1371,12 +1371,23 @@ async function createOwnedTabLeaseUnlocked(leaseKey: string, initialUrl?: string
 
   if (initialTabIsAvailable(initialTabId)) {
     tab = await chrome.tabs.get(initialTabId);
-    await consumeIdlePlaceholder(tab);
+    // Snapshot the marker before touching the tab: it is the only ownership
+    // evidence, so it is consumed only after the claim actually succeeded
+    // (navigated or restored). A failed claim must leave it in place.
+    const idleClaim = isIdlePageUrl(tab.url) ? { ...tab } : null;
+    if (idleClaim) await assertClaimableIdlePlaceholder(idleClaim);
     if (initialUrl && !isTargetUrl(tab.url, targetUrl)) {
       tab = await chrome.tabs.update(initialTabId, { url: targetUrl });
       await new Promise(resolve => setTimeout(resolve, 300));
       tab = await chrome.tabs.get(initialTabId);
+    } else if (idleClaim) {
+      // Claiming leaves the chrome-extension:// document in place when there is
+      // no initialUrl navigation to replace it. Restore the placeholder now:
+      // the next command (network-capture-start in the CLI's open flow) must
+      // attach CDP to this very tab.
+      tab = await restoreIdlePlaceholderTab(initialTabId);
     }
+    if (idleClaim) await consumeIdlePlaceholder(idleClaim);
   } else {
     tab = await chrome.tabs.create({ windowId, url: targetUrl, active: true });
   }
@@ -1724,6 +1735,66 @@ function isDebuggableUrl(url?: string): boolean {
   return url.startsWith('http://') || url.startsWith('https://') || url === 'about:blank' || url.startsWith('data:');
 }
 
+/** Bounded wait for a restored placeholder to become CDP-debuggable. */
+const IDLE_RESTORE_TIMEOUT_MS = 3_000;
+const IDLE_RESTORE_POLL_MS = 50;
+
+/**
+ * Ownership evidence for restoring a tab that still shows this extension's own
+ * idle placeholder. The storage marker is consumed when the tab is first
+ * claimed, so it can no longer prove ownership: the lease itself must be owned
+ * AND flagged as pointing at a tab this extension created. A user tab picked
+ * via `tabs select` (preferredTabOwned=false), a foreign extension page, and a
+ * tab the user is already navigating are all rejected.
+ */
+function isRestorableIdleTab(owned: boolean, preferredTabOwned: boolean, tab: chrome.tabs.Tab): boolean {
+  return owned
+    && preferredTabOwned
+    && isIdlePageUrl(tab.url)
+    && (!tab.pendingUrl || tab.pendingUrl === tab.url);
+}
+
+/**
+ * Guard a still-marked placeholder before touching it: the marker is the only
+ * ownership evidence, and a navigation the user already started must never be
+ * hijacked. Throws instead of claiming when either no longer holds.
+ */
+async function assertClaimableIdlePlaceholder(tab: chrome.tabs.Tab): Promise<void> {
+  if (!(await isClaimableIdlePlaceholder(tab))) {
+    throw new Error('Idle OpenCLI tab is no longer claimable (being navigated or already taken); retry the command.');
+  }
+}
+
+/** about:blank, settled, and not being navigated elsewhere — ready for CDP. */
+function isRestoredPlaceholderTab(tab: chrome.tabs.Tab): boolean {
+  return tab.url === BLANK_PAGE
+    && tab.status !== 'loading'
+    && (!tab.pendingUrl || tab.pendingUrl === BLANK_PAGE);
+}
+
+/**
+ * Restore a claimed owned tab from this extension's own idle placeholder to
+ * about:blank. The placeholder document is never CDP-debuggable, so leaving it
+ * in place fails the first attach of the session (the CLI arms
+ * network-capture-start before it navigates to the target). Bounded wait, then
+ * a read-back that must actually be a settled about:blank document: a bare
+ * "debuggable URL" check is too weak (an undefined/loading URL passes it and
+ * attachment would race the navigation).
+ */
+async function restoreIdlePlaceholderTab(tabId: number): Promise<chrome.tabs.Tab> {
+  await chrome.tabs.update(tabId, { url: BLANK_PAGE });
+  const deadline = Date.now() + IDLE_RESTORE_TIMEOUT_MS;
+  let tab = await chrome.tabs.get(tabId);
+  while (!isRestoredPlaceholderTab(tab)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Idle placeholder tab ${tabId} could not be restored to about:blank (url=${tab.url ?? 'unknown'})`);
+    }
+    await new Promise(resolve => setTimeout(resolve, IDLE_RESTORE_POLL_MS));
+    tab = await chrome.tabs.get(tabId);
+  }
+  return tab;
+}
+
 /** Check if a URL is safe for user-facing navigation (http/https only). */
 function isSafeNavigationUrl(url: string): boolean {
   return url.startsWith('http://') || url.startsWith('https://');
@@ -1819,6 +1890,39 @@ function setLeaseSession(
 }
 
 /**
+ * Point an existing owned lease at the tab a resolve path actually handed out
+ * (a reused container placeholder or a freshly created replacement). Without
+ * this the lease keeps naming the previous — undebuggable or closed — tab and
+ * release/reclaim would act on the wrong page.
+ *
+ * MUST be called with the lease mutation queue held (see resolveTab): the
+ * availability check and the write then cannot interleave with a concurrent
+ * claim. When the check fails the tab may belong to another session, so this
+ * throws instead of letting the caller hand out a tab it no longer owns.
+ */
+function adoptResolvedTab(
+  leaseKey: string,
+  previousTabId: number | null,
+  tabId: number,
+  tab: chrome.tabs.Tab,
+): void {
+  const current = automationSessions.get(leaseKey);
+  if (!current?.owned || current.preferredTabId !== previousTabId) {
+    throw new CommandFailure('session_busy', 'Session state changed while its tab was being resolved; retry the command.');
+  }
+  if (!initialTabIsAvailable(tabId)) {
+    throw new CommandFailure('session_busy', 'This tab was claimed by another session while it was being resolved; retry the command.');
+  }
+  current.preferredTabId = tabId;
+  // Both call sites hand out a tab this extension created or adopted inside its
+  // owned container; `tabs select` remains the only path that records a user
+  // page as non-owned.
+  current.preferredTabOwned = true;
+  current.windowId = tab.windowId;
+  void persistRuntimeState();
+}
+
+/**
  * Resolve tabId from command's page (targetId).
  * Returns undefined if no page identity is provided.
  */
@@ -1887,7 +1991,7 @@ async function resolveTab(tabId: number | undefined, leaseKey: string, initialUr
   if (existingSession && existingPreferredTabId !== null) {
     const session = existingSession;
     try {
-      const preferredTab = await chrome.tabs.get(existingPreferredTabId);
+      let preferredTab = await chrome.tabs.get(existingPreferredTabId);
       if (isDebuggableUrl(preferredTab.url)) return { tabId: preferredTab.id!, tab: preferredTab };
       if (!session.owned) {
         throw new CommandFailure(
@@ -1895,6 +1999,12 @@ async function resolveTab(tabId: number | undefined, leaseKey: string, initialUr
           `Bound tab for session "${session.session}" is not debuggable (${preferredTab.url ?? 'unknown URL'}).`,
           'Switch the tab to an http(s) page or run "opencli browser bind" on another tab.',
         );
+      }
+      // An owned lease can still point at our own idle placeholder: the marker
+      // is consumed on first claim, so the lease record is the evidence.
+      if (isRestorableIdleTab(session.owned, session.preferredTabOwned, preferredTab)) {
+        preferredTab = await restoreIdlePlaceholderTab(existingPreferredTabId);
+        return { tabId: preferredTab.id!, tab: preferredTab };
       }
     } catch (err) {
       if (err instanceof CommandFailure) throw err;
@@ -1911,22 +2021,55 @@ async function resolveTab(tabId: number | undefined, leaseKey: string, initialUr
   }
 
   if (!existingSession || (existingSession.owned && existingSession.preferredTabId === null)) {
+    // Takes the lease mutation queue itself, so it must stay outside the
+    // section below (nesting the same queue would deadlock).
     return createOwnedTabLease(leaseKey, initialUrl);
+  }
+
+  // Container selection, any placeholder restore, and the lease write-back are
+  // ONE lease-mutation section: otherwise two sessions resolving concurrently
+  // could both pick the same reusable tab. Nothing below calls
+  // createOwnedTabLease, so this never waits on the queue it holds.
+  return withLeaseMutation(() => resolveContainerTabUnlocked(leaseKey, existingPreferredTabId, initialUrl));
+}
+
+/**
+ * Container/fallback half of resolveTab. Caller holds the lease mutation queue;
+ * the lease and tab availability re-checks below are therefore authoritative.
+ */
+async function resolveContainerTabUnlocked(
+  leaseKey: string,
+  expectedTabId: number | null,
+  initialUrl?: string,
+): Promise<ResolvedTab> {
+  const session = automationSessions.get(leaseKey);
+  if (!session || session.preferredTabId !== expectedTabId) {
+    throw new CommandFailure('session_busy', 'Session state changed while its tab was being resolved; retry the command.');
   }
 
   // Get (or create) the dedicated automation container
   const windowId = await getAutomationWindow(leaseKey, initialUrl);
 
   const role = getOwnedWindowRole(leaseKey);
-  const group = existingSession?.owned ? await ensureOwnedContainerGroup(role, windowId, []) : null;
+  const group = session.owned ? await ensureOwnedContainerGroup(role, windowId, []) : null;
   const scopedWindowId = group?.windowId ?? windowId;
   const reusableTabId = await findReusableOwnedContainerTab(
     scopedWindowId,
-    existingSession?.owned ? (group?.id ?? null) : undefined,
+    session.owned ? (group?.id ?? null) : undefined,
   );
   if (reusableTabId !== undefined) {
     registerAdapterTab(leaseKey, reusableTabId);
-    return { tabId: reusableTabId, tab: await chrome.tabs.get(reusableTabId) };
+    let reusableTab = await chrome.tabs.get(reusableTabId);
+    const idleClaim = isIdlePageUrl(reusableTab.url) ? { ...reusableTab } : null;
+    if (idleClaim) await assertClaimableIdlePlaceholder(idleClaim);
+    if (idleClaim) {
+      // Restore first, consume second: a failed restore keeps the marker (the
+      // only ownership evidence) intact for the next attempt.
+      reusableTab = await restoreIdlePlaceholderTab(reusableTabId);
+      await consumeIdlePlaceholder(idleClaim);
+    }
+    adoptResolvedTab(leaseKey, expectedTabId, reusableTabId, reusableTab);
+    return { tabId: reusableTabId, tab: reusableTab };
   }
 
   // No debuggable tab — another extension may have hijacked the tab URL.
@@ -1934,7 +2077,7 @@ async function resolveTab(tabId: number | undefined, leaseKey: string, initialUr
   // without a group signal must create a fresh tab rather than overwrite user
   // content in a window where an OpenCLI group may have disappeared.
   const tabs = await chrome.tabs.query({ windowId: scopedWindowId });
-  const reuseTab = existingSession?.owned ? undefined : tabs.find(t => t.id);
+  const reuseTab = session.owned ? undefined : tabs.find(t => t.id);
   if (reuseTab?.id) {
     await chrome.tabs.update(reuseTab.id, { url: BLANK_PAGE });
     await new Promise(resolve => setTimeout(resolve, 300));
@@ -1950,11 +2093,13 @@ async function resolveTab(tabId: number | undefined, leaseKey: string, initialUr
   // Fallback: create a new tab
   const newTab = await chrome.tabs.create({ windowId: scopedWindowId, url: BLANK_PAGE, active: true });
   if (!newTab.id) throw new Error('Failed to create tab in automation container');
-  // Orphan-resistant: record the replacement tab even though the session's
-  // preferredTabId is not updated on this path.
+  // Orphan-resistant: record the replacement tab immediately, then make the
+  // lease point at it so release/reclaim act on the tab this session serves.
   registerAdapterTab(leaseKey, newTab.id);
   await ensureOwnedContainerGroup(role, scopedWindowId, [newTab.id]);
-  return { tabId: newTab.id, tab: await chrome.tabs.get(newTab.id) };
+  const createdTab = await chrome.tabs.get(newTab.id);
+  adoptResolvedTab(leaseKey, expectedTabId, newTab.id, createdTab);
+  return { tabId: newTab.id, tab: createdTab };
 }
 
 /** Build a page-scoped success result with targetId resolved from tabId */
@@ -2992,7 +3137,17 @@ async function reconcileTargetLeaseRegistry(): Promise<void> {
     if (tabId === null) continue;
     try {
       const tab = await chrome.tabs.get(tabId);
-      if (!isDebuggableUrl(tab.url)) continue;
+      if (
+        !isDebuggableUrl(tab.url)
+        // An owned lease can legitimately still point at our own idle
+        // placeholder: the marker is consumed on first claim, so the lease
+        // record is the remaining evidence. The tab is restored to about:blank
+        // lazily by the next command that resolves this lease — recovery must
+        // not navigate anything on its own. User pages (preferredTabOwned
+        // false), foreign extension pages, and tabs the user is navigating are
+        // not recoverable and keep the historical drop behavior.
+        && !isRestorableIdleTab(stored.owned === true, stored.preferredTabOwned === true, tab)
+      ) continue;
       if (stored.lifecycle === 'ephemeral' || stored.lifecycle === 'persistent' || stored.lifecycle === 'pinned') {
         setSessionOverride(leaseKey, { lifecycle: stored.lifecycle });
       }
