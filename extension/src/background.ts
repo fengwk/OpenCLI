@@ -1368,13 +1368,16 @@ async function createOwnedTabLeaseUnlocked(leaseKey: string, initialUrl?: string
   // initial load can still expose about:blank, causing a duplicate tabs.update.
   const { windowId, initialTabId } = await ensureOwnedContainerWindow(role, initialUrl, getWindowMode(leaseKey));
   let tab: chrome.tabs.Tab;
+  // Snapshot of the claimed marker: the marker is the only ownership evidence,
+  // so it is consumed only after the claim actually succeeded (navigated or
+  // replaced). Set when a self-idle placeholder was replaced by a fresh blank
+  // tab: the placeholder is retired only after the lease points at the new tab.
+  let idleClaim: chrome.tabs.Tab | null = null;
+  let replacedIdleTabId: number | null = null;
 
   if (initialTabIsAvailable(initialTabId)) {
     tab = await chrome.tabs.get(initialTabId);
-    // Snapshot the marker before touching the tab: it is the only ownership
-    // evidence, so it is consumed only after the claim actually succeeded
-    // (navigated or restored). A failed claim must leave it in place.
-    const idleClaim = isIdlePageUrl(tab.url) ? { ...tab } : null;
+    idleClaim = isIdlePageUrl(tab.url) ? { ...tab } : null;
     if (idleClaim) await assertClaimableIdlePlaceholder(idleClaim);
     if (initialUrl && !isTargetUrl(tab.url, targetUrl)) {
       tab = await chrome.tabs.update(initialTabId, { url: targetUrl });
@@ -1382,12 +1385,12 @@ async function createOwnedTabLeaseUnlocked(leaseKey: string, initialUrl?: string
       tab = await chrome.tabs.get(initialTabId);
     } else if (idleClaim) {
       // Claiming leaves the chrome-extension:// document in place when there is
-      // no initialUrl navigation to replace it. Restore the placeholder now:
-      // the next command (network-capture-start in the CLI's open flow) must
-      // attach CDP to this very tab.
-      tab = await restoreIdlePlaceholderTab(initialTabId);
+      // no initialUrl navigation to replace it, and Chrome will not attach CDP
+      // to it afterwards. Claim the lease onto a fresh about:blank tab in the
+      // same window/group instead; the old idle tab is retired below.
+      tab = await createBlankReplacementTab(leaseKey, idleClaim);
+      replacedIdleTabId = idleClaim.id ?? null;
     }
-    if (idleClaim) await consumeIdlePlaceholder(idleClaim);
   } else {
     tab = await chrome.tabs.create({ windowId, url: targetUrl, active: true });
   }
@@ -1409,6 +1412,8 @@ async function createOwnedTabLeaseUnlocked(leaseKey: string, initialUrl?: string
     preferredTabId: tabId,
     preferredTabOwned: true,
   });
+  if (idleClaim) await consumeIdlePlaceholder(idleClaim);
+  if (replacedIdleTabId !== null) await discardReplacedIdleTab(replacedIdleTabId);
   resetWindowIdleTimer(leaseKey);
   return { tabId, tab };
 }
@@ -1773,26 +1778,58 @@ function isRestoredPlaceholderTab(tab: chrome.tabs.Tab): boolean {
 }
 
 /**
- * Restore a claimed owned tab from this extension's own idle placeholder to
- * about:blank. The placeholder document is never CDP-debuggable, so leaving it
- * in place fails the first attach of the session (the CLI arms
- * network-capture-start before it navigates to the target). Bounded wait, then
- * a read-back that must actually be a settled about:blank document: a bare
- * "debuggable URL" check is too weak (an undefined/loading URL passes it and
- * attachment would race the navigation).
+ * Create the about:blank tab that replaces a self-idle placeholder, in the same
+ * owned window/group, and return it only once it is a settled blank document.
+ *
+ * Chrome refuses to attach CDP to the extension page after an in-place
+ * navigation to about:blank ("Cannot attach to this target"), so the placeholder
+ * tab itself is never reused. On failure only the tab created here is closed:
+ * the placeholder and its marker stay recoverable.
  */
-async function restoreIdlePlaceholderTab(tabId: number): Promise<chrome.tabs.Tab> {
-  await chrome.tabs.update(tabId, { url: BLANK_PAGE });
-  const deadline = Date.now() + IDLE_RESTORE_TIMEOUT_MS;
-  let tab = await chrome.tabs.get(tabId);
-  while (!isRestoredPlaceholderTab(tab)) {
-    if (Date.now() >= deadline) {
-      throw new Error(`Idle placeholder tab ${tabId} could not be restored to about:blank (url=${tab.url ?? 'unknown'})`);
+async function createBlankReplacementTab(
+  leaseKey: string,
+  placeholder: chrome.tabs.Tab,
+): Promise<chrome.tabs.Tab> {
+  const created = await chrome.tabs.create({ windowId: placeholder.windowId, url: BLANK_PAGE, active: true });
+  if (!created.id) throw new Error('Failed to create a replacement tab for the idle placeholder');
+  const createdId = created.id;
+  try {
+    // Same owned window/group as the placeholder it replaces.
+    await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), placeholder.windowId, [createdId]);
+    const deadline = Date.now() + IDLE_RESTORE_TIMEOUT_MS;
+    let tab = await chrome.tabs.get(createdId);
+    while (!isRestoredPlaceholderTab(tab)) {
+      if (Date.now() >= deadline) {
+        throw new Error(`Replacement tab ${createdId} never became a settled about:blank page (url=${tab.url ?? 'unknown'})`);
+      }
+      await new Promise(resolve => setTimeout(resolve, IDLE_RESTORE_POLL_MS));
+      tab = await chrome.tabs.get(createdId);
     }
-    await new Promise(resolve => setTimeout(resolve, IDLE_RESTORE_POLL_MS));
-    tab = await chrome.tabs.get(tabId);
+    registerAdapterTab(leaseKey, createdId);
+    return tab;
+  } catch (err) {
+    await chrome.tabs.remove(createdId).catch(() => {});
+    throw err;
   }
-  return tab;
+}
+
+/**
+ * Close a replaced self-idle placeholder. Only a tab that still shows our idle
+ * page and is referenced by no lease is removed: a navigation the user started
+ * while we were replacing it makes the tab theirs, and leases are already
+ * pointing at the replacement by the time this runs.
+ */
+async function discardReplacedIdleTab(oldTabId: number): Promise<void> {
+  let oldTab: chrome.tabs.Tab;
+  try {
+    oldTab = await chrome.tabs.get(oldTabId);
+  } catch {
+    return; // already gone
+  }
+  if (!isIdlePageUrl(oldTab.url)) return;
+  if (oldTab.pendingUrl && oldTab.pendingUrl !== oldTab.url) return;
+  if ([...automationSessions.values()].some(session => session.preferredTabId === oldTabId)) return;
+  await chrome.tabs.remove(oldTabId).catch(() => {});
 }
 
 /** Check if a URL is safe for user-facing navigation (http/https only). */
@@ -2003,8 +2040,7 @@ async function resolveTab(tabId: number | undefined, leaseKey: string, initialUr
       // An owned lease can still point at our own idle placeholder: the marker
       // is consumed on first claim, so the lease record is the evidence.
       if (isRestorableIdleTab(session.owned, session.preferredTabOwned, preferredTab)) {
-        preferredTab = await restoreIdlePlaceholderTab(existingPreferredTabId);
-        return { tabId: preferredTab.id!, tab: preferredTab };
+        return withLeaseMutation(() => recoverIdleLeaseTabUnlocked(leaseKey, existingPreferredTabId));
       }
     } catch (err) {
       if (err instanceof CommandFailure) throw err;
@@ -2034,6 +2070,33 @@ async function resolveTab(tabId: number | undefined, leaseKey: string, initialUr
 }
 
 /**
+ * Move an owned lease that still points at our self-idle placeholder onto a
+ * fresh about:blank tab and retire the placeholder. Caller holds the lease
+ * mutation queue, so the session and the old tab are re-read here before
+ * anything is touched: the user may have navigated the tab meanwhile (then it
+ * is their page and stays), or the lease may have moved on.
+ */
+async function recoverIdleLeaseTabUnlocked(leaseKey: string, expectedTabId: number): Promise<ResolvedTab> {
+  const session = automationSessions.get(leaseKey);
+  if (!session?.owned || session.preferredTabId !== expectedTabId) {
+    throw new CommandFailure('session_busy', 'Session state changed while its idle tab was being recovered; retry the command.');
+  }
+  const oldTab = await chrome.tabs.get(expectedTabId);
+  if (isDebuggableUrl(oldTab.url)) return { tabId: expectedTabId, tab: oldTab };
+  if (!isIdlePageUrl(oldTab.url) || (oldTab.pendingUrl && oldTab.pendingUrl !== oldTab.url)) {
+    // Foreign extension page, or a user navigation is in flight on it: leave
+    // the tab alone and resolve a replacement the normal way.
+    return resolveContainerTabUnlocked(leaseKey, expectedTabId);
+  }
+  const replacement = await createBlankReplacementTab(leaseKey, oldTab);
+  const replacementId = replacement.id!;
+  adoptResolvedTab(leaseKey, expectedTabId, replacementId, replacement);
+  await consumeIdlePlaceholder({ ...oldTab });
+  await discardReplacedIdleTab(expectedTabId);
+  return { tabId: replacementId, tab: replacement };
+}
+
+/**
  * Container/fallback half of resolveTab. Caller holds the lease mutation queue;
  * the lease and tab availability re-checks below are therefore authoritative.
  */
@@ -2058,16 +2121,20 @@ async function resolveContainerTabUnlocked(
     session.owned ? (group?.id ?? null) : undefined,
   );
   if (reusableTabId !== undefined) {
-    registerAdapterTab(leaseKey, reusableTabId);
-    let reusableTab = await chrome.tabs.get(reusableTabId);
+    const reusableTab = await chrome.tabs.get(reusableTabId);
     const idleClaim = isIdlePageUrl(reusableTab.url) ? { ...reusableTab } : null;
-    if (idleClaim) await assertClaimableIdlePlaceholder(idleClaim);
     if (idleClaim) {
-      // Restore first, consume second: a failed restore keeps the marker (the
-      // only ownership evidence) intact for the next attempt.
-      reusableTab = await restoreIdlePlaceholderTab(reusableTabId);
+      await assertClaimableIdlePlaceholder(idleClaim);
+      // In-place reset is not CDP-attachable in Chrome: claim a fresh
+      // about:blank tab, point the lease at it, then retire the placeholder.
+      const replacement = await createBlankReplacementTab(leaseKey, idleClaim);
+      const replacementId = replacement.id!;
+      adoptResolvedTab(leaseKey, expectedTabId, replacementId, replacement);
       await consumeIdlePlaceholder(idleClaim);
+      await discardReplacedIdleTab(reusableTabId);
+      return { tabId: replacementId, tab: replacement };
     }
+    registerAdapterTab(leaseKey, reusableTabId);
     adoptResolvedTab(leaseKey, expectedTabId, reusableTabId, reusableTab);
     return { tabId: reusableTabId, tab: reusableTab };
   }

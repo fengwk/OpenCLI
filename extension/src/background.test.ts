@@ -1113,12 +1113,11 @@ describe('background tab isolation', () => {
     expect(chrome.windows.create).not.toHaveBeenCalled();
   });
 
-  // The `browser open` flow issues network-capture-start before the target
-  // navigation. Claiming the interactive idle placeholder without an
-  // initialUrl consumed the marker but left the chrome-extension:// document
-  // in place, so that first CDP attach failed on an undebuggable tab.
-  it('restores a claimed idle placeholder before the first no-URL capture command', async () => {
-    const { chrome, tabs, groups } = createChromeMock();
+  // Chrome 150 refuses CDP attachment to the extension page after an in-place
+  // navigation to about:blank ("Cannot attach to this target"), so the claimed
+  // placeholder must be replaced by a fresh blank tab, never reset in place.
+  it('replaces the claimed idle placeholder with a debuggable blank tab', async () => {
+    const { chrome, tabs, groups, create } = createChromeMock();
     const token = '00000000-0000-4000-8000-000000000001';
     tabs.push({ id: 70, windowId: 7, url: `chrome-extension://opencli/idle.html#${token}`, active: true, status: 'complete', groupId: 400 });
     groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
@@ -1126,6 +1125,10 @@ describe('background tab isolation', () => {
     // Production chrome.debugger.sendCommand resolves a promise; the CDP
     // executor awaits it on the capture path.
     chrome.debugger.sendCommand = vi.fn(async () => ({}));
+    chrome.tabs.remove = vi.fn(async (id: number) => {
+      const idx = tabs.findIndex((tab) => tab.id === id);
+      if (idx >= 0) tabs.splice(idx, 1);
+    });
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
@@ -1134,26 +1137,36 @@ describe('background tab isolation', () => {
     });
 
     expect(started).toMatchObject({ ok: true, data: { started: true } });
-    // The capture attached to the restored placeholder instead of failing on
-    // the extension's own idle page.
-    expect(chrome.debugger.attach).toHaveBeenCalledWith({ tabId: 70 }, '1.3');
-    expect(tabs.find((tab) => tab.id === 70)?.url).toBe('about:blank');
-    expect(mod.__test__.getSession(browserKey('default'))).toMatchObject({
-      preferredTabId: 70,
-      owned: true,
-      preferredTabOwned: true,
-    });
-    // Consumed only after the restore succeeded.
+    const session = mod.__test__.getSession(browserKey('default'))!;
+    const replacementId = session.preferredTabId!;
+    expect(replacementId).not.toBe(70);
+    // CDP attaches to the fresh tab; the placeholder is never reset in place.
+    expect(chrome.debugger.attach).toHaveBeenCalledWith({ tabId: replacementId }, '1.3');
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(chrome.tabs.update).not.toHaveBeenCalledWith(70, expect.anything());
+    // Same owned window and group, and the old idle tab is retired.
+    expect(tabs.find((tab) => tab.id === replacementId)).toMatchObject({ url: 'about:blank', windowId: 7, groupId: 400 });
+    expect(tabs.some((tab) => tab.id === 70)).toBe(false);
+    expect(session).toMatchObject({ owned: true, preferredTabOwned: true });
+    // Marker consumed only after the replacement was ready and adopted.
     expect((await chrome.storage.local.get('opencli_idle_interactive_v1')).opencli_idle_interactive_v1).toBeUndefined();
+
+    // Release parks the replacement: the window keeps exactly one placeholder.
+    await mod.__test__.handleCommand({ id: 'release', action: 'close-window', session: 'default', surface: 'browser' });
+    expect(tabs.filter((tab) => tab.windowId === 7)).toHaveLength(1);
   });
 
-  it('keeps the capture armed on the restored placeholder through the first navigation', async () => {
+  it('keeps the capture armed on the replacement tab through the first navigation', async () => {
     const { chrome, tabs, groups, create } = createChromeMock();
     const token = '00000000-0000-4000-8000-000000000002';
     tabs.push({ id: 70, windowId: 7, url: `chrome-extension://opencli/idle.html#${token}`, active: true, status: 'complete', groupId: 400 });
     groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
     await chrome.storage.local.set({ opencli_idle_interactive_v1: token });
     chrome.debugger.sendCommand = vi.fn(async () => ({}));
+    chrome.tabs.remove = vi.fn(async (id: number) => {
+      const idx = tabs.findIndex((tab) => tab.id === id);
+      if (idx >= 0) tabs.splice(idx, 1);
+    });
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
@@ -1161,6 +1174,7 @@ describe('background tab isolation', () => {
       id: 'idle-capture', action: 'network-capture-start', session: 'default', surface: 'browser',
     });
     expect(started).toMatchObject({ ok: true });
+    const replacementId = mod.__test__.getSession(browserKey('default'))!.preferredTabId!;
     chrome.debugger.detach.mockClear();
 
     const navigated = await mod.__test__.handleCommand({
@@ -1168,20 +1182,26 @@ describe('background tab isolation', () => {
     });
 
     expect(navigated).toMatchObject({ ok: true });
-    // Same tab for capture and navigation — no replacement tab, and the armed
-    // debugger was never detached before the target request went out.
-    expect(chrome.tabs.update).toHaveBeenCalledWith(70, { url: 'https://target.example' });
-    expect(create).not.toHaveBeenCalled();
-    expect(chrome.debugger.detach).not.toHaveBeenCalledWith({ tabId: 70 });
-    expect(tabs.find((tab) => tab.id === 70)?.url).toBe('https://target.example');
+    // Capture and the target navigation use the same replacement tab; the
+    // armed debugger was never detached before the target request went out and
+    // the retired placeholder was not touched.
+    expect(chrome.tabs.update).toHaveBeenCalledWith(replacementId, { url: 'https://target.example' });
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(chrome.tabs.update).not.toHaveBeenCalledWith(70, expect.anything());
+    expect(chrome.debugger.detach).not.toHaveBeenCalledWith({ tabId: replacementId });
+    expect(tabs.find((tab) => tab.id === replacementId)?.url).toBe('https://target.example');
   });
 
-  it('restores a recovered owned lease whose idle marker was already consumed', async () => {
+  it('replaces the consumed idle placeholder of a recovered owned lease', async () => {
     // The storage token is gone (consumed when the tab was first claimed), so
     // the lease record itself must carry the ownership evidence.
-    const { chrome, tabs, groups } = createChromeMock();
+    const { chrome, tabs, groups, create } = createChromeMock();
     tabs.push({ id: 70, windowId: 7, url: 'chrome-extension://opencli/idle.html#consumed', active: true, status: 'complete', groupId: 400 });
     groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    chrome.tabs.remove = vi.fn(async (id: number) => {
+      const idx = tabs.findIndex((tab) => tab.id === id);
+      if (idx >= 0) tabs.splice(idx, 1);
+    });
     vi.stubGlobal('chrome', chrome);
     await chrome.storage.session.set({
       opencli_target_lease_registry_v2: {
@@ -1212,8 +1232,16 @@ describe('background tab isolation', () => {
     await mod.__test__.reconcileTargetLeaseRegistry();
     expect(mod.__test__.getSession(browserKey('restored'))).toMatchObject({ preferredTabId: 70, preferredTabOwned: true });
 
-    expect(await mod.__test__.resolveTabId(undefined, browserKey('restored'))).toBe(70);
-    expect(tabs.find((tab) => tab.id === 70)?.url).toBe('about:blank');
+    const tabId = await mod.__test__.resolveTabId(undefined, browserKey('restored'));
+    // A fresh blank tab replaces the placeholder; the old one is retired, the
+    // owned window/group survives, and the lease points at the new tab.
+    expect(tabId).not.toBe(70);
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(create.mock.calls[0][0]).toMatchObject({ windowId: 7, url: 'about:blank' });
+    expect(chrome.tabs.update).not.toHaveBeenCalledWith(70, expect.anything());
+    expect(tabs.some((tab) => tab.id === 70)).toBe(false);
+    expect(tabs.find((tab) => tab.id === tabId)).toMatchObject({ url: 'about:blank', windowId: 7, groupId: 400 });
+    expect(mod.__test__.getSession(browserKey('restored'))).toMatchObject({ preferredTabId: tabId, preferredTabOwned: true });
     expect(chrome.windows.create).not.toHaveBeenCalled();
   });
 
@@ -1316,13 +1344,13 @@ describe('background tab isolation', () => {
     expect(chrome.tabs.update).not.toHaveBeenCalledWith(20, expect.anything());
   });
 
-  it('leaves no lease behind when the claimed placeholder cannot be restored', async () => {
+  it('keeps the placeholder recoverable when the replacement tab cannot be created', async () => {
     const { chrome, tabs, groups } = createChromeMock();
     const token = '00000000-0000-4000-8000-000000000003';
     tabs.push({ id: 70, windowId: 7, url: `chrome-extension://opencli/idle.html#${token}`, active: true, status: 'complete', groupId: 400 });
     groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
     await chrome.storage.local.set({ opencli_idle_interactive_v1: token });
-    chrome.tabs.update = vi.fn(async () => { throw new Error('navigation blocked'); });
+    chrome.tabs.create = vi.fn(async () => { throw new Error('tab create blocked'); });
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
@@ -1330,11 +1358,15 @@ describe('background tab isolation', () => {
       id: 'idle-fail', action: 'network-capture-start', session: 'fail', surface: 'browser',
     });
 
-    expect(started).toMatchObject({ ok: false, error: 'navigation blocked' });
+    expect(started).toMatchObject({ ok: false, error: 'tab create blocked' });
     expect(mod.__test__.getSession(browserKey('fail'))).toBeNull();
     expect(chrome.debugger.attach).not.toHaveBeenCalled();
-    // The marker is the only ownership evidence: a failed restore must keep it.
+    // No half-made lease: the marker and the untouched placeholder remain the
+    // evidence the next attempt needs.
     expect((await chrome.storage.local.get('opencli_idle_interactive_v1')).opencli_idle_interactive_v1).toBe(token);
+    expect(tabs.find((tab) => tab.id === 70)).toMatchObject({ url: `chrome-extension://opencli/idle.html#${token}` });
+    expect(chrome.tabs.update).not.toHaveBeenCalledWith(70, expect.anything());
+    expect(chrome.tabs.remove).toHaveBeenCalledTimes(0);
   });
 
   it('propagates owned group recovery errors instead of creating a replacement window', async () => {
