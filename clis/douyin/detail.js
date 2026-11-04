@@ -69,6 +69,12 @@ function fmtTime(ts) {
     try { return new Date(ts * 1000).toISOString().slice(0, 19).replace('T', ' '); } catch { return String(ts); }
 }
 
+// 互动统计是可选的：只原样返回非负安全整数；缺失或非法（字符串、负数、小数、超范围、布尔）一律 null，
+// 真实 0 必须保留，不能用 0 冒充缺失。
+function readCount(value) {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
 cli({
     site: 'douyin',
     name: 'detail',
@@ -103,10 +109,10 @@ cli({
             desc: d.desc ?? '',
             author: d.author?.nickname ?? '',
             author_sec_uid: d.author?.sec_uid ?? '',
-            digg: st.digg_count ?? 0,
-            comment: st.comment_count ?? 0,
-            collect: st.collect_count ?? 0,
-            share: st.share_count ?? 0,
+            digg: readCount(st.digg_count),
+            comment: readCount(st.comment_count),
+            collect: readCount(st.collect_count),
+            share: readCount(st.share_count),
             created: fmtTime(d.create_time),
             duration_s: Math.round((d.video?.duration ?? 0) / 1000),
             music: d.music?.title ?? '',

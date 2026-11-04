@@ -78,3 +78,5 @@ opencli douyin profile -f json
 ## Public content details
 
 `opencli douyin detail <target> -f json` uses your browser session on `www.douyin.com`. It returns the caption, author and sec_uid, engagement counts, UTC creation time, duration, music, media URLs and image list. The target accepts a 16–20 digit ID, a Douyin video URL, or an HTTPS `v.douyin.com` share URL. Short links follow at most six redirects within known Douyin domains. Deleted, restricted, mismatched and failed API responses produce explicit errors. Media URLs may expire.
+
+Engagement counts (`digg`, `comment`, `collect`, `share`) are reported exactly as Douyin returns them: a non-negative integer, real `0` included. `null` means the platform did not report a usable count for that field, so treat it as missing/unavailable rather than zero; other fields are unaffected.
