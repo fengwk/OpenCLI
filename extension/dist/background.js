@@ -105,6 +105,15 @@ async function parkIdleInteractiveTab(tabId, windowId) {
   await chrome.storage.local.set({ [KEY]: token });
   return `${chrome.runtime.getURL(PAGE)}#${token}`;
 }
+function isIdlePageUrl(url) {
+  if (typeof url !== "string") return false;
+  const page = chrome.runtime.getURL(PAGE);
+  return url === page || url.startsWith(`${page}#`);
+}
+async function isClaimableIdlePlaceholder(tab) {
+  const url = await idlePlaceholderUrl();
+  return !!url && tab.url === url && (!tab.pendingUrl || tab.pendingUrl === url);
+}
 async function consumeIdlePlaceholder(tab) {
   const url = await idlePlaceholderUrl();
   if (url && tab.url === url) {
@@ -2413,12 +2422,16 @@ async function createOwnedTabLeaseUnlocked(leaseKey, initialUrl) {
   let tab;
   if (initialTabIsAvailable(initialTabId)) {
     tab = await chrome.tabs.get(initialTabId);
-    await consumeIdlePlaceholder(tab);
+    const idleClaim = isIdlePageUrl(tab.url) ? { ...tab } : null;
+    if (idleClaim) await assertClaimableIdlePlaceholder(idleClaim);
     if (initialUrl && !isTargetUrl(tab.url, targetUrl)) {
       tab = await chrome.tabs.update(initialTabId, { url: targetUrl });
       await new Promise((resolve) => setTimeout(resolve, 300));
       tab = await chrome.tabs.get(initialTabId);
+    } else if (idleClaim) {
+      tab = await restoreIdlePlaceholderTab(initialTabId);
     }
+    if (idleClaim) await consumeIdlePlaceholder(idleClaim);
   } else {
     tab = await chrome.tabs.create({ windowId, url: targetUrl, active: true });
   }
@@ -2689,6 +2702,32 @@ function isDebuggableUrl(url) {
   if (!url) return true;
   return url.startsWith("http://") || url.startsWith("https://") || url === "about:blank" || url.startsWith("data:");
 }
+const IDLE_RESTORE_TIMEOUT_MS = 3e3;
+const IDLE_RESTORE_POLL_MS = 50;
+function isRestorableIdleTab(owned, preferredTabOwned, tab) {
+  return owned && preferredTabOwned && isIdlePageUrl(tab.url) && (!tab.pendingUrl || tab.pendingUrl === tab.url);
+}
+async function assertClaimableIdlePlaceholder(tab) {
+  if (!await isClaimableIdlePlaceholder(tab)) {
+    throw new Error("Idle OpenCLI tab is no longer claimable (being navigated or already taken); retry the command.");
+  }
+}
+function isRestoredPlaceholderTab(tab) {
+  return tab.url === BLANK_PAGE && tab.status !== "loading" && (!tab.pendingUrl || tab.pendingUrl === BLANK_PAGE);
+}
+async function restoreIdlePlaceholderTab(tabId) {
+  await chrome.tabs.update(tabId, { url: BLANK_PAGE });
+  const deadline = Date.now() + IDLE_RESTORE_TIMEOUT_MS;
+  let tab = await chrome.tabs.get(tabId);
+  while (!isRestoredPlaceholderTab(tab)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Idle placeholder tab ${tabId} could not be restored to about:blank (url=${tab.url ?? "unknown"})`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, IDLE_RESTORE_POLL_MS));
+    tab = await chrome.tabs.get(tabId);
+  }
+  return tab;
+}
 function isSafeNavigationUrl(url) {
   return url.startsWith("http://") || url.startsWith("https://");
 }
@@ -2761,6 +2800,19 @@ function setLeaseSession(leaseKey, session) {
   });
   void persistRuntimeState();
 }
+function adoptResolvedTab(leaseKey, previousTabId, tabId, tab) {
+  const current = automationSessions.get(leaseKey);
+  if (!current?.owned || current.preferredTabId !== previousTabId) {
+    throw new CommandFailure("session_busy", "Session state changed while its tab was being resolved; retry the command.");
+  }
+  if (!initialTabIsAvailable(tabId)) {
+    throw new CommandFailure("session_busy", "This tab was claimed by another session while it was being resolved; retry the command.");
+  }
+  current.preferredTabId = tabId;
+  current.preferredTabOwned = true;
+  current.windowId = tab.windowId;
+  void persistRuntimeState();
+}
 async function resolveCommandTabId(cmd) {
   if (cmd.page) return resolveTabId$1(cmd.page);
   return void 0;
@@ -2811,7 +2863,7 @@ async function resolveTab(tabId, leaseKey, initialUrl) {
   if (existingSession && existingPreferredTabId !== null) {
     const session = existingSession;
     try {
-      const preferredTab = await chrome.tabs.get(existingPreferredTabId);
+      let preferredTab = await chrome.tabs.get(existingPreferredTabId);
       if (isDebuggableUrl(preferredTab.url)) return { tabId: preferredTab.id, tab: preferredTab };
       if (!session.owned) {
         throw new CommandFailure(
@@ -2819,6 +2871,10 @@ async function resolveTab(tabId, leaseKey, initialUrl) {
           `Bound tab for session "${session.session}" is not debuggable (${preferredTab.url ?? "unknown URL"}).`,
           'Switch the tab to an http(s) page or run "opencli browser bind" on another tab.'
         );
+      }
+      if (isRestorableIdleTab(session.owned, session.preferredTabOwned, preferredTab)) {
+        preferredTab = await restoreIdlePlaceholderTab(existingPreferredTabId);
+        return { tabId: preferredTab.id, tab: preferredTab };
       }
     } catch (err) {
       if (err instanceof CommandFailure) throw err;
@@ -2836,20 +2892,35 @@ async function resolveTab(tabId, leaseKey, initialUrl) {
   if (!existingSession || existingSession.owned && existingSession.preferredTabId === null) {
     return createOwnedTabLease(leaseKey, initialUrl);
   }
+  return withLeaseMutation(() => resolveContainerTabUnlocked(leaseKey, existingPreferredTabId, initialUrl));
+}
+async function resolveContainerTabUnlocked(leaseKey, expectedTabId, initialUrl) {
+  const session = automationSessions.get(leaseKey);
+  if (!session || session.preferredTabId !== expectedTabId) {
+    throw new CommandFailure("session_busy", "Session state changed while its tab was being resolved; retry the command.");
+  }
   const windowId = await getAutomationWindow(leaseKey, initialUrl);
   const role = getOwnedWindowRole(leaseKey);
-  const group = existingSession?.owned ? await ensureOwnedContainerGroup(role, windowId, []) : null;
+  const group = session.owned ? await ensureOwnedContainerGroup(role, windowId, []) : null;
   const scopedWindowId = group?.windowId ?? windowId;
   const reusableTabId = await findReusableOwnedContainerTab(
     scopedWindowId,
-    existingSession?.owned ? group?.id ?? null : void 0
+    session.owned ? group?.id ?? null : void 0
   );
   if (reusableTabId !== void 0) {
     registerAdapterTab(leaseKey, reusableTabId);
-    return { tabId: reusableTabId, tab: await chrome.tabs.get(reusableTabId) };
+    let reusableTab = await chrome.tabs.get(reusableTabId);
+    const idleClaim = isIdlePageUrl(reusableTab.url) ? { ...reusableTab } : null;
+    if (idleClaim) await assertClaimableIdlePlaceholder(idleClaim);
+    if (idleClaim) {
+      reusableTab = await restoreIdlePlaceholderTab(reusableTabId);
+      await consumeIdlePlaceholder(idleClaim);
+    }
+    adoptResolvedTab(leaseKey, expectedTabId, reusableTabId, reusableTab);
+    return { tabId: reusableTabId, tab: reusableTab };
   }
   const tabs = await chrome.tabs.query({ windowId: scopedWindowId });
-  const reuseTab = existingSession?.owned ? void 0 : tabs.find((t) => t.id);
+  const reuseTab = session.owned ? void 0 : tabs.find((t) => t.id);
   if (reuseTab?.id) {
     await chrome.tabs.update(reuseTab.id, { url: BLANK_PAGE });
     await new Promise((resolve) => setTimeout(resolve, 300));
@@ -2864,7 +2935,9 @@ async function resolveTab(tabId, leaseKey, initialUrl) {
   if (!newTab.id) throw new Error("Failed to create tab in automation container");
   registerAdapterTab(leaseKey, newTab.id);
   await ensureOwnedContainerGroup(role, scopedWindowId, [newTab.id]);
-  return { tabId: newTab.id, tab: await chrome.tabs.get(newTab.id) };
+  const createdTab = await chrome.tabs.get(newTab.id);
+  adoptResolvedTab(leaseKey, expectedTabId, newTab.id, createdTab);
+  return { tabId: newTab.id, tab: createdTab };
 }
 async function pageScopedResult(id, tabId, data) {
   const page = await resolveTargetId(tabId);
@@ -3705,7 +3778,7 @@ async function reconcileTargetLeaseRegistry() {
     if (tabId === null) continue;
     try {
       const tab = await chrome.tabs.get(tabId);
-      if (!isDebuggableUrl(tab.url)) continue;
+      if (!isDebuggableUrl(tab.url) && !isRestorableIdleTab(stored.owned === true, stored.preferredTabOwned === true, tab)) continue;
       if (stored.lifecycle === "ephemeral" || stored.lifecycle === "persistent" || stored.lifecycle === "pinned") {
         setSessionOverride(leaseKey, { lifecycle: stored.lifecycle });
       }

@@ -1,5 +1,14 @@
 # Changelog
 
+## [2.0.2-fengwk.3] — fork release
+
+Includes Browser Bridge **1.0.38**.
+
+- Restore owned idle placeholders to a settled `about:blank` before the first CDP attach, preserving network capture before target navigation.
+- Keep recovered/replacement tab identity in the lease and serialize fallback claims so concurrent sessions cannot claim the same tab.
+- Keep borrowed user tabs, foreign extension pages, and pending user navigations outside idle recovery.
+- Return `null` for missing or invalid Douyin detail engagement counts, while preserving real zero values.
+
 ## [2.0.2](https://github.com/jackwener/opencli/compare/v2.0.1...v2.0.2) (2026-10-20)
 
 ### Fixes
