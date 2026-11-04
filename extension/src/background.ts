@@ -2078,7 +2078,7 @@ async function resolveTab(tabId: number | undefined, leaseKey: string, initialUr
  */
 async function recoverIdleLeaseTabUnlocked(leaseKey: string, expectedTabId: number): Promise<ResolvedTab> {
   const session = automationSessions.get(leaseKey);
-  if (!session?.owned || session.preferredTabId !== expectedTabId) {
+  if (!session?.owned || !session.preferredTabOwned || session.preferredTabId !== expectedTabId) {
     throw new CommandFailure('session_busy', 'Session state changed while its idle tab was being recovered; retry the command.');
   }
   const oldTab = await chrome.tabs.get(expectedTabId);
