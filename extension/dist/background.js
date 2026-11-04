@@ -2420,18 +2420,20 @@ async function createOwnedTabLeaseUnlocked(leaseKey, initialUrl) {
   const role = getOwnedWindowRole(leaseKey);
   const { windowId, initialTabId } = await ensureOwnedContainerWindow(role, initialUrl, getWindowMode(leaseKey));
   let tab;
+  let idleClaim = null;
+  let replacedIdleTabId = null;
   if (initialTabIsAvailable(initialTabId)) {
     tab = await chrome.tabs.get(initialTabId);
-    const idleClaim = isIdlePageUrl(tab.url) ? { ...tab } : null;
+    idleClaim = isIdlePageUrl(tab.url) ? { ...tab } : null;
     if (idleClaim) await assertClaimableIdlePlaceholder(idleClaim);
     if (initialUrl && !isTargetUrl(tab.url, targetUrl)) {
       tab = await chrome.tabs.update(initialTabId, { url: targetUrl });
       await new Promise((resolve) => setTimeout(resolve, 300));
       tab = await chrome.tabs.get(initialTabId);
     } else if (idleClaim) {
-      tab = await restoreIdlePlaceholderTab(initialTabId);
+      tab = await createBlankReplacementTab(leaseKey, idleClaim);
+      replacedIdleTabId = idleClaim.id ?? null;
     }
-    if (idleClaim) await consumeIdlePlaceholder(idleClaim);
   } else {
     tab = await chrome.tabs.create({ windowId, url: targetUrl, active: true });
   }
@@ -2450,6 +2452,8 @@ async function createOwnedTabLeaseUnlocked(leaseKey, initialUrl) {
     preferredTabId: tabId,
     preferredTabOwned: true
   });
+  if (idleClaim) await consumeIdlePlaceholder(idleClaim);
+  if (replacedIdleTabId !== null) await discardReplacedIdleTab(replacedIdleTabId);
   resetWindowIdleTimer(leaseKey);
   return { tabId, tab };
 }
@@ -2715,18 +2719,41 @@ async function assertClaimableIdlePlaceholder(tab) {
 function isRestoredPlaceholderTab(tab) {
   return tab.url === BLANK_PAGE && tab.status !== "loading" && (!tab.pendingUrl || tab.pendingUrl === BLANK_PAGE);
 }
-async function restoreIdlePlaceholderTab(tabId) {
-  await chrome.tabs.update(tabId, { url: BLANK_PAGE });
-  const deadline = Date.now() + IDLE_RESTORE_TIMEOUT_MS;
-  let tab = await chrome.tabs.get(tabId);
-  while (!isRestoredPlaceholderTab(tab)) {
-    if (Date.now() >= deadline) {
-      throw new Error(`Idle placeholder tab ${tabId} could not be restored to about:blank (url=${tab.url ?? "unknown"})`);
+async function createBlankReplacementTab(leaseKey, placeholder) {
+  const created = await chrome.tabs.create({ windowId: placeholder.windowId, url: BLANK_PAGE, active: true });
+  if (!created.id) throw new Error("Failed to create a replacement tab for the idle placeholder");
+  const createdId = created.id;
+  try {
+    await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), placeholder.windowId, [createdId]);
+    const deadline = Date.now() + IDLE_RESTORE_TIMEOUT_MS;
+    let tab = await chrome.tabs.get(createdId);
+    while (!isRestoredPlaceholderTab(tab)) {
+      if (Date.now() >= deadline) {
+        throw new Error(`Replacement tab ${createdId} never became a settled about:blank page (url=${tab.url ?? "unknown"})`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, IDLE_RESTORE_POLL_MS));
+      tab = await chrome.tabs.get(createdId);
     }
-    await new Promise((resolve) => setTimeout(resolve, IDLE_RESTORE_POLL_MS));
-    tab = await chrome.tabs.get(tabId);
+    registerAdapterTab(leaseKey, createdId);
+    return tab;
+  } catch (err) {
+    await chrome.tabs.remove(createdId).catch(() => {
+    });
+    throw err;
   }
-  return tab;
+}
+async function discardReplacedIdleTab(oldTabId) {
+  let oldTab;
+  try {
+    oldTab = await chrome.tabs.get(oldTabId);
+  } catch {
+    return;
+  }
+  if (!isIdlePageUrl(oldTab.url)) return;
+  if (oldTab.pendingUrl && oldTab.pendingUrl !== oldTab.url) return;
+  if ([...automationSessions.values()].some((session) => session.preferredTabId === oldTabId)) return;
+  await chrome.tabs.remove(oldTabId).catch(() => {
+  });
 }
 function isSafeNavigationUrl(url) {
   return url.startsWith("http://") || url.startsWith("https://");
@@ -2873,8 +2900,7 @@ async function resolveTab(tabId, leaseKey, initialUrl) {
         );
       }
       if (isRestorableIdleTab(session.owned, session.preferredTabOwned, preferredTab)) {
-        preferredTab = await restoreIdlePlaceholderTab(existingPreferredTabId);
-        return { tabId: preferredTab.id, tab: preferredTab };
+        return withLeaseMutation(() => recoverIdleLeaseTabUnlocked(leaseKey, existingPreferredTabId));
       }
     } catch (err) {
       if (err instanceof CommandFailure) throw err;
@@ -2894,6 +2920,23 @@ async function resolveTab(tabId, leaseKey, initialUrl) {
   }
   return withLeaseMutation(() => resolveContainerTabUnlocked(leaseKey, existingPreferredTabId, initialUrl));
 }
+async function recoverIdleLeaseTabUnlocked(leaseKey, expectedTabId) {
+  const session = automationSessions.get(leaseKey);
+  if (!session?.owned || !session.preferredTabOwned || session.preferredTabId !== expectedTabId) {
+    throw new CommandFailure("session_busy", "Session state changed while its idle tab was being recovered; retry the command.");
+  }
+  const oldTab = await chrome.tabs.get(expectedTabId);
+  if (isDebuggableUrl(oldTab.url)) return { tabId: expectedTabId, tab: oldTab };
+  if (!isIdlePageUrl(oldTab.url) || oldTab.pendingUrl && oldTab.pendingUrl !== oldTab.url) {
+    return resolveContainerTabUnlocked(leaseKey, expectedTabId);
+  }
+  const replacement = await createBlankReplacementTab(leaseKey, oldTab);
+  const replacementId = replacement.id;
+  adoptResolvedTab(leaseKey, expectedTabId, replacementId, replacement);
+  await consumeIdlePlaceholder({ ...oldTab });
+  await discardReplacedIdleTab(expectedTabId);
+  return { tabId: replacementId, tab: replacement };
+}
 async function resolveContainerTabUnlocked(leaseKey, expectedTabId, initialUrl) {
   const session = automationSessions.get(leaseKey);
   if (!session || session.preferredTabId !== expectedTabId) {
@@ -2908,14 +2951,18 @@ async function resolveContainerTabUnlocked(leaseKey, expectedTabId, initialUrl) 
     session.owned ? group?.id ?? null : void 0
   );
   if (reusableTabId !== void 0) {
-    registerAdapterTab(leaseKey, reusableTabId);
-    let reusableTab = await chrome.tabs.get(reusableTabId);
+    const reusableTab = await chrome.tabs.get(reusableTabId);
     const idleClaim = isIdlePageUrl(reusableTab.url) ? { ...reusableTab } : null;
-    if (idleClaim) await assertClaimableIdlePlaceholder(idleClaim);
     if (idleClaim) {
-      reusableTab = await restoreIdlePlaceholderTab(reusableTabId);
+      await assertClaimableIdlePlaceholder(idleClaim);
+      const replacement = await createBlankReplacementTab(leaseKey, idleClaim);
+      const replacementId = replacement.id;
+      adoptResolvedTab(leaseKey, expectedTabId, replacementId, replacement);
       await consumeIdlePlaceholder(idleClaim);
+      await discardReplacedIdleTab(reusableTabId);
+      return { tabId: replacementId, tab: replacement };
     }
+    registerAdapterTab(leaseKey, reusableTabId);
     adoptResolvedTab(leaseKey, expectedTabId, reusableTabId, reusableTab);
     return { tabId: reusableTabId, tab: reusableTab };
   }

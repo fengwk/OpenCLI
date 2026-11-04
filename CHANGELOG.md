@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.0.2-fengwk.4] — fork release
+
+Includes Browser Bridge **1.0.39** and supersedes `2.0.2-fengwk.3` / Bridge `1.0.38`.
+
+- Replace a claimed self-idle placeholder with a fresh blank tab in the same owned window/group before CDP attach. Chrome 150 can still reject the old extension target after an in-place navigation to `about:blank`.
+- Point the lease at the fresh tab before retiring the old placeholder; preserve user navigations and leave markers recoverable when replacement creation fails.
+- Keep first-navigation network capture, strict ownership checks, and nullable Douyin detail statistics from the preceding release.
+
 ## [2.0.2-fengwk.3] — fork release
 
 Includes Browser Bridge **1.0.38**.
