@@ -51,6 +51,24 @@ describe('douyin detail', () => {
         expect(Object.keys(row).sort()).toEqual([...command.columns].sort());
         expect(page.goto).toHaveBeenCalledWith(`https://www.douyin.com/video/${id}`);
     });
+    it('returns every engagement count as-is, keeping real zeros', async () => {
+        const page = pageFor({aweme_detail:{aweme_id:id, statistics:{digg_count:0, comment_count:12, collect_count:34, share_count:56}}});
+        const [row] = await command.func(page, {target:id});
+        expect([row.digg, row.comment, row.collect, row.share]).toEqual([0, 12, 34, 56]);
+    });
+    it('reports absent engagement counts as null, never as zero', async () => {
+        const [noStatistics] = await command.func(pageFor({aweme_detail:{aweme_id:id}}), {target:id});
+        const [emptyStatistics] = await command.func(pageFor({aweme_detail:{aweme_id:id,statistics:{}}}), {target:id});
+        for (const row of [noStatistics, emptyStatistics]) {
+            expect([row.digg, row.comment, row.collect, row.share]).toEqual([null, null, null, null]);
+        }
+    });
+    // 字符串/负数/小数/超范围/布尔都不是可用的统计值：统一 null，不把非法值伪装成 0 或截断成有效数字。
+    it.each(['12', -1, 1.5, Number.MAX_SAFE_INTEGER + 1, true, null])('reports invalid count %j as null', async value => {
+        const page = pageFor({aweme_detail:{aweme_id:id, statistics:{digg_count:value, comment_count:value, collect_count:value, share_count:value}}});
+        const [row] = await command.func(page, {target:id});
+        expect([row.digg, row.comment, row.collect, row.share]).toEqual([null, null, null, null]);
+    });
     it.each([403,429,500])('does not accept success JSON over HTTP %s', async status => {
         await expect(command.func(pageFor({status_code:0,aweme_detail:{aweme_id:id}},status),{target:id})).rejects.toThrow(String(status));
     });
