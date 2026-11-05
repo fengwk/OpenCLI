@@ -10274,6 +10274,13 @@
         "default": 10,
         "required": false,
         "help": "结果数量 (1-30)"
+      },
+      {
+        "name": "timeout",
+        "type": "int",
+        "default": 120,
+        "required": false,
+        "help": "搜索总超时秒数（导航与结果等待共用）"
       }
     ],
     "columns": [

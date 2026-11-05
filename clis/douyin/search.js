@@ -1,7 +1,7 @@
 /**
  * Douyin search — keyword video search on www.douyin.com.
  *
- * Strategy: DOM extraction from the server-rendered search results page.
+ * Strategy: DOM extraction from the rendered search results page.
  *
  * Why not XHR interception:
  *   The `www.douyin.com/search/<q>?type=video` page renders results into
@@ -15,8 +15,8 @@
  *   "verify_check" }` because the bare URL lacks the SPA-computed
  *   `a_bogus` / `msToken` signature.
  *
- *   DOM extraction sidesteps both blockers: the data is already in the
- *   rendered HTML at the moment of navigation, signature-free.
+ *   DOM extraction sidesteps both blockers: wait for the site's own
+ *   rendered cards instead of synthesizing signed requests.
  *
  * Selector approach:
  *   Douyin obfuscates card classnames (e.g. `.ckopQfVu`, `.cIiU4Muu`)
@@ -41,14 +41,18 @@
  * skeleton for anonymous visitors, which we surface as AuthRequiredError.
  */
 import { cli, Strategy } from '@jackwener/opencli/registry';
-import { ArgumentError, AuthRequiredError, CommandExecutionError, EmptyResultError } from '@jackwener/opencli/errors';
+import { ArgumentError, AuthRequiredError, CommandExecutionError, EmptyResultError, TimeoutError } from '@jackwener/opencli/errors';
 
 export const MAX_SEARCH_LIMIT = 30;
-// Time budget for the SPA's initial DOM commit. Empirically the
-// scroll-list `<li>` rows appear within 2-4s of navigation when logged
-// in; 15s covers slow networks without blocking on a permanently-empty
-// page (anonymous gate, network error).
-export const RENDER_TIMEOUT_MS = 15000;
+const DEFAULT_SEARCH_TIMEOUT_SECONDS = 120;
+
+export function parseSearchTimeout(raw) {
+    const parsed = Number(raw ?? DEFAULT_SEARCH_TIMEOUT_SECONDS);
+    if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+        throw new ArgumentError('--timeout must be a positive integer in seconds');
+    }
+    return parsed;
+}
 
 export function parseSearchLimit(raw) {
     const parsed = Number(raw ?? 10);
@@ -187,12 +191,10 @@ export function projectSearchCards(cards, limit) {
     return { rows: rows.filter(isProjectedRowUsable), invalidCount };
 }
 
-// JS snippet that waits for the scroll-list to populate, then returns
-// `{state: 'rendered', cards}` or `{state: 'login_wall'}` /
-// `{state: 'timeout'}`. Runs inside page.evaluate so we don't pay a
-// round-trip per poll iteration.
-const WAIT_AND_EXTRACT_JS = (timeoutMs) => `
-  new Promise((resolve) => {
+// Read once per poll: do not leave a pending Promise/observer in the page
+// after a transport timeout or navigation.
+const EXTRACT_JS = `
+  (() => {
     const collectCards = () => {
       const cards = [];
       const lis = document.querySelectorAll('[data-e2e="scroll-list"] li');
@@ -228,19 +230,8 @@ const WAIT_AND_EXTRACT_JS = (timeoutMs) => `
       }
       return null;
     };
-    const found = detectState();
-    if (found) return resolve(found);
-    const observer = new MutationObserver(() => {
-      const s = detectState();
-      if (s) { observer.disconnect(); resolve(s); }
-    });
-    observer.observe(document.body, { childList: true, subtree: true });
-    setTimeout(() => {
-      observer.disconnect();
-      const fallback = detectState();
-      resolve(fallback ?? { state: 'timeout' });
-    }, ${timeoutMs});
-  })
+    return detectState() ?? { state: 'pending' };
+  })()
 `;
 
 function unwrapEvaluateResult(payload) {
@@ -260,20 +251,32 @@ cli({
     args: [
         { name: 'query', required: true, positional: true, help: '搜索关键词' },
         { name: 'limit', type: 'int', default: 10, help: `结果数量 (1-${MAX_SEARCH_LIMIT})` },
+        { name: 'timeout', type: 'int', default: DEFAULT_SEARCH_TIMEOUT_SECONDS, help: '搜索总超时秒数（导航与结果等待共用）' },
     ],
     columns: ['rank', 'desc', 'author', 'url', 'plays', 'likes', 'comments', 'shares'],
     func: async (page, kwargs) => {
         const limit = parseSearchLimit(kwargs.limit);
+        const timeout = parseSearchTimeout(kwargs.timeout);
+        const deadline = Date.now() + timeout * 1000;
         const keyword = String(kwargs.query ?? '').trim();
         if (!keyword) {
             throw new ArgumentError('douyin search 需要 <query> 关键词');
         }
         await page.goto(`https://www.douyin.com/search/${encodeURIComponent(keyword)}?type=video`);
-        let result;
-        try {
-            result = unwrapEvaluateResult(await page.evaluate(WAIT_AND_EXTRACT_JS(RENDER_TIMEOUT_MS)));
-        } catch (error) {
-            throw new CommandExecutionError(`Douyin search extraction failed: ${error instanceof Error ? error.message : String(error)}`);
+        let result = { state: 'pending' };
+        while (Date.now() < deadline) {
+            try {
+                result = unwrapEvaluateResult(await page.evaluate(EXTRACT_JS));
+            } catch (error) {
+                throw new CommandExecutionError(`Douyin search extraction failed: ${error instanceof Error ? error.message : String(error)}`);
+            }
+            if (result?.state !== 'pending') break;
+            // Navigation and polling spend the same --timeout budget.
+            const remainingMs = Math.max(0, deadline - Date.now());
+            await new Promise(resolve => setTimeout(resolve, Math.min(500, remainingMs)));
+        }
+        if (result?.state === 'pending' || Date.now() >= deadline) {
+            throw new TimeoutError('douyin search', timeout, 'Increase --timeout, or check the same search in Chrome for loading/login/security issues.');
         }
         if (!result || typeof result !== 'object') {
             throw new CommandExecutionError('Douyin search: unexpected evaluator payload shape');
@@ -286,9 +289,6 @@ cli({
         }
         if (result.state === 'empty') {
             throw new EmptyResultError('douyin search', `No Douyin videos matched "${keyword}".`);
-        }
-        if (result.state === 'timeout') {
-            throw new CommandExecutionError('Douyin search did not render result cards within the timeout. Open the same search in Chrome and verify login/security state before retrying.');
         }
         if (!Array.isArray(result.cards)) {
             throw new CommandExecutionError('Douyin search: evaluator returned malformed cards payload');

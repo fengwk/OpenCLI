@@ -1,4 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { JSDOM } from 'jsdom';
+import { getRegistry } from '@jackwener/opencli/registry';
 
 import {
     extractDouyinVideoId,
@@ -6,9 +8,138 @@ import {
     normalizeDouyinVideoUrl,
     parseDouyinCount,
     parseSearchLimit,
+    parseSearchTimeout,
     projectCard,
     projectSearchCards,
 } from './search.js';
+
+const command = getRegistry().get('douyin/search');
+
+describe('search command timeout', () => {
+    let dom;
+
+    afterEach(() => {
+        dom?.window.close();
+        dom = undefined;
+        vi.useRealTimers();
+    });
+
+    function browserPage(text = '') {
+        dom = new JSDOM('<body></body>');
+        const { document } = dom.window;
+        document.body.textContent = text;
+        Object.defineProperty(document.body, 'innerText', { get() { return this.textContent; } });
+        return {
+            goto: vi.fn().mockResolvedValue(undefined),
+            evaluate: vi.fn(script => Function(
+                'document', 'HTMLElement', 'getComputedStyle', `return (${script})`,
+            )(
+                document, dom.window.HTMLElement, dom.window.getComputedStyle.bind(dom.window),
+            )),
+        };
+    }
+
+    function renderResult() {
+        dom.window.document.body.innerHTML = '<ul data-e2e="scroll-list"><li>'
+            + '<a href="/video/7704361492980385467"><span>搜索结果文案</span>'
+            + '<span>@</span><span>作者</span></a></li></ul>';
+    }
+
+    it('accepts results rendered after 15 seconds within the single command budget', async () => {
+        // Run the actual browser script: the former 15s timer would reject this page.
+        vi.useFakeTimers();
+        const page = browserPage();
+        page.goto.mockImplementation(() => new Promise(resolve => setTimeout(resolve, 20_000)));
+        let settled = false;
+        const pending = command.func(page, { query: '测试', limit: 1, timeout: 120 });
+        pending.then(() => { settled = true; }, () => { settled = true; });
+        await vi.advanceTimersByTimeAsync(20_000);
+        await vi.advanceTimersByTimeAsync(16_000);
+        expect(settled).toBe(false);
+        renderResult();
+        await vi.advanceTimersByTimeAsync(500);
+        await expect(pending).resolves.toMatchObject([{ desc: '搜索结果文案', author: '作者' }]);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('counts navigation against the same budget and stops polling on timeout', async () => {
+        // 20s navigation leaves 10s, not another full 30s; failure must stop browser work.
+        vi.useFakeTimers();
+        const page = browserPage();
+        page.goto.mockImplementation(() => new Promise(resolve => setTimeout(resolve, 20_000)));
+        const pending = command.func(page, { query: '测试', timeout: 30 }).catch(error => error);
+        await vi.advanceTimersByTimeAsync(29_999);
+        let settled = false;
+        pending.then(() => { settled = true; });
+        await Promise.resolve();
+        expect(settled).toBe(false);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(await pending).toMatchObject({ code: 'TIMEOUT' });
+        expect(vi.getTimerCount()).toBe(0);
+        const callsAtTimeout = page.evaluate.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(page.evaluate).toHaveBeenCalledTimes(callsAtTimeout);
+    });
+
+    it('returns already-rendered cards without scheduling a wait', async () => {
+        // Warm pages should still complete on the first read.
+        vi.useFakeTimers();
+        const page = browserPage();
+        renderResult();
+        await expect(command.func(page, { query: '测试', timeout: 120 })).resolves.toHaveLength(1);
+        expect(page.evaluate).toHaveBeenCalledOnce();
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('does not read the page if navigation has exhausted the budget', async () => {
+        // A late navigation must not start another wait after the command has expired.
+        vi.useFakeTimers();
+        const page = browserPage();
+        page.goto.mockImplementation(() => new Promise(resolve => setTimeout(resolve, 1_100)));
+        const pending = command.func(page, { query: '测试', timeout: 1 }).catch(error => error);
+        await vi.advanceTimersByTimeAsync(1_100);
+        expect(await pending).toMatchObject({ code: 'TIMEOUT' });
+        expect(page.evaluate).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('does not report success for a browser response arriving after the deadline', async () => {
+        // A slow round-trip must not turn an expired search into a late success or another poll.
+        vi.useFakeTimers();
+        const page = browserPage();
+        renderResult();
+        const read = page.evaluate.getMockImplementation();
+        page.evaluate.mockImplementation(async script => {
+            await new Promise(resolve => setTimeout(resolve, 1_100));
+            return read(script);
+        });
+        const pending = command.func(page, { query: '测试', timeout: 1 }).catch(error => error);
+        await vi.advanceTimersByTimeAsync(1_100);
+        expect(await pending).toMatchObject({ code: 'TIMEOUT' });
+        expect(page.evaluate).toHaveBeenCalledOnce();
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it.each([
+        ['请先登录', 'AUTH_REQUIRED'],
+        ['请完成安全校验', 'AUTH_REQUIRED'],
+        ['暂无相关搜索结果', 'EMPTY_RESULT'],
+    ])('still exits immediately for %s', async (text, code) => {
+        // A longer budget must not hide terminal login/empty states behind a wait.
+        vi.useFakeTimers();
+        const page = browserPage(text);
+        await expect(command.func(page, { query: '测试', timeout: 120 })).rejects.toMatchObject({ code });
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('validates the single timeout before browser navigation', async () => {
+        // Invalid values must not create timers or navigate a user tab.
+        const page = browserPage();
+        expect(parseSearchTimeout(undefined)).toBe(120);
+        await expect(command.func(page, { query: '测试', timeout: 0 })).rejects.toThrow('--timeout');
+        expect(page.goto).not.toHaveBeenCalled();
+    });
+});
 
 describe('douyin search', () => {
     it('rejects limit above MAX_SEARCH_LIMIT', () => {

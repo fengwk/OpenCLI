@@ -6,6 +6,7 @@
 
 | Command | Description |
 |---------|-------------|
+| `opencli douyin search <query> --limit 10 --timeout 120` | 搜索公开视频；`--timeout` 为导航与结果等待共用的总秒数，默认 120 |
 | `opencli douyin detail <target>` | 单条视频或图文详情（ID、HTTPS 视频链接或分享短链） |
 | `opencli douyin profile` | 获取账号信息 |
 | `opencli douyin videos` | 获取作品列表 |
