@@ -21,6 +21,14 @@ Use it when merging back to mainline or rebasing onto upstream.
 
 ## Changelog (fork)
 
+### 2026-11-05
+
+#### Douyin search command budget
+
+CLI `2.0.2-fengwk.5` / unchanged extension `1.0.39`.
+
+The builtin `douyin search` adapter uses one `--timeout` budget (default 120 seconds) for navigation and result polling instead of an independent 15-second render cutoff. It stops polling on expiry without leaving a page observer, preserves early login/security/empty-result errors, and exports the argument in `cli-manifest.json`. The core timeout framework and independent `douyin-ext` plugin are unchanged.
+
 ### 2026-11-01
 
 #### Hub adapter manifest export & metadata completeness
@@ -183,8 +191,8 @@ CLI `1.8.7-fengwk.9` and extension `1.0.30`.
 
 | Component | Version |
 |-----------|---------|
-| CLI (`@jackwener/opencli`) | `1.8.8-fengwk.5` (paired tag: `fork-v1.8.8-fengwk.5`) |
-| Extension | `1.0.36` (`compatRange`: `>=1.8.7`) |
+| CLI (`@jackwener/opencli`) | `2.0.2-fengwk.5` (paired tag: `fork-v2.0.2-fengwk.5`) |
+| Extension | `1.0.39` (`compatRange`: `>=1.8.7`) |
 
 ### Auto-update policy (fork)
 

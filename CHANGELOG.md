@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.0.2-fengwk.5] — fork release
+
+CLI-only Douyin search repair. Browser Bridge remains **1.0.39**, with no extension or protocol changes.
+
+- Replace the independent 15-second result-render cutoff with one `douyin search --timeout` budget (default 120 seconds) shared by navigation and result polling.
+- Stop polling when the budget expires; avoid leaving a pending browser-side Promise or observer, and reject late responses rather than reporting late success.
+- Keep early login/security and explicit-empty-result errors. Export the timeout argument in the command manifest so Hub callers can pass it through.
+
 ## [2.0.2-fengwk.4] — fork release
 
 Includes Browser Bridge **1.0.39** and supersedes `2.0.2-fengwk.3` / Bridge `1.0.38`.
